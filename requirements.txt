@@ -4,3 +4,4 @@ ultralytics
 torch
 torchvision
 pillow
+pytest

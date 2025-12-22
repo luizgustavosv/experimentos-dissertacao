@@ -42,9 +42,16 @@ class ExperimentController:
         metrics = detector.validate(images_dir, report_out, plots_dir, logger)
         return OperationResult(metrics=metrics, message="Validação concluída.")
 
-    def execute_normalize(self, algorithm_key: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None) -> OperationResult:
+    def execute_normalize(
+        self,
+        algorithm_key: str,
+        dataset_type: str,
+        dataset_dir: Path,
+        normalized_dir: Path,
+        logger: Optional[Logger] = None,
+    ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
-        detector.normalize_dataset(dataset_dir, normalized_dir, logger)
+        detector.normalize_dataset(dataset_type, dataset_dir, normalized_dir, logger)
         return OperationResult(metrics=None, message="Normalização concluída.")
 
     def _get_detector(self, algorithm_key: str) -> DetectionAlgorithm:

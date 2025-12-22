@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import random
 from pathlib import Path
 from typing import List, Optional
@@ -134,21 +133,20 @@ class StubDetector(DetectionAlgorithm):
         self._log(f"[VAL] Relatório salvo em {report_out}", logger)
         return metrics
 
-    def normalize_dataset(self, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None) -> None:
-        dataset_dir = dataset_dir.expanduser().resolve()
-        if not dataset_dir.exists():
-            raise FileNotFoundError(f"Dataset bruto não encontrado em {dataset_dir}")
-        normalized_dir = normalized_dir.expanduser().resolve()
-        normalized_dir.mkdir(parents=True, exist_ok=True)
-        info_path = normalized_dir / "normalization_summary.json"
-        summary = {
-            "algorithm": self.context.name,
-            "source_dataset": str(dataset_dir),
-            "normalized_dataset": str(normalized_dir),
-            "notes": "Normalização simulada para preparação de treinos consistentes.",
-        }
-        info_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
-        self._log(
-            f"[NORM] Dataset normalizado (stub) em {normalized_dir}. Detalhes em {info_path}",
-            logger,
+    def normalize_dataset(
+        self,
+        dataset_type: str,
+        dataset_dir: Path,
+        normalized_dir: Path,
+        logger: Optional[Logger] = None,
+    ):
+        from app.datasets.normalizer import normalize_dataset
+
+        return normalize_dataset(
+            dataset_type=dataset_type,
+            algorithm_key=self.context.architecture,
+            dataset_dir=dataset_dir,
+            normalized_dir=normalized_dir,
+            logger=logger,
+            target_format=self.dataset_target(),
         )

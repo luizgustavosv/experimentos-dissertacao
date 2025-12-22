@@ -19,6 +19,7 @@ class DetectorApp(tk.Tk):
         self.controller = ExperimentController()
         self.algorithm_var = tk.StringVar(value="YOLO")
         self.action_var = tk.StringVar(value="Treinar")
+        self.dataset_type_var = tk.StringVar(value="HERIDAL")
         self.path_vars = {
             "dataset": tk.StringVar(),
             "weights": tk.StringVar(),
@@ -116,6 +117,7 @@ class DetectorApp(tk.Tk):
             self._add_path_selector("Pasta para gráficos", "plots", is_dir=True)
             self._add_path_selector("Relatório PDF da validação", "report", is_file=True, defaultextension=".pdf")
         elif action == "Normalizar dataset":
+            self._add_dataset_type_selector()
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
             self._add_path_selector("Destino do dataset normalizado", "normalized", is_dir=True)
 
@@ -137,6 +139,13 @@ class DetectorApp(tk.Tk):
                 self.path_vars[key].set(path)
 
         ttk.Button(frame, text="Selecionar", command=browse).pack(side="left")
+
+    def _add_dataset_type_selector(self) -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        tk.Label(frame, text="Tipo de dataset", bg="#12233d", fg="white").pack(anchor="w")
+        combo = ttk.Combobox(frame, textvariable=self.dataset_type_var, values=["HERIDAL", "VisDrone"], state="readonly", width=30)
+        combo.pack(anchor="w")
 
     def _append_log(self, message: str) -> None:
         self.log_widget.insert("end", message + "\n")
@@ -162,7 +171,8 @@ class DetectorApp(tk.Tk):
             elif action == "Normalizar dataset":
                 dataset = Path(self.path_vars["dataset"].get())
                 normalized = Path(self.path_vars["normalized"].get())
-                result = self.controller.execute_normalize(algorithm_key, dataset, normalized, self._append_log)
+                dataset_type = self.dataset_type_var.get().lower()
+                result = self.controller.execute_normalize(algorithm_key, dataset_type, dataset, normalized, self._append_log)
             else:
                 raise ValueError("Ação desconhecida")
         except Exception as exc:  # noqa: BLE001

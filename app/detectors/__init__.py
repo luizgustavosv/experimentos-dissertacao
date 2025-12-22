@@ -13,21 +13,25 @@ def load_detectors() -> Dict[str, DetectionAlgorithm]:
             name="YOLOv12n",
             architecture="YOLO",
             recommended_repo="https://github.com/ultralytics/ultralytics",
+            target_format="yolo",
         ),
         "SSD": DetectorContext(
             name="SSD-300",
             architecture="SSD",
             recommended_repo="https://github.com/pytorch/vision/tree/main/references/detection",
+            target_format="voc",
         ),
         "Faster R-CNN": DetectorContext(
             name="Faster R-CNN",
             architecture="Faster R-CNN",
             recommended_repo="https://github.com/pytorch/vision",
+            target_format="coco",
         ),
         "RetinaNet": DetectorContext(
             name="RetinaNet",
             architecture="RetinaNet",
             recommended_repo="https://github.com/pytorch/vision",
+            target_format="coco",
         ),
     }
 
