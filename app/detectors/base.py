@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, Optional
+
+from app.metrics import Metrics
+
+Logger = Callable[[str], None]
+
+
+@dataclass
+class DetectorContext:
+    name: str
+    architecture: str
+    recommended_repo: str
+
+
+class DetectionAlgorithm:
+    def __init__(self, context: DetectorContext):
+        self.context = context
+
+    def train(self, dataset_dir: Path, weights_out: Path, logger: Optional[Logger] = None) -> Metrics:
+        raise NotImplementedError
+
+    def infer(self, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> Metrics:
+        raise NotImplementedError
+
+    def validate(self, images_dir: Path, report_out: Path, plots_dir: Path, logger: Optional[Logger] = None) -> Metrics:
+        raise NotImplementedError
+
+    def normalize_dataset(self, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None) -> None:
+        raise NotImplementedError
+
+    def _log(self, message: str, logger: Optional[Logger]) -> None:
+        if logger:
+            logger(message)
