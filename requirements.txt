@@ -1,0 +1,6 @@
+matplotlib
+fpdf2
+ultralytics
+torch
+torchvision
+pillow
