@@ -23,11 +23,14 @@ class DetectorApp(tk.Tk):
         self.path_vars = {
             "dataset": tk.StringVar(),
             "weights": tk.StringVar(),
+            "pretrained": tk.StringVar(),
             "images": tk.StringVar(),
             "report": tk.StringVar(),
             "plots": tk.StringVar(),
             "normalized": tk.StringVar(),
         }
+        self.epochs_var = tk.IntVar(value=10)
+        self.early_stop_var = tk.BooleanVar(value=False)
 
         self._build_header()
         self._build_forms()
@@ -108,7 +111,10 @@ class DetectorApp(tk.Tk):
 
         if action == "Treinar":
             self._add_path_selector("Dataset de treino", "dataset", is_dir=True)
+            self._add_path_selector("Pesos pré-treinados", "pretrained")
             self._add_path_selector("Salvar pesos treinados", "weights", is_file=True, defaultextension=".pt")
+            self._add_epoch_selector()
+            self._add_early_stop_selector()
         elif action == "Inferir":
             self._add_path_selector("Imagens para inferência", "images", is_dir=True)
             self._add_path_selector("Relatório PDF da inferência", "report", is_file=True, defaultextension=".pdf")
@@ -147,6 +153,33 @@ class DetectorApp(tk.Tk):
         combo = ttk.Combobox(frame, textvariable=self.dataset_type_var, values=["HERIDAL", "VisDrone"], state="readonly", width=30)
         combo.pack(anchor="w")
 
+    def _add_epoch_selector(self) -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        tk.Label(frame, text="Número de épocas", bg="#12233d", fg="white").pack(anchor="w")
+        spinbox = tk.Spinbox(frame, from_=1, to=500, textvariable=self.epochs_var, width=8)
+        spinbox.pack(anchor="w")
+
+    def _add_early_stop_selector(self) -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        check = tk.Checkbutton(
+            frame,
+            text="Treinar até o modelo parar de melhorar (parada antecipada)",
+            variable=self.early_stop_var,
+            onvalue=True,
+            offvalue=False,
+            bg="#12233d",
+            fg="white",
+            selectcolor="#0b172a",
+            activebackground="#12233d",
+            activeforeground="white",
+            anchor="w",
+            justify="left",
+            wraplength=760,
+        )
+        check.pack(anchor="w")
+
     def _append_log(self, message: str) -> None:
         self.log_widget.insert("end", message + "\n")
         self.log_widget.see("end")
@@ -158,7 +191,19 @@ class DetectorApp(tk.Tk):
             if action == "Treinar":
                 dataset = Path(self.path_vars["dataset"].get())
                 weights = Path(self.path_vars["weights"].get())
-                result = self.controller.execute_train(algorithm_key, dataset, weights, self._append_log)
+                pretrained_raw = self.path_vars["pretrained"].get().strip()
+                pretrained = Path(pretrained_raw) if pretrained_raw else None
+                epochs = int(self.epochs_var.get())
+                early_stop = bool(self.early_stop_var.get())
+                result = self.controller.execute_train(
+                    algorithm_key,
+                    dataset,
+                    pretrained,
+                    weights,
+                    epochs,
+                    early_stop,
+                    self._append_log,
+                )
             elif action == "Inferir":
                 images = Path(self.path_vars["images"].get())
                 report = Path(self.path_vars["report"].get())

@@ -20,9 +20,18 @@ class ExperimentController:
     def __init__(self) -> None:
         self.detectors: Dict[str, DetectionAlgorithm] = load_detectors()
 
-    def execute_train(self, algorithm_key: str, dataset_dir: Path, weights_out: Path, logger: Optional[Logger] = None) -> OperationResult:
+    def execute_train(
+        self,
+        algorithm_key: str,
+        dataset_dir: Path,
+        pretrained_weights: Optional[Path],
+        weights_out: Path,
+        epochs: int,
+        early_stop: bool,
+        logger: Optional[Logger] = None,
+    ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
-        metrics = detector.train(dataset_dir, weights_out, logger)
+        metrics = detector.train(dataset_dir, pretrained_weights, weights_out, epochs, early_stop, logger)
         return OperationResult(metrics=metrics, message="Treinamento concluído.")
 
     def execute_infer(self, algorithm_key: str, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> OperationResult:

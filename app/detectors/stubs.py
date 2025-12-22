@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from pathlib import Path
 from typing import List, Optional
@@ -68,23 +69,104 @@ class StubDetector(DetectionAlgorithm):
                 self._log(f"[INFER] Não foi possível gerar miniatura para {image_path.name}: {exc}", logger)
         return previews
 
-    def train(self, dataset_dir: Path, weights_out: Path, logger: Optional[Logger] = None) -> Metrics:
+    def train(
+        self,
+        dataset_dir: Path,
+        pretrained_weights: Optional[Path],
+        weights_out: Path,
+        epochs: int,
+        early_stop: bool,
+        logger: Optional[Logger] = None,
+    ) -> Metrics:
         dataset_dir = dataset_dir.expanduser().resolve()
         if not dataset_dir.exists():
             raise FileNotFoundError(f"Dataset de treino não encontrado em {dataset_dir}")
+        if pretrained_weights:
+            pretrained_weights = pretrained_weights.expanduser().resolve()
+            if not pretrained_weights.exists():
+                raise FileNotFoundError(f"Pesos pré-treinados não encontrados em {pretrained_weights}")
+        epochs = max(1, int(epochs))
         weights_out = weights_out.expanduser().resolve()
         weights_out.parent.mkdir(parents=True, exist_ok=True)
         self._log(f"[TRAIN] {self.context.name}: usando dataset em {dataset_dir}", logger)
+        if pretrained_weights:
+            self._log(f"[TRAIN] Pesos pré-treinados: {pretrained_weights}", logger)
+        else:
+            self._log("[TRAIN] Nenhum peso pré-treinado selecionado. Iniciando do zero.", logger)
 
-        metrics = self._simulate_metrics("train")
+        rng = random.Random(f"{self.context.name}-train-{dataset_dir}")
+        patience = 3
+        min_epochs_for_stop = 5
+        best_map = -math.inf
+        best_metrics: Optional[Metrics] = None
+        best_epoch = 1
+        epochs_without_improve = 0
+        metrics_history: List[Metrics] = []
+
+        for epoch in range(1, epochs + 1):
+            for step in range(1, 6):
+                loss = max(0.08, rng.uniform(0.45, 1.35) / (epoch ** 0.55 + step * 0.15))
+                self._log(f"[TRAIN] Época {epoch}/{epochs} — passo {step}/5: loss={loss:.4f}", logger)
+
+            precision = min(0.97, 0.58 + 0.03 * epoch + rng.uniform(-0.01, 0.02))
+            recall = min(0.95, 0.52 + 0.035 * epoch + rng.uniform(-0.01, 0.02))
+            map50 = min(0.92, 0.48 + 0.045 * epoch + rng.uniform(-0.015, 0.02))
+            map50_95 = min(0.88, 0.42 + 0.04 * epoch + rng.uniform(-0.015, 0.02))
+            metrics = Metrics(precision=precision, recall=recall, map50=map50, map50_95=map50_95)
+            metrics_history.append(metrics)
+            self._log(
+                f"[TRAIN] Época {epoch}: Precisão={precision:.3f}, Recall={recall:.3f}, "
+                f"mAP@0.50={map50:.3f}, mAP@0.50:0.95={map50_95:.3f}",
+                logger,
+            )
+
+            if metrics.map50_95 > best_map:
+                best_map = metrics.map50_95
+                best_metrics = metrics
+                best_epoch = epoch
+                epochs_without_improve = 0
+                self._log(f"[TRAIN] Nova melhor métrica na época {epoch} (mAP@0.50:0.95={metrics.map50_95:.3f}).", logger)
+            else:
+                epochs_without_improve += 1
+                self._log(f"[TRAIN] Nenhuma melhoria há {epochs_without_improve} época(s).", logger)
+
+            if early_stop and epoch >= min_epochs_for_stop and epochs_without_improve >= patience:
+                self._log(
+                    f"[TRAIN] Parada antecipada: {patience} época(s) sem melhoria após {epoch} épocas.",
+                    logger,
+                )
+                break
+
+        assert metrics_history, "Histórico de métricas vazio após treinamento simulado."
+        final_metrics = best_metrics or metrics_history[-1]
+        total_epochs = len(metrics_history)
+        self._log(
+            f"[TRAIN] Melhor época: {best_epoch}/{total_epochs} com mAP@0.50:0.95={final_metrics.map50_95:.3f}",
+            logger,
+        )
         weights_out.write_text(
-            f"Stub pesos para {self.context.name}\nOrigem do dataset: {dataset_dir}\nMétricas: {metrics.to_dict()}\n"
+            "\n".join(
+                [
+                    f"Stub pesos para {self.context.name}",
+                    f"Origem do dataset: {dataset_dir}",
+                    f"Pesos pré-treinados: {pretrained_weights or 'nenhum'}",
+                    f"Épocas executadas: {total_epochs} (configurado={epochs})",
+                    f"Parada antecipada: {'sim' if early_stop else 'não'}",
+                    f"Melhor época: {best_epoch}",
+                    f"Métricas: {final_metrics.to_dict()}",
+                ]
+            )
         )
         report_path = weights_out.with_suffix(".training.pdf")
-        self.report_builder.save_report(report_path, metrics, operation="Treinamento", source_dir=dataset_dir)
+        self.report_builder.save_report(
+            report_path,
+            final_metrics,
+            operation="Treinamento",
+            source_dir=dataset_dir,
+        )
         self._log(f"[TRAIN] Pesos fictícios salvos em {weights_out}", logger)
         self._log(f"[TRAIN] Relatório salvo em {report_path}", logger)
-        return metrics
+        return final_metrics
 
     def infer(self, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> InferencePerformance:
         images_dir = images_dir.expanduser().resolve()

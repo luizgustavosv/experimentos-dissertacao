@@ -21,7 +21,15 @@ class DetectionAlgorithm:
     def __init__(self, context: DetectorContext):
         self.context = context
 
-    def train(self, dataset_dir: Path, weights_out: Path, logger: Optional[Logger] = None) -> Metrics:
+    def train(
+        self,
+        dataset_dir: Path,
+        pretrained_weights: Optional[Path],
+        weights_out: Path,
+        epochs: int,
+        early_stop: bool,
+        logger: Optional[Logger] = None,
+    ) -> Metrics:
         raise NotImplementedError
 
     def infer(self, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> InferencePerformance:
