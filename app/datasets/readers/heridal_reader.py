@@ -29,9 +29,9 @@ def read_heridal(
 ) -> Tuple[DatasetIR, Dict[str, int], List[str], bool]:
     dataset_dir = dataset_dir.expanduser().resolve()
     train_dir = dataset_dir / "train"
-    annotations_path = train_dir / "annotations.csv"
+    annotations_path = train_dir / "_annotations.csv"
     if not annotations_path.exists():
-        raise FileNotFoundError(f"annotations.csv não encontrado em {annotations_path}")
+        raise FileNotFoundError(f"_annotations.csv não encontrado em {annotations_path}")
 
     images: Dict[str, ImageRecord] = {}
     annotations: List[AnnotationRecord] = []

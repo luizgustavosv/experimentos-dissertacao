@@ -32,7 +32,7 @@ def test_read_heridal_split_and_annotations(tmp_path: Path) -> None:
         "img2.jpg,100,100,human,20,20,40,50",
         "img3.jpg,100,100,human,5,5,60,60",
     ]
-    (train_dir / "annotations.csv").write_text("\n".join(csv_lines), encoding="utf-8")
+    (train_dir / "_annotations.csv").write_text("\n".join(csv_lines), encoding="utf-8")
 
     dataset, discarded, warnings, is_labelled = read_heridal(root, seed=1)
 
