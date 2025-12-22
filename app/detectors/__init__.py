@@ -3,7 +3,9 @@ from __future__ import annotations
 from typing import Dict
 
 from app.detectors.base import DetectionAlgorithm, DetectorContext
-from app.detectors.stubs import StubDetector
+from app.detectors.torchvision_detectors import TorchvisionDetector
+from app.detectors.torchvision_models import build_faster_rcnn, build_retinanet, build_ssd
+from app.detectors.yolo import YoloDetector
 
 
 def load_detectors() -> Dict[str, DetectionAlgorithm]:
@@ -35,4 +37,9 @@ def load_detectors() -> Dict[str, DetectionAlgorithm]:
         ),
     }
 
-    return {key: StubDetector(ctx) for key, ctx in architectures.items()}
+    return {
+        "YOLO": YoloDetector(architectures["YOLO"]),
+        "SSD": TorchvisionDetector(architectures["SSD"], build_ssd),
+        "Faster R-CNN": TorchvisionDetector(architectures["Faster R-CNN"], build_faster_rcnn),
+        "RetinaNet": TorchvisionDetector(architectures["RetinaNet"], build_retinanet),
+    }
