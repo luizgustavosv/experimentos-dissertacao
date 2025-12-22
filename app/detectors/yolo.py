@@ -25,18 +25,18 @@ class YoloDetector(DetectionAlgorithm):
         logger: Optional[Logger] = None,
     ) -> Metrics:
         from ultralytics import YOLO  # import tardio para evitar dependências pesadas em import
-        yaml_path = validate_yolo_dataset(dataset_dir)
+        yaml_path = validate_yolo_dataset(dataset_dir).resolve()
         seed_everything(self.config.seed)
         device_str = resolve_device(self.config.device)
         num_epochs = epochs or self.config.epochs
         if logger:
             logger(f"[TRAIN] {self.context.name} iniciando treino com {num_epochs} épocas em {device_str}")
-            logger(f"[DATA] YAML: {yaml_path}")
+            logger(f"YOLO train(): usando dataset.yaml = {yaml_path}")
 
         base_weights = pretrained_weights or "yolov8n.pt"
         model = YOLO(base_weights)
         results = model.train(
-            data=yaml_path,
+            data=str(yaml_path),
             epochs=num_epochs,
             imgsz=640,
             batch=self.config.batch_size,
@@ -71,4 +71,13 @@ class YoloDetector(DetectionAlgorithm):
         raise NotImplementedError("Validação via Ultralytics não implementada neste escopo de treino.")
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):
-        raise NotImplementedError("Normalização delegada ao módulo de datasets existente.")
+        from app.datasets.normalizer import normalize_dataset as normalize_pipeline
+
+        result = normalize_pipeline(dataset_type, self.context.architecture, dataset_dir, normalized_dir, logger=logger)
+        yaml_path = result.output_dir / "dataset.yaml"
+        if not yaml_path.exists():
+            raise FileNotFoundError(f"dataset.yaml não encontrado após normalização em {result.output_dir}")
+        if logger:
+            logger(f"YOLO normalize(): root = {result.output_dir.resolve()}")
+            logger(f"YOLO normalize(): dataset.yaml criado em {yaml_path.resolve()}")
+        return result

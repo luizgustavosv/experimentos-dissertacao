@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Dict, Iterable, Optional
+
+import yaml
 
 from app.datasets.ir import AnnotationRecord, DatasetIR, ImageRecord
 from app.datasets.progress import NormalizationProgressBar
@@ -27,6 +28,9 @@ def export_yolo(dataset: DatasetIR, output_dir: Path, is_labelled: bool, logger:
     output_dir = output_dir.expanduser().resolve()
     images_root = ensure_dir(output_dir / "images")
     labels_root = ensure_dir(output_dir / "labels")
+    for split in ("train", "val", "test"):
+        ensure_dir(images_root / split)
+        ensure_dir(labels_root / split)
 
     progress = NormalizationProgressBar(total=len(dataset.images), logger=logger)
 
@@ -49,23 +53,22 @@ def export_yolo(dataset: DatasetIR, output_dir: Path, is_labelled: bool, logger:
 
     progress.finish()
 
+    train_images = images_root / "train"
+    train_labels = labels_root / "train"
+    if not train_images.exists() or not train_labels.exists():
+        raise ValueError(
+            f"Dataset YOLO normalizado inválido: pastas obrigatórias não encontradas ({train_images}, {train_labels})"
+        )
+
     dataset_yaml = {
-        "path": ".",
+        "path": output_dir.as_posix(),
+        "train": "images/train",
+        "val": "images/val",
+        "test": "images/test",
         "names": {idx: name for idx, name in enumerate(dataset.classes)},
     }
-    if "train" in split_paths:
-        dataset_yaml["train"] = split_paths["train"]
-    if "val" in split_paths:
-        dataset_yaml["val"] = split_paths["val"]
-    if "test" in split_paths:
-        dataset_yaml["test"] = split_paths["test"]
-
-    additional = {k: v for k, v in split_paths.items() if k not in {"train", "val", "test"}}
-    if additional:
-        dataset_yaml["additional_splits"] = additional
-
     yaml_path = output_dir / "dataset.yaml"
-    yaml_path.write_text(json.dumps(dataset_yaml, indent=2), encoding="utf-8")
+    yaml.safe_dump(dataset_yaml, yaml_path.open("w", encoding="utf-8"), sort_keys=False)
     if logger:
         logger(f"[YOLO] dataset.yaml salvo em {yaml_path}")
     return output_dir
