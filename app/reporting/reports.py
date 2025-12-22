@@ -54,6 +54,7 @@ class ReportBuilder:
         plot_path: Optional[Path] = None,
         inference_performance: Optional[InferencePerformance] = None,
         detection_previews: Optional[Sequence[Path]] = None,
+        weights_path: Optional[Path] = None,
     ) -> Path:
         report_path = report_path.expanduser().resolve()
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,6 +67,8 @@ class ReportBuilder:
                 f"Algoritmo: {self.algorithm_name}",
                 f"Origem das imagens: {source_dir}",
             ]
+            if weights_path:
+                lines.append(f"Pesos utilizados: {weights_path}")
             if inference_performance:
                 lines.extend(
                     [

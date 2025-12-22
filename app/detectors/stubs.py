@@ -168,10 +168,19 @@ class StubDetector(DetectionAlgorithm):
         self._log(f"[TRAIN] Relatório salvo em {report_path}", logger)
         return final_metrics
 
-    def infer(self, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> InferencePerformance:
+    def infer(
+        self,
+        images_dir: Path,
+        weights_path: Path,
+        report_out: Path,
+        logger: Optional[Logger] = None,
+    ) -> InferencePerformance:
         images_dir = images_dir.expanduser().resolve()
         if not images_dir.exists():
             raise FileNotFoundError(f"Imagens para inferência não encontradas em {images_dir}")
+        weights_path = weights_path.expanduser().resolve()
+        if not weights_path.exists() or not weights_path.is_file():
+            raise FileNotFoundError(f"Pesos para inferência não encontrados em {weights_path}")
         image_paths = self._collect_images(images_dir)
         if not image_paths:
             raise FileNotFoundError(f"Nenhuma imagem suportada encontrada em {images_dir}")
@@ -180,6 +189,7 @@ class StubDetector(DetectionAlgorithm):
         report_out.parent.mkdir(parents=True, exist_ok=True)
         preview_dir = report_out.parent / f"{report_out.stem}_previews"
         self._log(f"[INFER] {self.context.name}: inferência em {images_dir}", logger)
+        self._log(f"[INFER] Pesos utilizados: {weights_path}", logger)
 
         performance = self._simulate_latency(len(image_paths))
         detection_previews = self._generate_detection_previews(image_paths, preview_dir, logger)
@@ -190,6 +200,7 @@ class StubDetector(DetectionAlgorithm):
             source_dir=images_dir,
             inference_performance=performance,
             detection_previews=detection_previews,
+            weights_path=weights_path,
         )
         self._log(
             f"[INFER] Latência simulada: {performance.images_per_second:.2f} img/s ({performance.milliseconds_per_image:.2f} ms/imagem)",
