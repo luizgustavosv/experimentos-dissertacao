@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from app.datasets.ir import AnnotationRecord, DatasetIR, ImageRecord
+from app.datasets.progress import NormalizationProgressBar
 from app.datasets.utils import copy_image, ensure_dir
 from app.detectors.base import Logger
 
@@ -35,6 +36,8 @@ def export_voc(dataset: DatasetIR, output_dir: Path, is_labelled: bool, logger: 
     images_dir = ensure_dir(output_dir / "JPEGImages")
     imagesets_dir = ensure_dir(output_dir / "ImageSets" / "Main")
 
+    progress = NormalizationProgressBar(total=len(dataset.images), logger=logger)
+
     ann_by_img = dataset.annotations_by_image()
     split_files: Dict[str, Path] = {}
 
@@ -50,5 +53,8 @@ def export_voc(dataset: DatasetIR, output_dir: Path, is_labelled: bool, logger: 
             fh.write(f"{Path(img.filename).stem}\n")
         if logger:
             logger(f"[VOC] Exportação concluída para {img.filename} ({img.split})")
+        progress.advance()
+
+    progress.finish()
 
     return output_dir
