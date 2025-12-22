@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
-from app.metrics import Metrics
+from app.metrics import InferencePerformance, Metrics
 
 Logger = Callable[[str], None]
 
@@ -23,7 +23,7 @@ class DetectionAlgorithm:
     def train(self, dataset_dir: Path, weights_out: Path, logger: Optional[Logger] = None) -> Metrics:
         raise NotImplementedError
 
-    def infer(self, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> Metrics:
+    def infer(self, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> InferencePerformance:
         raise NotImplementedError
 
     def validate(self, images_dir: Path, report_out: Path, plots_dir: Path, logger: Optional[Logger] = None) -> Metrics:

@@ -6,12 +6,13 @@ from typing import Dict, Optional
 
 from app.detectors import load_detectors
 from app.detectors.base import DetectionAlgorithm, Logger
-from app.metrics import Metrics
+from app.metrics import InferencePerformance, Metrics
 
 
 @dataclass
 class OperationResult:
     metrics: Optional[Metrics] = None
+    inference_performance: Optional[InferencePerformance] = None
     message: str = ""
 
 
@@ -26,8 +27,8 @@ class ExperimentController:
 
     def execute_infer(self, algorithm_key: str, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> OperationResult:
         detector = self._get_detector(algorithm_key)
-        metrics = detector.infer(images_dir, report_out, logger)
-        return OperationResult(metrics=metrics, message="Inferência concluída.")
+        performance = detector.infer(images_dir, report_out, logger)
+        return OperationResult(inference_performance=performance, message="Inferência concluída.")
 
     def execute_validate(
         self,

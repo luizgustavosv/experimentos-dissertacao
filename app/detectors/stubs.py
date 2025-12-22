@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
-from app.metrics import Metrics
+from app.metrics import InferencePerformance, Metrics
 from app.reporting.reports import ReportBuilder
+from PIL import Image, ImageDraw
 
 
 class StubDetector(DetectionAlgorithm):
@@ -33,6 +34,41 @@ class StubDetector(DetectionAlgorithm):
             ]
         )
 
+    def _simulate_latency(self, image_count: int) -> InferencePerformance:
+        rng = random.Random(f"{self.context.name}-latency-{image_count}")
+        ms_per_image = rng.uniform(30, 120)
+        return InferencePerformance(images_per_second=1000 / ms_per_image, milliseconds_per_image=ms_per_image)
+
+    def _collect_images(self, images_dir: Path) -> List[Path]:
+        extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+        return sorted(p for p in images_dir.rglob("*") if p.suffix.lower() in extensions)
+
+    def _generate_detection_previews(self, image_paths: List[Path], preview_dir: Path, logger: Optional[Logger]) -> List[Path]:
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        previews: List[Path] = []
+        for image_path in image_paths[:6]:
+            try:
+                with Image.open(image_path) as img:
+                    rgb_image = img.convert("RGB")
+                    rgb_image.thumbnail((960, 960))
+                    draw = ImageDraw.Draw(rgb_image)
+                    width, height = rgb_image.size
+                    rng = random.Random(f"{self.context.name}-{image_path.name}")
+                    for _ in range(rng.randint(1, 4)):
+                        box_width = rng.uniform(0.15, 0.35) * width
+                        box_height = rng.uniform(0.20, 0.45) * height
+                        x0 = rng.uniform(0, width - box_width)
+                        y0 = rng.uniform(0, height - box_height)
+                        x1, y1 = x0 + box_width, y0 + box_height
+                        draw.rectangle([x0, y0, x1, y1], outline="#ef6f6c", width=3)
+                        draw.text((x0 + 4, y0 + 4), "Pessoa", fill="#ef6f6c")
+                    preview_path = preview_dir / f"{image_path.stem}_detected.jpg"
+                    rgb_image.save(preview_path)
+                    previews.append(preview_path)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[INFER] Não foi possível gerar miniatura para {image_path.name}: {exc}", logger)
+        return previews
+
     def train(self, dataset_dir: Path, weights_out: Path, logger: Optional[Logger] = None) -> Metrics:
         dataset_dir = dataset_dir.expanduser().resolve()
         if not dataset_dir.exists():
@@ -51,17 +87,35 @@ class StubDetector(DetectionAlgorithm):
         self._log(f"[TRAIN] Relatório salvo em {report_path}", logger)
         return metrics
 
-    def infer(self, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> Metrics:
+    def infer(self, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> InferencePerformance:
         images_dir = images_dir.expanduser().resolve()
         if not images_dir.exists():
             raise FileNotFoundError(f"Imagens para inferência não encontradas em {images_dir}")
+        image_paths = self._collect_images(images_dir)
+        if not image_paths:
+            raise FileNotFoundError(f"Nenhuma imagem suportada encontrada em {images_dir}")
+
         report_out = report_out.expanduser().resolve()
         report_out.parent.mkdir(parents=True, exist_ok=True)
+        preview_dir = report_out.parent / f"{report_out.stem}_previews"
         self._log(f"[INFER] {self.context.name}: inferência em {images_dir}", logger)
-        metrics = self._simulate_metrics("infer")
-        self.report_builder.save_report(report_out, metrics, operation="Inferência", source_dir=images_dir)
+
+        performance = self._simulate_latency(len(image_paths))
+        detection_previews = self._generate_detection_previews(image_paths, preview_dir, logger)
+        self.report_builder.save_report(
+            report_out,
+            metrics=None,
+            operation="Inferência",
+            source_dir=images_dir,
+            inference_performance=performance,
+            detection_previews=detection_previews,
+        )
+        self._log(
+            f"[INFER] Latência simulada: {performance.images_per_second:.2f} img/s ({performance.milliseconds_per_image:.2f} ms/imagem)",
+            logger,
+        )
         self._log(f"[INFER] Relatório salvo em {report_out}", logger)
-        return metrics
+        return performance
 
     def validate(self, images_dir: Path, report_out: Path, plots_dir: Path, logger: Optional[Logger] = None) -> Metrics:
         images_dir = images_dir.expanduser().resolve()

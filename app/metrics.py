@@ -31,3 +31,15 @@ class Metrics:
             map50=self.map50 * 100,
             map50_95=self.map50_95 * 100,
         )
+
+
+@dataclass
+class InferencePerformance:
+    images_per_second: float
+    milliseconds_per_image: float
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "images_per_second": self.images_per_second,
+            "milliseconds_per_image": self.milliseconds_per_image,
+        }

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
-from app.metrics import Metrics
+from app.metrics import InferencePerformance, Metrics
 
 
 @dataclass
@@ -44,10 +44,12 @@ class ReportBuilder:
     def save_report(
         self,
         report_path: Path,
-        metrics: Metrics,
+        metrics: Optional[Metrics],
         operation: str,
         source_dir: Path,
         plot_path: Optional[Path] = None,
+        inference_performance: Optional[InferencePerformance] = None,
+        detection_previews: Optional[Sequence[Path]] = None,
     ) -> Path:
         report_path = report_path.expanduser().resolve()
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,19 +61,41 @@ class ReportBuilder:
                 f"Relatório de {operation}",
                 f"Algoritmo: {self.algorithm_name}",
                 f"Origem das imagens: {source_dir}",
-                "",
-                "Métricas:",
-                f" • Precisão: {metrics.precision:.3f}",
-                f" • Recall: {metrics.recall:.3f}",
-                f" • mAP@0.50: {metrics.map50:.3f}",
-                f" • mAP@0.50:0.95: {metrics.map50_95:.3f}",
             ]
+            if inference_performance:
+                lines.extend(
+                    [
+                        "",
+                        "Latência:",
+                        f" • {inference_performance.images_per_second:.2f} imagens por segundo",
+                        f" • {inference_performance.milliseconds_per_image:.2f} ms por imagem",
+                    ]
+                )
+            elif metrics:
+                lines.extend(
+                    [
+                        "",
+                        "Métricas:",
+                        f" • Precisão: {metrics.precision:.3f}",
+                        f" • Recall: {metrics.recall:.3f}",
+                        f" • mAP@0.50: {metrics.map50:.3f}",
+                        f" • mAP@0.50:0.95: {metrics.map50_95:.3f}",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "",
+                        "Métricas:",
+                        " • Nenhuma métrica calculada para esta operação.",
+                    ]
+                )
             text = "\n".join(lines)
             ax.text(0.05, 0.95, text, va="top", ha="left", fontsize=12)
             pdf.savefig(fig)
             plt.close(fig)
 
-            if plot_path and plot_path.exists():
+            if plot_path and plot_path.exists() and metrics:
                 plot_fig = plt.figure(figsize=(8.3, 5.8))
                 img = plt.imread(plot_path)
                 plt.imshow(img)
@@ -79,14 +103,26 @@ class ReportBuilder:
                 pdf.savefig(plot_fig)
                 plt.close(plot_fig)
 
+            if detection_previews:
+                for preview in detection_previews:
+                    if not preview.exists():
+                        continue
+                    preview_fig = plt.figure(figsize=(8.3, 5.8))
+                    img = plt.imread(preview)
+                    plt.imshow(img)
+                    plt.axis("off")
+                    plt.title(preview.name)
+                    pdf.savefig(preview_fig)
+                    plt.close(preview_fig)
+
             detail_fig, detail_ax = plt.subplots(figsize=(8.3, 5.8))
             detail_ax.axis("off")
             detail_ax.text(
                 0.05,
                 0.95,
                 "Este relatório foi gerado automaticamente para apoiar experimentos controlados\n"
-                "de detecção de pessoas em imagens aéreas. Substitua as métricas pelo resultado\n"
-                "real assim que treinar e avaliar o modelo.",
+                "de detecção de pessoas em imagens aéreas. Substitua as métricas ou latências pelo resultado\n"
+                "real assim que treinar e avaliar o modelo. As bounding boxes exibidas são simuladas para fins de exemplo.",
                 va="top",
                 ha="left",
             )
