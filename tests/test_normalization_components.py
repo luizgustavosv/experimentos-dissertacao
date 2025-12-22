@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 from PIL import Image
 
 from app.datasets.exporters.coco_exporter import export_coco
@@ -105,7 +106,9 @@ def test_yolo_exporter_outputs_labels_and_yaml(tmp_path: Path) -> None:
     yaml_path = output_dir / "dataset.yaml"
     content = label_path.read_text(encoding="utf-8").strip()
     assert content == "0 0.500000 0.500000 0.500000 0.500000"
-    yaml_data = json.loads(yaml_path.read_text(encoding="utf-8"))
+    yaml_data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    assert yaml_data["path"] == output_dir.resolve().as_posix()
+    assert yaml_data["train"] == "images/train"
     assert "human" in yaml_data["names"].values()
 
 
