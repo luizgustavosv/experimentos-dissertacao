@@ -170,7 +170,12 @@ class DetectorApp(tk.Tk):
             self._append_log(f"Erro: {exc}")
             return
 
-        if result.metrics:
+        if result.inference_performance:
+            perf = result.inference_performance
+            self._append_log(
+                f"Latência → {perf.images_per_second:.2f} img/s ({perf.milliseconds_per_image:.2f} ms/imagem)"
+            )
+        elif result.metrics:
             m = result.metrics
             self._append_log(
                 f"Métricas → Precisão: {m.precision:.3f}, Recall: {m.recall:.3f}, mAP@0.50: {m.map50:.3f}, mAP@0.50:0.95: {m.map50_95:.3f}"
