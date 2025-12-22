@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from app.datasets.ir import AnnotationRecord, DatasetIR, ImageRecord
+from app.datasets.progress import NormalizationProgressBar
 from app.datasets.utils import copy_image, ensure_dir
 from app.detectors.base import Logger
 
@@ -33,12 +34,15 @@ def export_coco(dataset: DatasetIR, output_dir: Path, is_labelled: bool, logger:
     ann_by_img = dataset.annotations_by_image()
     ann_by_split = dataset.annotations_by_split()
 
+    progress = NormalizationProgressBar(total=len(dataset.images), logger=logger)
+
     for split, imgs in dataset.images_by_split().items():
         split_dir = ensure_dir(images_root / split)
         for img in imgs:
             copy_image(img.path, split_dir / img.filename)
             if logger:
                 logger(f"[COCO] Imagem copiada: {img.filename} ({split})")
+            progress.advance()
 
         annotations = ann_by_split.get(split, [])
         if not is_labelled and not annotations:
@@ -53,5 +57,7 @@ def export_coco(dataset: DatasetIR, output_dir: Path, is_labelled: bool, logger:
         ann_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         if logger:
             logger(f"[COCO] Anotações salvas em {ann_path}")
+
+    progress.finish()
 
     return output_dir

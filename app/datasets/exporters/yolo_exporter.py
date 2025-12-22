@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 from app.datasets.ir import AnnotationRecord, DatasetIR, ImageRecord
+from app.datasets.progress import NormalizationProgressBar
 from app.datasets.utils import copy_image, ensure_dir
 from app.detectors.base import Logger
 
@@ -27,6 +28,8 @@ def export_yolo(dataset: DatasetIR, output_dir: Path, is_labelled: bool, logger:
     images_root = ensure_dir(output_dir / "images")
     labels_root = ensure_dir(output_dir / "labels")
 
+    progress = NormalizationProgressBar(total=len(dataset.images), logger=logger)
+
     ann_by_img = _annotations_by_image(dataset)
     split_paths: Dict[str, str] = {}
     for img in dataset.images:
@@ -42,6 +45,9 @@ def export_yolo(dataset: DatasetIR, output_dir: Path, is_labelled: bool, logger:
         (split_lbl_dir / f"{Path(img.filename).stem}.txt").write_text("\n".join(label_lines), encoding="utf-8")
         if logger:
             logger(f"[YOLO] Exportado rótulo para {img.filename} ({img.split})")
+        progress.advance()
+
+    progress.finish()
 
     dataset_yaml = {
         "path": ".",
