@@ -5,3 +5,4 @@ torch
 torchvision
 pillow
 pytest
+opencv-python-headless
