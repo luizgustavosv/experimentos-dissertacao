@@ -34,9 +34,16 @@ class ExperimentController:
         metrics = detector.train(dataset_dir, pretrained_weights, weights_out, epochs, early_stop, logger)
         return OperationResult(metrics=metrics, message="Treinamento concluído.")
 
-    def execute_infer(self, algorithm_key: str, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> OperationResult:
+    def execute_infer(
+        self,
+        algorithm_key: str,
+        images_dir: Path,
+        weights_path: Path,
+        report_out: Path,
+        logger: Optional[Logger] = None,
+    ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
-        performance = detector.infer(images_dir, report_out, logger)
+        performance = detector.infer(images_dir, weights_path, report_out, logger)
         return OperationResult(inference_performance=performance, message="Inferência concluída.")
 
     def execute_validate(

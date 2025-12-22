@@ -24,6 +24,7 @@ class DetectorApp(tk.Tk):
             "dataset": tk.StringVar(),
             "weights": tk.StringVar(),
             "pretrained": tk.StringVar(),
+            "inference_weights": tk.StringVar(),
             "images": tk.StringVar(),
             "report": tk.StringVar(),
             "plots": tk.StringVar(),
@@ -116,6 +117,7 @@ class DetectorApp(tk.Tk):
             self._add_epoch_selector()
             self._add_early_stop_selector()
         elif action == "Inferir":
+            self._add_path_selector("Pesos para inferência", "inference_weights")
             self._add_path_selector("Imagens para inferência", "images", is_dir=True)
             self._add_path_selector("Relatório PDF da inferência", "report", is_file=True, defaultextension=".pdf")
         elif action == "Validar":
@@ -206,8 +208,9 @@ class DetectorApp(tk.Tk):
                 )
             elif action == "Inferir":
                 images = Path(self.path_vars["images"].get())
+                weights = Path(self.path_vars["inference_weights"].get())
                 report = Path(self.path_vars["report"].get())
-                result = self.controller.execute_infer(algorithm_key, images, report, self._append_log)
+                result = self.controller.execute_infer(algorithm_key, images, weights, report, self._append_log)
             elif action == "Validar":
                 images = Path(self.path_vars["images"].get())
                 plots = Path(self.path_vars["plots"].get())

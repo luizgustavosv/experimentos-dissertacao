@@ -32,7 +32,13 @@ class DetectionAlgorithm:
     ) -> Metrics:
         raise NotImplementedError
 
-    def infer(self, images_dir: Path, report_out: Path, logger: Optional[Logger] = None) -> InferencePerformance:
+    def infer(
+        self,
+        images_dir: Path,
+        weights_path: Path,
+        report_out: Path,
+        logger: Optional[Logger] = None,
+    ) -> InferencePerformance:
         raise NotImplementedError
 
     def validate(self, images_dir: Path, report_out: Path, plots_dir: Path, logger: Optional[Logger] = None) -> Metrics:
