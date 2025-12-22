@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, TYPE_CHECKING
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 from app.metrics import InferencePerformance, Metrics
+
+if TYPE_CHECKING:
+    from app.datasets.normalizer import NormalizationResult
 
 
 @dataclass
@@ -127,5 +131,23 @@ class ReportBuilder:
                 ha="left",
             )
             pdf.savefig(detail_fig)
-            plt.close(detail_fig)
+        plt.close(detail_fig)
         return report_path
+
+
+def save_normalization_report(output_dir: Path, result: "NormalizationResult") -> Path:
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "normalization_report.json"
+
+    def _convert(obj):
+        if isinstance(obj, Path):
+            return str(obj)
+        return obj
+
+    payload = {k: _convert(v) for k, v in result.__dict__.items()}
+    report_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return report_path

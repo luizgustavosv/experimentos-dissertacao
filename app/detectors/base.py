@@ -14,6 +14,7 @@ class DetectorContext:
     name: str
     architecture: str
     recommended_repo: str
+    target_format: str
 
 
 class DetectionAlgorithm:
@@ -29,8 +30,11 @@ class DetectionAlgorithm:
     def validate(self, images_dir: Path, report_out: Path, plots_dir: Path, logger: Optional[Logger] = None) -> Metrics:
         raise NotImplementedError
 
-    def normalize_dataset(self, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None) -> None:
+    def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):
         raise NotImplementedError
+
+    def dataset_target(self) -> str:
+        return self.context.target_format
 
     def _log(self, message: str, logger: Optional[Logger]) -> None:
         if logger:
