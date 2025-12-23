@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import shutil
+import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.utils import copy_ultralytics_checkpoint, resolve_device, seed_everything, validate_yolo_dataset
-from app.metrics import Metrics
+from app.metrics import InferencePerformance, Metrics
+from app.reporting.reports import ReportBuilder
 
 
 class YoloDetector(DetectionAlgorithm):
@@ -65,7 +66,73 @@ class YoloDetector(DetectionAlgorithm):
         )
 
     def infer(self, images_dir: Path, weights_path: Path, report_out: Path, logger: Optional[Logger] = None):
-        raise NotImplementedError("Inferência via Ultralytics não implementada neste escopo de treino.")
+        from ultralytics import YOLO  # import tardio para evitar dependências pesadas em import
+
+        images_dir = images_dir.expanduser().resolve()
+        weights_path = weights_path.expanduser().resolve()
+        report_out = report_out.expanduser().resolve()
+
+        if not images_dir.exists() or not images_dir.is_dir():
+            raise FileNotFoundError(f"Pasta de imagens inexistente: {images_dir}")
+        if not weights_path.exists():
+            raise FileNotFoundError(f"Pesos não encontrados: {weights_path}")
+
+        image_paths = self._list_images(images_dir)
+        if not image_paths:
+            raise ValueError(f"Nenhuma imagem encontrada em {images_dir}")
+
+        device_str = resolve_device(self.config.device)
+        if logger:
+            logger(f"[INFER] {self.context.name} usando pesos {weights_path} em {device_str}")
+            logger(f"[INFER] Total de imagens: {len(image_paths)}")
+
+        model = YOLO(str(weights_path))
+        predictions_root = report_out.parent / "predictions"
+        start = time.perf_counter()
+        results = model.predict(
+            source=str(images_dir),
+            imgsz=640,
+            device=device_str,
+            save=True,
+            project=str(predictions_root),
+            name=report_out.stem,
+            exist_ok=True,
+        )
+        elapsed = time.perf_counter() - start
+
+        total_images = len(image_paths)
+        images_per_second = total_images / elapsed if elapsed > 0 else 0.0
+        milliseconds_per_image = (elapsed / total_images * 1000) if total_images else 0.0
+        performance = InferencePerformance(
+            images_per_second=images_per_second,
+            milliseconds_per_image=milliseconds_per_image,
+        )
+
+        save_dir = (
+            Path(results[0].save_dir)
+            if results and hasattr(results[0], "save_dir")
+            else predictions_root / report_out.stem
+        )
+        previews = self._collect_previews(save_dir)
+
+        report_builder = ReportBuilder(self.context.name)
+        report_builder.save_report(
+            report_path=report_out,
+            metrics=None,
+            operation="Inferência",
+            source_dir=images_dir,
+            inference_performance=performance,
+            detection_previews=previews,
+            weights_path=weights_path,
+        )
+
+        if logger:
+            logger(
+                f"[INFER] Latência: {performance.images_per_second:.2f} img/s ({performance.milliseconds_per_image:.2f} ms/imagem)"
+            )
+            logger(f"[INFER] Relatório salvo em {report_out}")
+
+        return performance
 
     def validate(self, images_dir: Path, report_out: Path, plots_dir: Path, logger: Optional[Logger] = None):
         raise NotImplementedError("Validação via Ultralytics não implementada neste escopo de treino.")
@@ -81,3 +148,16 @@ class YoloDetector(DetectionAlgorithm):
             logger(f"YOLO normalize(): root = {result.output_dir.resolve()}")
             logger(f"YOLO normalize(): dataset.yaml criado em {yaml_path.resolve()}")
         return result
+
+    @staticmethod
+    def _list_images(root: Path) -> List[Path]:
+        extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+        return sorted([p for p in root.iterdir() if p.suffix.lower() in extensions and p.is_file()])
+
+    @staticmethod
+    def _collect_previews(preview_dir: Path, limit: int = 10) -> List[Path]:
+        if not preview_dir.exists():
+            return []
+        extensions = {".jpg", ".jpeg", ".png", ".bmp"}
+        previews = [p for p in preview_dir.iterdir() if p.suffix.lower() in extensions and p.is_file()]
+        return sorted(previews)[:limit]
