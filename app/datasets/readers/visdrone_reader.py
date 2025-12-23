@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -9,17 +8,92 @@ from app.datasets.utils import clip_bbox, is_image_file, load_image_size, load_j
 from app.detectors.base import Logger
 
 
-def _detect_splits(root: Path) -> List[Tuple[str, Path]]:
-    candidates = []
-    for split in ("train", "val", "test-dev", "test-challenge"):
-        split_dir = root / split
-        if split_dir.exists():
-            candidates.append((split, split_dir))
-    if candidates:
-        return candidates
-    if (root / "images").exists():
-        return [(root.name, root)]
-    return []
+def _classify_split(name: str) -> Optional[str]:
+    lower = name.lower()
+    if "train" in lower:
+        return "train"
+    if "val" in lower:
+        return "val"
+    if "test-dev" in lower or "test-challenge" in lower or "test" in lower:
+        return "test"
+    return None
+
+
+def _iter_image_files(images_dir: Path) -> List[Path]:
+    return [p for p in sorted(images_dir.iterdir()) if p.is_file() and is_image_file(p)]
+
+
+def _has_annotation_files(annotations_dir: Path) -> bool:
+    if not annotations_dir.exists():
+        return False
+    return any(p.is_file() and p.suffix.lower() == ".txt" for p in annotations_dir.iterdir())
+
+
+def _gather_candidate_dirs(input_dir: Path) -> List[Path]:
+    candidates = [input_dir]
+    for child in input_dir.iterdir():
+        if child.is_dir():
+            candidates.append(child)
+            if child.name.startswith("VisDrone2019-DET-"):
+                continue
+            for grandchild in child.iterdir():
+                if grandchild.is_dir() and grandchild.name.startswith("VisDrone2019-DET-"):
+                    candidates.append(grandchild)
+
+    if _classify_split(input_dir.name):
+        for sibling in input_dir.parent.iterdir():
+            if sibling.is_dir():
+                candidates.append(sibling)
+
+    unique: List[Path] = []
+    seen = set()
+    for path in candidates:
+        if path not in seen:
+            unique.append(path)
+            seen.add(path)
+    return unique
+
+
+def resolve_visdrone_splits(input_dir: Path) -> Dict[str, Optional[Path]]:
+    input_dir = input_dir.expanduser().resolve()
+    resolved: Dict[str, Optional[Path]] = {"train": None, "val": None, "test": None}
+    tested: List[Tuple[Path, str, bool, bool]] = []
+
+    for candidate in _gather_candidate_dirs(input_dir):
+        split = _classify_split(candidate.name)
+        if split is None:
+            continue
+
+        images_dir = candidate / "images"
+        ann_dir = candidate / "annotations"
+        has_images = images_dir.exists() and any(_iter_image_files(images_dir))
+        has_annotations = _has_annotation_files(ann_dir)
+        tested.append((candidate, split, has_images, has_annotations))
+
+        if not has_images:
+            continue
+        if split in {"train", "val"} and not has_annotations:
+            raise FileNotFoundError(f"split {split} sem annotations em {candidate}")
+        if split == "test":
+            current = resolved["test"]
+            current_has_ann = current is not None and _has_annotation_files(current / "annotations")
+            if resolved["test"] is None or (not current_has_ann and has_annotations):
+                resolved["test"] = candidate
+        elif resolved[split] is None:
+            resolved[split] = candidate
+
+    missing = [s for s in ("train", "val") if resolved[s] is None]
+    if missing:
+        tested_desc = "; ".join(
+            f"{path} (split={split}, imagens={'ok' if has_img else 'faltando'}, "
+            f"annotations={'ok' if has_ann else 'faltando'})"
+            for path, split, has_img, has_ann in tested
+        )
+        details = tested_desc if tested_desc else "nenhum candidato detectado"
+        raise FileNotFoundError(
+            f"Splits obrigatórios não encontrados ({', '.join(missing)}) em {input_dir}. Avaliados: {details}"
+        )
+    return resolved
 
 
 def _load_human_categories(config_path: Path, override: Optional[List[int]]) -> List[int]:
@@ -47,10 +121,6 @@ def _read_annotation_file(path: Path) -> List[List[int]]:
             except ValueError:
                 continue
     return lines
-
-
-def _iter_image_files(images_dir: Path) -> List[Path]:
-    return [p for p in sorted(images_dir.iterdir()) if p.is_file() and is_image_file(p)]
 
 
 def _make_annotation(
@@ -83,9 +153,12 @@ def read_visdrone(
     logger: Optional[Logger] = None,
 ) -> Tuple[DatasetIR, Dict[str, int], List[str], bool]:
     dataset_dir = dataset_dir.expanduser().resolve()
-    splits = _detect_splits(dataset_dir)
-    if not splits:
-        raise FileNotFoundError(f"Não foram encontradas pastas de split em {dataset_dir}")
+    splits = resolve_visdrone_splits(dataset_dir)
+    if logger:
+        logger(
+            f"VisDrone splits detectados: train={splits['train']}, val={splits['val']}, "
+            f"test={splits.get('test')}"
+        )
 
     images: List[ImageRecord] = []
     annotations: List[AnnotationRecord] = []
@@ -99,10 +172,15 @@ def read_visdrone(
     warnings: List[str] = []
     is_labelled = False
     human_class = "human"
+    images_per_split: Dict[str, int] = {"train": 0, "val": 0, "test": 0}
+    labels_per_split: Dict[str, int] = {"train": 0, "val": 0, "test": 0}
 
     image_id = 0
     ann_id = 0
-    for split_name, split_dir in splits:
+    for split_name in ("train", "val", "test"):
+        split_dir = splits.get(split_name)
+        if split_dir is None:
+            continue
         images_dir = split_dir / "images"
         annotations_dir = split_dir / "annotations"
         if not images_dir.exists():
@@ -117,9 +195,10 @@ def read_visdrone(
                 path=image_path,
                 width=width,
                 height=height,
-                split=split_name,
+                split="test" if split_name.startswith("test") else split_name,
             )
             images.append(img_record)
+            images_per_split[img_record.split] = images_per_split.get(img_record.split, 0) + 1
 
             annotation_path = annotations_dir / f"{image_path.stem}.txt"
             if not annotations_dir.exists():
@@ -141,6 +220,7 @@ def read_visdrone(
                 if score_or_ignored == 0:
                     discarded["ignored_by_score"] += 1
                     continue
+                # VisDrone DET: categoria 1 = pedestrian (mapeado para classe única "human")
                 if category not in human_categories:
                     discarded["non_human_category"] += 1
                     continue
@@ -168,6 +248,15 @@ def read_visdrone(
                 )
             if ann_for_image == 0 and annotations_dir.exists():
                 warnings.append(f"{image_path.name} ficou sem anotações após filtros em {split_name}")
+            labels_per_split[img_record.split] = labels_per_split.get(img_record.split, 0) + ann_for_image
 
     dataset = DatasetIR(classes=[human_class], images=images, annotations=annotations)
+    if logger:
+        logger(
+            "Contagem gerada por split (imagens/labels): "
+            + ", ".join(
+                f"{split}={images_per_split.get(split,0)}/{labels_per_split.get(split,0)}"
+                for split in ("train", "val", "test")
+            )
+        )
     return dataset, discarded, warnings, is_labelled
