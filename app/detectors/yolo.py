@@ -4,8 +4,6 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-import yaml
-
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.utils import copy_ultralytics_checkpoint, resolve_device, seed_everything, validate_yolo_dataset
@@ -164,106 +162,25 @@ class YoloDetector(DetectionAlgorithm):
         plots_dir = plots_dir.expanduser().resolve()
 
         dataset_yaml_path = self._resolve_dataset_yaml_path(dataset_path).resolve()
-        cfg = yaml.safe_load(dataset_yaml_path.read_text(encoding="utf-8"))
-        if not isinstance(cfg, dict):
-            raise ValueError(f"dataset.yaml inválido (esperado objeto mapeável): {dataset_yaml_path}")
-
-        try:
-            raw_root = cfg["path"]
-            if isinstance(raw_root, str):
-                raw_root = raw_root.strip()
-            root = Path(raw_root).expanduser()
-            if not root.is_absolute():
-                root = (dataset_yaml_path.parent / root).resolve()
-            else:
-                root = root.resolve()
-            train_dir = (root / "images" / "train").resolve()
-            val_dir = (root / "images" / "val").resolve()
-        except KeyError as exc:  # noqa: PERF203
-            raise ValueError(f"Chave obrigatória ausente em {dataset_yaml_path}: {exc}") from exc
-
-        test_dir = (root / cfg["test"]).expanduser().resolve() if "test" in cfg else None
-        dataset_yaml_resolved = dataset_yaml_path
-        cwd_before = Path.cwd()
-        if logger:
-            logger(f"[VAL] dataset.yaml informado: {dataset_yaml_resolved}")
-            logger(f"[VAL] cwd atual: {cwd_before}")
-            logger(f"[VAL] cfg.path={cfg.get('path')} | train={cfg.get('train')} | val={cfg.get('val')}")
-            logger(f"[VAL] Diretório raiz resolvido: {root}")
-            logger(f"[VAL] train_dir: {train_dir}")
-            logger(f"[VAL] val_dir: {val_dir}")
-            if test_dir:
-                logger(f"[VAL] test_dir: {test_dir}")
-
-        images_root = root / "images"
-        if logger:
-            logger(f"train_dir repr={train_dir!r}")
-            logger(f"val_dir repr={val_dir!r}")
-            logger(f"root exists={root.exists()} images={images_root.exists()}")
-            if images_root.exists():
-                subdirs = [p.resolve() for p in images_root.iterdir() if p.is_dir()]
-                logger(f"root/images subdirs: {[str(p) for p in subdirs]}")
-
-        missing = []
-        for label, path in (("train", train_dir), ("val", val_dir)):
-            if not path.exists():
-                missing.append((label, path))
-                if logger:
-                    logger(f"[VAL] Caminho ausente para {label}_dir: {path}")
-
-        if missing:
-            images_root = root / "images"
-            listing = ""
-            if images_root.exists() and images_root.is_dir():
-                entries = sorted(images_root.iterdir())
-                listing_lines = [str(entry.resolve()) for entry in entries]
-                listing = "\n".join(listing_lines)
-            missing_str = "; ".join(f"{label}={path}" for label, path in missing)
-            debug_message = (
-                "dataset.yaml inválido para validação.\n"
-                f"YAML usado: {dataset_yaml_resolved}\n"
-                f"root calculado: {root}\n"
-                f"train_dir: {train_dir}\n"
-                f"val_dir: {val_dir}\n"
-                f"Ausentes: {missing_str}"
-            )
-            if listing:
-                debug_message += f"\nConteúdo de {images_root.resolve()}:\n{listing}"
-            raise FileNotFoundError(debug_message)
-        if logger:
-            logger(f"[VAL] Diretórios encontrados (train/val): {train_dir} | {val_dir}")
-
-        weights_resolved = weights_path.expanduser().resolve() if weights_path else None
-        if weights_resolved is not None and not weights_resolved.exists():
+        weights_resolved = weights_path.expanduser().resolve() if weights_path else Path("yolov8n.pt")
+        if weights_path is not None and not weights_resolved.exists():
             raise FileNotFoundError(f"Pesos não encontrados: {weights_resolved}")
 
-        base_weights = str(weights_resolved) if weights_resolved else "yolov8n.pt"
+        base_weights = weights_resolved
         device_str = resolve_device(self.config.device)
         if logger:
-            weight_label = weights_resolved if weights_resolved else "pesos padrão (yolov8n.pt)"
-            logger(f"[VAL] {self.context.name} validando {dataset_yaml_resolved} em {device_str} usando {weight_label}")
+            logger(f"[VAL] {self.context.name} validando {dataset_yaml_path} em {device_str} usando {base_weights}")
             if pedestrian_only:
                 logger("[VAL] Filtrando apenas classe pedestrian (0) durante a validação")
 
         model = YOLO(base_weights)
-        val_name = report_out.stem
-        results = model.val(
-            data=str(dataset_yaml_resolved),
-            imgsz=640,
-            device=device_str,
-            project=str(plots_dir),
-            name=val_name,
-            exist_ok=True,
-            verbose=False,
-            plots=True,
-            classes=[0] if pedestrian_only else None,
-        )
+        results = model.val(data=dataset_yaml_path)
         if logger:
-            logger(f"[VAL] Validação concluída para {dataset_yaml_resolved}")
+            logger(f"[VAL] Validação concluída para {dataset_yaml_path}")
 
-        run_dir = Path(getattr(results, "save_dir", plots_dir / val_name))
+        run_dir = Path(getattr(results, "save_dir", plots_dir / report_out.stem))
         run_dir.mkdir(parents=True, exist_ok=True)
-        metrics = self._build_metrics_from_results(results, device_str, weights_resolved or Path("yolov8n.pt"))
+        metrics = self._build_metrics_from_results(results, device_str, weights_resolved)
 
         report_builder = ReportBuilder(self.context.name)
         metrics_plot = run_dir / "metrics_summary.png"
@@ -272,9 +189,9 @@ class YoloDetector(DetectionAlgorithm):
             report_path=report_out,
             metrics=metrics,
             operation="Validação",
-            source_dir=val_dir,
+            source_dir=dataset_yaml_path.parent,
             plot_path=metrics_plot,
-            weights_path=weights_resolved or Path("yolov8n.pt"),
+            weights_path=weights_resolved,
         )
 
         if logger:
