@@ -163,22 +163,27 @@ class YoloDetector(DetectionAlgorithm):
         report_out = report_out.expanduser().resolve()
         plots_dir = plots_dir.expanduser().resolve()
 
-        dataset_yaml_path = self._resolve_dataset_yaml_path(dataset_path)
+        dataset_yaml_path = self._resolve_dataset_yaml_path(dataset_path).resolve()
         cfg = yaml.safe_load(dataset_yaml_path.read_text(encoding="utf-8"))
         if not isinstance(cfg, dict):
             raise ValueError(f"dataset.yaml inválido (esperado objeto mapeável): {dataset_yaml_path}")
 
         try:
-            root = Path(cfg["path"]).expanduser()
+            raw_root = cfg["path"]
+            if isinstance(raw_root, str):
+                raw_root = raw_root.strip()
+            root = Path(raw_root).expanduser()
             if not root.is_absolute():
                 root = (dataset_yaml_path.parent / root).resolve()
-            train_dir = (root / cfg["train"]).expanduser().resolve()
-            val_dir = (root / cfg["val"]).expanduser().resolve()
+            else:
+                root = root.resolve()
+            train_dir = (root / "images" / "train").resolve()
+            val_dir = (root / "images" / "val").resolve()
         except KeyError as exc:  # noqa: PERF203
             raise ValueError(f"Chave obrigatória ausente em {dataset_yaml_path}: {exc}") from exc
 
         test_dir = (root / cfg["test"]).expanduser().resolve() if "test" in cfg else None
-        dataset_yaml_resolved = dataset_yaml_path.resolve()
+        dataset_yaml_resolved = dataset_yaml_path
         cwd_before = Path.cwd()
         if logger:
             logger(f"[VAL] dataset.yaml informado: {dataset_yaml_resolved}")
@@ -189,6 +194,15 @@ class YoloDetector(DetectionAlgorithm):
             logger(f"[VAL] val_dir: {val_dir}")
             if test_dir:
                 logger(f"[VAL] test_dir: {test_dir}")
+
+        images_root = root / "images"
+        if logger:
+            logger(f"train_dir repr={train_dir!r}")
+            logger(f"val_dir repr={val_dir!r}")
+            logger(f"root exists={root.exists()} images={images_root.exists()}")
+            if images_root.exists():
+                subdirs = [p.resolve() for p in images_root.iterdir() if p.is_dir()]
+                logger(f"root/images subdirs: {[str(p) for p in subdirs]}")
 
         missing = []
         for label, path in (("train", train_dir), ("val", val_dir)):
