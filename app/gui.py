@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
+from queue import Queue
+from threading import Thread
+from tkinter import filedialog, messagebox, ttk
+from typing import Optional
 
-from app.controller import ExperimentController
+from app.controller import ExperimentController, OperationResult
 from app.logging_utils import PromptLogForwarder, capture_prompt_output
 
 
@@ -37,7 +40,10 @@ class DetectorApp(tk.Tk):
         self._build_header()
         self._build_forms()
         self._build_log_area()
+        self.log_queue: Queue[str] = Queue()
+        self._worker_thread: Optional[Thread] = None
         self._render_fields()
+        self.after(100, self._poll_log_queue)
 
     def _build_header(self) -> None:
         header = tk.Frame(self, bg="#0b172a")
@@ -187,6 +193,14 @@ class DetectorApp(tk.Tk):
         self.log_widget.insert("end", message + "\n")
         self.log_widget.see("end")
 
+    def _queue_log(self, message: str) -> None:
+        self.log_queue.put(message)
+
+    def _poll_log_queue(self) -> None:
+        while not self.log_queue.empty():
+            self._append_log(self.log_queue.get())
+        self.after(100, self._poll_log_queue)
+
     def _build_prompt_command(self, action: str, algorithm: str, args: dict[str, object]) -> str:
         parts = [action.lower(), algorithm]
         for key, value in args.items():
@@ -205,32 +219,38 @@ class DetectorApp(tk.Tk):
         return "$ " + " ".join(str(part) for part in parts)
 
     def _execute_action(self) -> None:
+        if self._worker_thread and self._worker_thread.is_alive():
+            messagebox.showinfo("Em execução", "Aguarde o término do comando atual antes de iniciar outro.")
+            return
+
         action = self.action_var.get()
         algorithm_key = self.algorithm_var.get()
-        prompt_logger = PromptLogForwarder(self._append_log, Path("app.log"))
+        prompt_logger = PromptLogForwarder(self._queue_log, Path("app.log"))
+
         try:
-            with capture_prompt_output(prompt_logger):
-                if action == "Treinar":
-                    dataset = Path(self.path_vars["dataset"].get())
-                    weights = Path(self.path_vars["weights"].get())
-                    pretrained_raw = self.path_vars["pretrained"].get().strip()
-                    pretrained = Path(pretrained_raw) if pretrained_raw else None
-                    epochs = int(self.epochs_var.get())
-                    early_stop = bool(self.early_stop_var.get())
-                    prompt_logger(
-                        self._build_prompt_command(
-                            "treinar",
-                            algorithm_key,
-                            {
-                                "dataset": dataset,
-                                "pesos_out": weights,
-                                "pretreinados": pretrained or "padrão",
-                                "epocas": epochs,
-                                "parada_antecipada": early_stop,
-                            },
-                        )
+            if action == "Treinar":
+                dataset = Path(self.path_vars["dataset"].get())
+                weights = Path(self.path_vars["weights"].get())
+                pretrained_raw = self.path_vars["pretrained"].get().strip()
+                pretrained = Path(pretrained_raw) if pretrained_raw else None
+                epochs = int(self.epochs_var.get())
+                early_stop = bool(self.early_stop_var.get())
+                prompt_logger(
+                    self._build_prompt_command(
+                        "treinar",
+                        algorithm_key,
+                        {
+                            "dataset": dataset,
+                            "pesos_out": weights,
+                            "pretreinados": pretrained or "padrão",
+                            "epocas": epochs,
+                            "parada_antecipada": early_stop,
+                        },
                     )
-                    result = self.controller.execute_train(
+                )
+
+                def run_action() -> OperationResult:
+                    return self.controller.execute_train(
                         algorithm_key,
                         dataset,
                         pretrained,
@@ -239,53 +259,77 @@ class DetectorApp(tk.Tk):
                         early_stop,
                         prompt_logger,
                     )
-                elif action == "Inferir":
-                    images = Path(self.path_vars["images"].get())
-                    weights_raw = self.path_vars["inference_weights"].get().strip()
-                    weights = Path(weights_raw) if weights_raw else None
-                    report = Path(self.path_vars["report"].get())
-                    prompt_logger(
-                        self._build_prompt_command(
-                            "inferir",
-                            algorithm_key,
-                            {"imagens": images, "pesos": weights or "padrão", "relatorio": report},
-                        )
+
+            elif action == "Inferir":
+                images = Path(self.path_vars["images"].get())
+                weights_raw = self.path_vars["inference_weights"].get().strip()
+                weights = Path(weights_raw) if weights_raw else None
+                report = Path(self.path_vars["report"].get())
+                prompt_logger(
+                    self._build_prompt_command(
+                        "inferir",
+                        algorithm_key,
+                        {"imagens": images, "pesos": weights or "padrão", "relatorio": report},
                     )
-                    result = self.controller.execute_infer(algorithm_key, images, weights, report, prompt_logger)
-                elif action == "Validar":
-                    images = Path(self.path_vars["images"].get())
-                    plots = Path(self.path_vars["plots"].get())
-                    report = Path(self.path_vars["report"].get())
-                    prompt_logger(
-                        self._build_prompt_command(
-                            "validar",
-                            algorithm_key,
-                            {"imagens": images, "graficos": plots, "relatorio": report},
-                        )
+                )
+
+                def run_action() -> OperationResult:
+                    return self.controller.execute_infer(algorithm_key, images, weights, report, prompt_logger)
+
+            elif action == "Validar":
+                images = Path(self.path_vars["images"].get())
+                plots = Path(self.path_vars["plots"].get())
+                report = Path(self.path_vars["report"].get())
+                prompt_logger(
+                    self._build_prompt_command(
+                        "validar",
+                        algorithm_key,
+                        {"imagens": images, "graficos": plots, "relatorio": report},
                     )
-                    result = self.controller.execute_validate(algorithm_key, images, report, plots, prompt_logger)
-                elif action == "Normalizar dataset":
-                    dataset = Path(self.path_vars["dataset"].get())
-                    normalized = Path(self.path_vars["normalized"].get())
-                    dataset_type = self.dataset_type_var.get().lower()
-                    prompt_logger(
-                        self._build_prompt_command(
-                            "normalizar",
-                            algorithm_key,
-                            {"dataset": dataset, "tipo": dataset_type, "saida": normalized},
-                        )
+                )
+
+                def run_action() -> OperationResult:
+                    return self.controller.execute_validate(algorithm_key, images, report, plots, prompt_logger)
+
+            elif action == "Normalizar dataset":
+                dataset = Path(self.path_vars["dataset"].get())
+                normalized = Path(self.path_vars["normalized"].get())
+                dataset_type = self.dataset_type_var.get().lower()
+                prompt_logger(
+                    self._build_prompt_command(
+                        "normalizar",
+                        algorithm_key,
+                        {"dataset": dataset, "tipo": dataset_type, "saida": normalized},
                     )
-                    result = self.controller.execute_normalize(
+                )
+
+                def run_action() -> OperationResult:
+                    return self.controller.execute_normalize(
                         algorithm_key, dataset_type, dataset, normalized, prompt_logger
                     )
-                else:
-                    raise ValueError("Ação desconhecida")
+
+            else:
+                raise ValueError("Ação desconhecida")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Erro", str(exc))
             self._append_log(f"Erro: {exc}")
             return
 
-        prompt_logger(f"$ comando finalizado → {result.message}")
+        self._set_running(True)
+
+        def worker() -> None:
+            try:
+                with capture_prompt_output(prompt_logger):
+                    result = run_action()
+                prompt_logger(f"$ comando finalizado → {result.message}")
+                self.after(0, self._on_action_complete, result)
+            except Exception as exc:  # noqa: BLE001
+                self.after(0, self._on_action_error, exc)
+
+        self._worker_thread = Thread(target=worker, daemon=True)
+        self._worker_thread.start()
+
+    def _on_action_complete(self, result: OperationResult) -> None:
         if result.inference_performance:
             perf = result.inference_performance
             self._append_log(
@@ -297,7 +341,20 @@ class DetectorApp(tk.Tk):
                 f"Métricas → Precisão: {m.precision:.3f}, Recall: {m.recall:.3f}, mAP@0.50: {m.map50:.3f}, mAP@0.50:0.95: {m.map50_95:.3f}"
             )
         self._append_log(result.message)
+        self._set_running(False)
         messagebox.showinfo("Concluído", result.message)
+
+    def _on_action_error(self, exc: Exception) -> None:
+        self._set_running(False)
+        self._append_log(f"Erro: {exc}")
+        messagebox.showerror("Erro", str(exc))
+
+    def _set_running(self, running: bool) -> None:
+        if running:
+            self.run_button.state(["disabled"])
+        else:
+            self.run_button.state(["!disabled"])
+        self.update_idletasks()
 
 
 def run_app() -> None:
