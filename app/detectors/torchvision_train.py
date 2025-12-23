@@ -8,7 +8,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, random_split
@@ -28,6 +28,47 @@ except Exception:  # pragma: no cover - fallback silencioso se tqdm não estiver
 
 # Exemplo de execução:
 # python train_ssd.py --dataset heridal --epochs 1 --verbose --log-every 10 --debug-dataloader
+# python torchvision_train.py --dataset heridal --epochs 1 --checkpoint-dir /caminho/para/checkpoints
+
+
+def _normalize_losses(loss_out: Any, device: torch.device) -> Tuple[torch.Tensor, dict]:
+    """
+    Retorna:
+      - loss_total (torch.Tensor)
+      - loss_items (dict) apenas para logging (pode ser vazio)
+    """
+    if isinstance(loss_out, dict):
+        loss_total = sum(v for v in loss_out.values())
+        return loss_total, {k: float(v.detach().cpu()) for k, v in loss_out.items()}
+
+    if isinstance(loss_out, tuple) and len(loss_out) == 2:
+        a, b = loss_out
+        for cand in (a, b):
+            if torch.is_tensor(cand):
+                return _normalize_losses(cand, device)
+        for cand in (a, b):
+            if isinstance(cand, (int, float)):
+                return torch.tensor(float(cand), device=device), {}
+        for cand in (a, b):
+            if isinstance(cand, (dict, list, tuple)):
+                return _normalize_losses(cand, device)
+
+    if isinstance(loss_out, (list, tuple)):
+        items = [x for x in loss_out if x is not None]
+        if not items:
+            return torch.tensor(0.0, device=device), {}
+        tens = []
+        for x in items:
+            if torch.is_tensor(x):
+                tens.append(x)
+            else:
+                tens.append(torch.tensor(float(x), device=device))
+        return sum(tens), {}
+
+    if torch.is_tensor(loss_out):
+        return loss_out, {}
+
+    return torch.tensor(float(loss_out), device=device), {}
 
 
 class _ForwardToLoggerHandler(logging.Handler):
@@ -133,6 +174,7 @@ def train_torchvision_detector(
     val_ratio: float = 0.1,
     train_dataset=None,
     val_dataset=None,
+    checkpoint_dir: Optional[Path] = None,
 ) -> Metrics:
     log_dir = Path(config.log_dir).expanduser().resolve()
     safe_stdout = _safe_stream("stdout", log_dir)
@@ -149,12 +191,20 @@ def train_torchvision_detector(
 
     logging_logger.info("Iniciando setup de treinamento SSD...")
     device_str = resolve_device(config.device)
+    device = torch.device(device_str)
     seed_everything(config.seed)
     logging_logger.info("Dispositivo: %s | torch=%s | cuda_available=%s", device_str, torch.__version__, torch.cuda.is_available())
     logging_logger.info("Configuração: %s", config)
 
+    ckpt_dir = Path(checkpoint_dir) if checkpoint_dir else Path(weights_out).expanduser().resolve().parent
+    ckpt_dir = ckpt_dir.expanduser().resolve()
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    logging_logger.info("Checkpoints serão salvos em: %s", ckpt_dir)
+
     watchdog_stop: Optional[threading.Event] = None
     watchdog_thread: Optional[threading.Thread] = None
+    epoch = 0
+    optimizer: Optional[torch.optim.Optimizer] = None
     try:
         if train_dataset is None or val_dataset is None:
             transform = transforms.Compose([transforms.ToTensor()])
@@ -258,8 +308,10 @@ def train_torchvision_detector(
                 images = [img.to(device_str) for img in images]
                 targets = [{k: v.to(device_str) for k, v in t.items()} for t in targets]
 
-                loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict.values())
+                loss_out = model(images, targets)
+                losses, loss_items = _normalize_losses(loss_out, device)
+                if loss_items:
+                    logging_logger.debug(f"Loss components: {loss_items}")
 
                 optimizer.zero_grad()
                 losses.backward()
@@ -330,11 +382,25 @@ def train_torchvision_detector(
                 for images, targets in val_loader:
                     images = [img.to(device_str) for img in images]
                     targets = [{k: v.to(device_str) for k, v in t.items()} for t in targets]
-                    loss_dict = model(images, targets)
-                    losses = sum(loss for loss in loss_dict.values())
+                    loss_out = model(images, targets)
+                    losses, loss_items = _normalize_losses(loss_out, device)
+                    if loss_items:
+                        logging_logger.debug(f"Loss components: {loss_items}")
                     val_loss += losses.item()
             val_loss = val_loss / max(1, len(val_loader))
             logging_logger.info(f"[VAL] Época {epoch} | loss={val_loss:.4f}")
+
+            epoch_ckpt = ckpt_dir / f"epoch_{epoch:03d}.pth"
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict() if optimizer else None,
+                    "loss": float(avg_loss),
+                },
+                epoch_ckpt,
+            )
+            logging_logger.info("Checkpoint da época %d salvo em %s", epoch, epoch_ckpt)
 
         watchdog_stop.set()
         watchdog_thread.join(timeout=1)
@@ -362,6 +428,20 @@ def train_torchvision_detector(
         logging_logger.exception("Exceção não tratada durante o treinamento.")
         raise
     finally:
+        try:
+            final_epoch = epoch if epoch else 0
+            last_ckpt = ckpt_dir / "last.pth"
+            torch.save(
+                {
+                    "epoch": final_epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict() if optimizer else None,
+                },
+                last_ckpt,
+            )
+            logging_logger.info("Checkpoint final salvo em %s", last_ckpt)
+        except Exception:
+            logging_logger.exception("Falha ao salvar checkpoint final.")
         if watchdog_stop:
             watchdog_stop.set()
         if watchdog_thread:
