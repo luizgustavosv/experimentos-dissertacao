@@ -35,7 +35,7 @@ class DetectionAlgorithm:
     def infer(
         self,
         images_dir: Path,
-        weights_path: Path,
+        weights_path: Optional[Path],
         report_out: Path,
         logger: Optional[Logger] = None,
     ) -> InferencePerformance:

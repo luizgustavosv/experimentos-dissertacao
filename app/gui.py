@@ -208,7 +208,8 @@ class DetectorApp(tk.Tk):
                 )
             elif action == "Inferir":
                 images = Path(self.path_vars["images"].get())
-                weights = Path(self.path_vars["inference_weights"].get())
+                weights_raw = self.path_vars["inference_weights"].get().strip()
+                weights = Path(weights_raw) if weights_raw else None
                 report = Path(self.path_vars["report"].get())
                 result = self.controller.execute_infer(algorithm_key, images, weights, report, self._append_log)
             elif action == "Validar":
