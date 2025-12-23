@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 
@@ -15,3 +16,11 @@ class TrainConfig:
     weight_decay: float = 1e-4
     lr_step_size: int = 3
     lr_gamma: float = 0.1
+    verbose: bool = False
+    log_every: int = 20
+    debug_dataloader: bool = False
+    log_dir: Path = Path("logs")
+    pin_memory: bool = False
+    persistent_workers: bool = False
+    prefetch_factor: Optional[int] = 2
+    drop_last: bool = False
