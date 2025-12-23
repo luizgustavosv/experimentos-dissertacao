@@ -44,7 +44,7 @@ class DetectionAlgorithm:
 
     def validate(
         self,
-        images_dir: Path,
+        dataset_path: Path,
         weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,

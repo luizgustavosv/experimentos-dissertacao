@@ -310,7 +310,7 @@ class DetectorApp(tk.Tk):
                     )
 
             elif action == "Validar":
-                images = Path(self.path_vars["images"].get())
+                dataset_selection = Path(self.path_vars["images"].get())
                 weights_raw = self.path_vars["validation_weights"].get().strip()
                 weights = Path(weights_raw) if weights_raw else None
                 plots = Path(self.path_vars["plots"].get())
@@ -321,7 +321,7 @@ class DetectorApp(tk.Tk):
                         "validar",
                         algorithm_key,
                         {
-                            "imagens": images,
+                            "imagens": dataset_selection,
                             "pesos": weights or "padrão",
                             "graficos": plots,
                             "relatorio": report,
@@ -332,7 +332,7 @@ class DetectorApp(tk.Tk):
 
                 def run_action() -> OperationResult:
                     return self.controller.execute_validate(
-                        algorithm_key, images, weights, report, plots, pedestrian_only, prompt_logger
+                        algorithm_key, dataset_selection, weights, report, plots, pedestrian_only, prompt_logger
                     )
 
             elif action == "Normalizar dataset":

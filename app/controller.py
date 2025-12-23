@@ -50,7 +50,7 @@ class ExperimentController:
     def execute_validate(
         self,
         algorithm_key: str,
-        images_dir: Path,
+        dataset_path: Path,
         weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
@@ -59,7 +59,7 @@ class ExperimentController:
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
         metrics = detector.validate(
-            images_dir, weights_path, report_out, plots_dir, pedestrian_only=pedestrian_only, logger=logger
+            dataset_path, weights_path, report_out, plots_dir, pedestrian_only=pedestrian_only, logger=logger
         )
         return OperationResult(metrics=metrics, message="Validação concluída.")
 
