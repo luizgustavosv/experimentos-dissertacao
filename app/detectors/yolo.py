@@ -4,6 +4,8 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+import yaml
+
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.utils import copy_ultralytics_checkpoint, resolve_device, seed_everything, validate_yolo_dataset
@@ -149,7 +151,7 @@ class YoloDetector(DetectionAlgorithm):
 
     def validate(
         self,
-        images_dir: Path,
+        dataset_path: Path,
         weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
@@ -158,11 +160,65 @@ class YoloDetector(DetectionAlgorithm):
     ):
         from ultralytics import YOLO  # import tardio para evitar dependências pesadas em import
 
-        images_dir = images_dir.expanduser().resolve()
         report_out = report_out.expanduser().resolve()
         plots_dir = plots_dir.expanduser().resolve()
 
-        yaml_path = validate_yolo_dataset(images_dir).resolve()
+        dataset_yaml_path = self._resolve_dataset_yaml_path(dataset_path)
+        cfg = yaml.safe_load(dataset_yaml_path.read_text(encoding="utf-8"))
+        if not isinstance(cfg, dict):
+            raise ValueError(f"dataset.yaml inválido (esperado objeto mapeável): {dataset_yaml_path}")
+
+        try:
+            root = Path(cfg["path"]).expanduser()
+            if not root.is_absolute():
+                root = (dataset_yaml_path.parent / root).resolve()
+            train_dir = (root / cfg["train"]).expanduser().resolve()
+            val_dir = (root / cfg["val"]).expanduser().resolve()
+        except KeyError as exc:  # noqa: PERF203
+            raise ValueError(f"Chave obrigatória ausente em {dataset_yaml_path}: {exc}") from exc
+
+        test_dir = (root / cfg["test"]).expanduser().resolve() if "test" in cfg else None
+        dataset_yaml_resolved = dataset_yaml_path.resolve()
+        cwd_before = Path.cwd()
+        if logger:
+            logger(f"[VAL] dataset.yaml informado: {dataset_yaml_resolved}")
+            logger(f"[VAL] cwd atual: {cwd_before}")
+            logger(f"[VAL] cfg.path={cfg.get('path')} | train={cfg.get('train')} | val={cfg.get('val')}")
+            logger(f"[VAL] Diretório raiz resolvido: {root}")
+            logger(f"[VAL] train_dir: {train_dir}")
+            logger(f"[VAL] val_dir: {val_dir}")
+            if test_dir:
+                logger(f"[VAL] test_dir: {test_dir}")
+
+        missing = []
+        for label, path in (("train", train_dir), ("val", val_dir)):
+            if not path.exists():
+                missing.append((label, path))
+                if logger:
+                    logger(f"[VAL] Caminho ausente para {label}_dir: {path}")
+
+        if missing:
+            images_root = root / "images"
+            listing = ""
+            if images_root.exists() and images_root.is_dir():
+                entries = sorted(images_root.iterdir())
+                listing_lines = [str(entry.resolve()) for entry in entries]
+                listing = "\n".join(listing_lines)
+            missing_str = "; ".join(f"{label}={path}" for label, path in missing)
+            debug_message = (
+                "dataset.yaml inválido para validação.\n"
+                f"YAML usado: {dataset_yaml_resolved}\n"
+                f"root calculado: {root}\n"
+                f"train_dir: {train_dir}\n"
+                f"val_dir: {val_dir}\n"
+                f"Ausentes: {missing_str}"
+            )
+            if listing:
+                debug_message += f"\nConteúdo de {images_root.resolve()}:\n{listing}"
+            raise FileNotFoundError(debug_message)
+        if logger:
+            logger(f"[VAL] Diretórios encontrados (train/val): {train_dir} | {val_dir}")
+
         weights_resolved = weights_path.expanduser().resolve() if weights_path else None
         if weights_resolved is not None and not weights_resolved.exists():
             raise FileNotFoundError(f"Pesos não encontrados: {weights_resolved}")
@@ -171,14 +227,14 @@ class YoloDetector(DetectionAlgorithm):
         device_str = resolve_device(self.config.device)
         if logger:
             weight_label = weights_resolved if weights_resolved else "pesos padrão (yolov8n.pt)"
-            logger(f"[VAL] {self.context.name} validando {yaml_path} em {device_str} usando {weight_label}")
+            logger(f"[VAL] {self.context.name} validando {dataset_yaml_resolved} em {device_str} usando {weight_label}")
             if pedestrian_only:
                 logger("[VAL] Filtrando apenas classe pedestrian (0) durante a validação")
 
         model = YOLO(base_weights)
         val_name = report_out.stem
         results = model.val(
-            data=str(yaml_path),
+            data=str(dataset_yaml_resolved),
             imgsz=640,
             device=device_str,
             project=str(plots_dir),
@@ -188,6 +244,8 @@ class YoloDetector(DetectionAlgorithm):
             plots=True,
             classes=[0] if pedestrian_only else None,
         )
+        if logger:
+            logger(f"[VAL] Validação concluída para {dataset_yaml_resolved}")
 
         run_dir = Path(getattr(results, "save_dir", plots_dir / val_name))
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -200,7 +258,7 @@ class YoloDetector(DetectionAlgorithm):
             report_path=report_out,
             metrics=metrics,
             operation="Validação",
-            source_dir=images_dir,
+            source_dir=val_dir,
             plot_path=metrics_plot,
             weights_path=weights_resolved or Path("yolov8n.pt"),
         )
@@ -212,8 +270,22 @@ class YoloDetector(DetectionAlgorithm):
         if logger:
             logger(f"[VAL] Gráficos salvos em {run_dir}")
             logger(f"[VAL] Relatório salvo em {report_out}")
+            logger(f"[VAL] cwd final: {Path.cwd()}")
 
         return metrics
+
+    @staticmethod
+    def _resolve_dataset_yaml_path(dataset_input: Path) -> Path:
+        dataset_input = dataset_input.expanduser()
+        if dataset_input.suffix.lower() in {".yaml", ".yml"}:
+            yaml_path = dataset_input
+        else:
+            yaml_path = dataset_input / "dataset.yaml"
+        if not yaml_path.exists():
+            raise FileNotFoundError(
+                f"dataset.yaml não encontrado. Caminho informado: {dataset_input.resolve()} | Esperado: {yaml_path.resolve()}"
+            )
+        return yaml_path.resolve()
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):
         from app.datasets.normalizer import normalize_dataset as normalize_pipeline
