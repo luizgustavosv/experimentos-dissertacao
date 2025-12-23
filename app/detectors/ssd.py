@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
 
-from app.datasets.heridal_to_voc import normalize_heridal_to_voc
-from app.datasets.visdrone_to_voc import find_visdrone_splits, normalize_visdrone_to_voc
+from app.datasets.heridal_to_voc import make_split
+from app.datasets.visdrone_to_voc import find_visdrone_splits
 from app.detectors.base import DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.dataset_voc import PascalVOCDataset
 from app.detectors.torchvision_detectors import TorchvisionDetector
 from app.detectors.torchvision_train import train_torchvision_detector
 from app.detectors.utils import resolve_device, validate_voc_dataset
+from normalize_dataset import build_imagesets_main, normalize_to_voc, validate_voc_dataset as robust_validate
 
 
 class SSDDetector(TorchvisionDetector):
@@ -76,18 +78,86 @@ class SSDDetector(TorchvisionDetector):
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):
         dataset_type = dataset_type.lower()
+        normalized_dir = normalized_dir.expanduser().resolve()
+        dataset_dir = dataset_dir.expanduser().resolve()
+        normalized_dir.mkdir(parents=True, exist_ok=True)
+        processed_any = False
+
+        def _canonical_key(name: str) -> str:
+            candidate = name
+            while True:
+                stem = Path(candidate).stem
+                if stem == candidate:
+                    break
+                candidate = stem
+            return candidate.lower()
+
         if dataset_type == "heridal":
-            normalized_path = normalize_heridal_to_voc(dataset_dir, normalized_dir, logger=logger)
+            train_dir = dataset_dir / "train"
+            annotations_dir = train_dir
+            if not train_dir.exists():
+                raise FileNotFoundError(f"Diretório esperado não encontrado para HERIDAL: {train_dir}")
+            images = [p for p in train_dir.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}]
+            splits = make_split([p.name for p in images], train_ratio=0.8, val_ratio=0.2, test_ratio=0.0)
+            class_map = {"*": "human"}
+            for split_name in ("train", "val"):
+                selected = {_canonical_key(name) for name, s in splits.items() if s == split_name}
+                normalize_to_voc(
+                    src_images_dir=str(train_dir),
+                    src_annotations_dir=str(annotations_dir),
+                    out_dir=str(normalized_dir),
+                    split=split_name,
+                    class_map=class_map,
+                    keep_skipped=True,
+                    selected_original_stems=selected,
+                    logger=logger,
+                )
+                processed_any = True
         else:
             visdrone_splits = find_visdrone_splits(dataset_dir)
             has_visdrone_structure = any(visdrone_splits.values())
             if dataset_type == "visdrone" or has_visdrone_structure:
-                normalized_path = normalize_visdrone_to_voc(dataset_dir, normalized_dir, logger=logger)
+                for split_name in ("train", "val"):
+                    split_info = visdrone_splits.get(split_name)
+                    if not split_info:
+                        continue
+                    images_dir, annotations_dir = split_info
+                    normalize_to_voc(
+                        src_images_dir=str(images_dir),
+                        src_annotations_dir=str(annotations_dir),
+                        out_dir=str(normalized_dir),
+                        split=split_name,
+                        class_map={"*": "human"},
+                        keep_skipped=True,
+                        logger=logger,
+                    )
+                    processed_any = True
             else:
                 raise ValueError("Normalização SSD implementada apenas para os datasets HERIDAL ou VisDrone.")
+        if not processed_any:
+            raise ValueError("Nenhum split foi processado; verifique a estrutura do dataset de entrada.")
+        state_path = normalized_dir / "normalization_state.json"
+        if state_path.exists():
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            splits_state = state.get("splits", {})
+            if (not splits_state.get("val")) and splits_state.get("train"):
+                train_ids = list(splits_state["train"])
+                if len(train_ids) == 1:
+                    val_ids = [train_ids[0]]
+                    train_ids = []
+                else:
+                    cut = max(1, len(train_ids) // 5)
+                    val_ids = train_ids[-cut:]
+                    train_ids = train_ids[:-cut]
+                splits_state["train"] = train_ids
+                splits_state["val"] = val_ids
+                state["splits"] = splits_state
+                state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+                build_imagesets_main(normalized_dir, splits_state)
+        robust_validate(normalized_dir, fix=True, logger=logger)
         if logger:
-            logger(f"[SSD][NORM] Dataset pronto em {normalized_path}")
-        return normalized_path
+            logger(f"[SSD][NORM] Dataset pronto em {normalized_dir}")
+        return normalized_dir
 
     def _build_ssd_model(self, num_classes: int, pretrained_weights: Optional[Path], logger: Optional[Logger]):
         from torchvision.models import VGG16_Weights
