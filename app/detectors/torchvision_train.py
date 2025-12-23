@@ -26,6 +26,39 @@ except Exception:  # pragma: no cover - fallback silencioso se tqdm não estiver
     tqdm = None
 
 
+def _describe_structure(obj: Any, depth: int = 0, max_depth: int = 4) -> str:
+    if depth >= max_depth:
+        return "..."
+    if isinstance(obj, dict):
+        keys = list(obj.keys())
+        key_str = ",".join(map(str, keys))
+        value_parts = []
+        for idx, value in enumerate(obj.values()):
+            if idx >= 3:
+                value_parts.append("...")
+                break
+            value_parts.append(_describe_structure(value, depth + 1, max_depth))
+        values_desc = ",".join(value_parts)
+        return f"dict(keys=[{key_str}], values=[{values_desc}])"
+    if isinstance(obj, (list, tuple)):
+        parts = []
+        for idx, value in enumerate(obj):
+            if idx >= 4:
+                parts.append("...")
+                break
+            parts.append(_describe_structure(value, depth + 1, max_depth))
+        joined = ",".join(parts)
+        type_name = "list" if isinstance(obj, list) else "tuple"
+        return f"{type_name}[len={len(obj)}]([{joined}])"
+    if torch.is_tensor(obj):
+        return "tensor"
+    if isinstance(obj, (float, int)):
+        return "float"
+    if obj is None:
+        return "None"
+    return type(obj).__name__
+
+
 # Exemplo de execução:
 # python train_ssd.py --dataset heridal --epochs 1 --verbose --log-every 10 --debug-dataloader
 # python torchvision_train.py --dataset heridal --epochs 1 --checkpoint-dir /caminho/para/checkpoints
@@ -37,38 +70,58 @@ def _normalize_losses(loss_out: Any, device: torch.device) -> Tuple[torch.Tensor
       - loss_total (torch.Tensor)
       - loss_items (dict) apenas para logging (pode ser vazio)
     """
-    if isinstance(loss_out, dict):
-        loss_total = sum(v for v in loss_out.values())
-        return loss_total, {k: float(v.detach().cpu()) for k, v in loss_out.items()}
+    logger = logging.getLogger("ssd_train")
+    warned_types: set[str] = set()
+    loss_items: dict[str, float] = {}
 
-    if isinstance(loss_out, tuple) and len(loss_out) == 2:
-        a, b = loss_out
-        for cand in (a, b):
-            if torch.is_tensor(cand):
-                return _normalize_losses(cand, device)
-        for cand in (a, b):
-            if isinstance(cand, (int, float)):
-                return torch.tensor(float(cand), device=device), {}
-        for cand in (a, b):
-            if isinstance(cand, (dict, list, tuple)):
-                return _normalize_losses(cand, device)
+    def _accumulate(obj: Any, prefix: str = "") -> torch.Tensor:
+        total = torch.tensor(0.0, device=device)
 
-    if isinstance(loss_out, (list, tuple)):
-        items = [x for x in loss_out if x is not None]
-        if not items:
-            return torch.tensor(0.0, device=device), {}
-        tens = []
-        for x in items:
-            if torch.is_tensor(x):
-                tens.append(x)
-            else:
-                tens.append(torch.tensor(float(x), device=device))
-        return sum(tens), {}
+        if obj is None:
+            return total
 
-    if torch.is_tensor(loss_out):
-        return loss_out, {}
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                child_prefix = f"{prefix}{key}."
+                total = total + _accumulate(value, child_prefix)
+            return total
 
-    return torch.tensor(float(loss_out), device=device), {}
+        if isinstance(obj, (list, tuple)):
+            for idx, value in enumerate(obj):
+                child_prefix = f"{prefix}{idx}."
+                total = total + _accumulate(value, child_prefix)
+            return total
+
+        if torch.is_tensor(obj):
+            if obj.device != device:
+                obj = obj.to(device)
+            name = prefix[:-1] if prefix.endswith(".") else prefix
+            if name:
+                try:
+                    loss_items[name] = float(obj.detach().cpu())
+                except Exception:
+                    logger.debug("Falha ao registrar loss_item para %s", name)
+            return obj
+
+        if isinstance(obj, (int, float)):
+            name = prefix[:-1] if prefix.endswith(".") else prefix
+            if name:
+                loss_items[name] = float(obj)
+            return torch.tensor(float(obj), device=device)
+
+        tname = type(obj).__name__
+        if tname not in warned_types:
+            warned_types.add(tname)
+            logger.warning("_normalize_losses ignorando tipo inesperado em loss_out: %s", tname)
+        return total
+
+    try:
+        loss_total = _accumulate(loss_out)
+    except Exception:
+        logger.exception("_normalize_losses falhou; retornando 0.0")
+        return torch.tensor(0.0, device=device), {}
+
+    return loss_total, loss_items
 
 
 class _ForwardToLoggerHandler(logging.Handler):
@@ -281,6 +334,7 @@ def train_torchvision_detector(
         watchdog_thread = _start_watchdog(log_path, last_progress, watchdog_stop, logging_logger, safe_stderr=safe_stderr)
 
         last_loss = None
+        logged_loss_structure = False
         heartbeat_seconds = 10
         log_every_batches = max(1, config.log_every)
 
@@ -309,7 +363,19 @@ def train_torchvision_detector(
                 targets = [{k: v.to(device_str) for k, v in t.items()} for t in targets]
 
                 loss_out = model(images, targets)
-                losses, loss_items = _normalize_losses(loss_out, device)
+                if not logged_loss_structure:
+                    try:
+                        logging_logger.info("Loss return structure: %s", _describe_structure(loss_out))
+                    except Exception:
+                        logging_logger.exception("Falha ao descrever estrutura de loss_out.")
+                    finally:
+                        logged_loss_structure = True
+                try:
+                    losses, loss_items = _normalize_losses(loss_out, device)
+                except Exception:
+                    logging_logger.exception("Falha ao normalizar losses; usando 0.0 para continuar.")
+                    losses = torch.tensor(0.0, device=device)
+                    loss_items = {}
                 if loss_items:
                     logging_logger.debug(f"Loss components: {loss_items}")
 
@@ -383,7 +449,12 @@ def train_torchvision_detector(
                     images = [img.to(device_str) for img in images]
                     targets = [{k: v.to(device_str) for k, v in t.items()} for t in targets]
                     loss_out = model(images, targets)
-                    losses, loss_items = _normalize_losses(loss_out, device)
+                    try:
+                        losses, loss_items = _normalize_losses(loss_out, device)
+                    except Exception:
+                        logging_logger.exception("Falha ao normalizar losses no val; usando 0.0 para continuar.")
+                        losses = torch.tensor(0.0, device=device)
+                        loss_items = {}
                     if loss_items:
                         logging_logger.debug(f"Loss components: {loss_items}")
                     val_loss += losses.item()
