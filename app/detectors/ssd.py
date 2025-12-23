@@ -27,9 +27,8 @@ class SSDDetector(TorchvisionDetector):
         self,
         dataset_dir: Path,
         pretrained_weights: Optional[Path],
-        weights_out: Path,
+        output_dir: Path,
         epochs: int,
-        early_stop: bool,
         logger: Optional[Logger] = None,
     ):
         from torchvision import transforms
@@ -57,7 +56,7 @@ class SSDDetector(TorchvisionDetector):
             dataset_root,
             train_ann=None,
             val_ann=None,
-            weights_out=weights_out,
+            weights_out=output_dir,
             config=TrainConfig(
                 epochs=epochs or self.config.epochs,
                 batch_size=self.config.batch_size,

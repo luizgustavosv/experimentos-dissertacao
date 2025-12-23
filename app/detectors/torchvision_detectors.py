@@ -28,9 +28,8 @@ class TorchvisionDetector(DetectionAlgorithm):
         self,
         dataset_dir: Path,
         pretrained_weights: Optional[Path],
-        weights_out: Path,
+        output_dir: Path,
         epochs: int,
-        early_stop: bool,
         logger: Optional[Logger] = None,
     ) -> Metrics:
         train_ann, val_ann = validate_coco_dataset(dataset_dir)
@@ -47,7 +46,7 @@ class TorchvisionDetector(DetectionAlgorithm):
             dataset_dir,
             train_ann,
             val_ann,
-            weights_out,
+            output_dir,
             TrainConfig(
                 epochs=epochs or self.config.epochs,
                 batch_size=self.config.batch_size,
@@ -70,7 +69,7 @@ class TorchvisionDetector(DetectionAlgorithm):
             logger=logger,
         )
 
-        ensure_weights_size(weights_out)
+        ensure_weights_size(output_dir)
         return metrics
 
     def _infer_num_classes(self, ann_path: Path) -> int:
