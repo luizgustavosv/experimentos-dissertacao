@@ -41,15 +41,24 @@ def validate_coco_dataset(dataset_dir: Path) -> Tuple[Path, Path]:
     images_root = dataset_dir / "images"
     train_images = images_root / "train"
     val_images = images_root / "val"
-    train_ann = dataset_dir / "train.json"
-    val_ann = dataset_dir / "val.json"
-    missing = [p for p in [train_images, val_images, train_ann, val_ann] if not p.exists()]
-    if missing:
+    ann_candidates = [
+        (dataset_dir / "annotations" / "instances_train.json", dataset_dir / "annotations" / "instances_val.json"),
+        (dataset_dir / "train.json", dataset_dir / "val.json"),
+    ]
+    train_ann, val_ann = next(((train, val) for train, val in ann_candidates if train.exists() and val.exists()), (None, None))
+    required_paths = [train_images, val_images]
+    if train_ann and val_ann:
+        required_paths.extend([train_ann, val_ann])
+    missing = [p for p in required_paths if not p or not p.exists()]
+    if missing or train_ann is None or val_ann is None:
+        if train_ann is None or val_ann is None:
+            missing.extend([train_ann or dataset_dir / "annotations" / "instances_train.json", val_ann or dataset_dir / "annotations" / "instances_val.json"])
         missing_str = ", ".join(str(p) for p in missing)
         raise FileNotFoundError(
-            "Dataset COCO incompleto. Esperado: images/train, images/val, train.json e val.json. "
+            "Dataset COCO incompleto. Esperado: images/train, images/val e anotações (train/val). "
             f"Faltando: {missing_str}"
         )
+    assert train_ann is not None and val_ann is not None
     return train_ann, val_ann
 
 
@@ -99,4 +108,3 @@ def describe_dataloader(dataset, logger: Optional[Logger]) -> None:
 
 def read_json(path: Path) -> Dict:
     return json.loads(path.read_text(encoding="utf-8"))
-
