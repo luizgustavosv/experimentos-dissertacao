@@ -115,7 +115,8 @@ class TorchvisionDetector(DetectionAlgorithm):
 
             save_path = save_dir / image_path.name
             transforms.ToPILImage()(drawn).save(save_path)
-            previews.append(save_path)
+            if boxes.numel() > 0:
+                previews.append(save_path)
             if logger:
                 logger(f"[INFER] {image_path.name}: {len(boxes)} detecções acima de 0.5")
 
@@ -156,9 +157,15 @@ class TorchvisionDetector(DetectionAlgorithm):
     def _load_model_for_inference(
         self, weights_path: Optional[Path], device_str: str, logger: Optional[Logger]
     ) -> Tuple[torch.nn.Module, Sequence[str], Optional[Path]]:
-        if self.context.architecture != "SSD":
-            raise NotImplementedError("Inferência implementada apenas para SSD neste módulo.")
+        if self.context.architecture == "SSD":
+            return self._load_ssd_for_inference(weights_path, device_str, logger)
+        if self.context.architecture == "Faster R-CNN":
+            return self._load_faster_rcnn_for_inference(weights_path, device_str, logger)
+        raise NotImplementedError(f"Inferência não implementada para {self.context.architecture} neste módulo.")
 
+    def _load_ssd_for_inference(
+        self, weights_path: Optional[Path], device_str: str, logger: Optional[Logger]
+    ) -> Tuple[torch.nn.Module, Sequence[str], Optional[Path]]:
         from torchvision.models.detection import SSD300_VGG16_Weights, ssd300_vgg16
 
         if weights_path is None:
@@ -175,6 +182,37 @@ class TorchvisionDetector(DetectionAlgorithm):
             state_dict = torch.load(weights_path, map_location="cpu")
             num_classes = self._infer_ssd_num_classes(state_dict, logger)
             model = ssd300_vgg16(weights=None, weights_backbone=None, num_classes=num_classes)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if logger:
+                if missing:
+                    logger(f"[INFER] Aviso: camadas ausentes ao carregar pesos: {missing}")
+                if unexpected:
+                    logger(f"[INFER] Aviso: pesos inesperados ignorados: {unexpected}")
+            class_names = [str(idx) for idx in range(num_classes)]
+            weights_label = weights_path
+        model.to(device_str)
+        model.eval()
+        return model, class_names, weights_label
+
+    def _load_faster_rcnn_for_inference(
+        self, weights_path: Optional[Path], device_str: str, logger: Optional[Logger]
+    ) -> Tuple[torch.nn.Module, Sequence[str], Optional[Path]]:
+        from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights, fasterrcnn_resnet50_fpn
+
+        if weights_path is None:
+            weights = FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+            model = fasterrcnn_resnet50_fpn(weights=weights)
+            class_names: Sequence[str] = tuple(weights.meta.get("categories", []))
+            weights_label: Optional[Path] = Path("FasterRCNN_ResNet50_FPN_Weights.DEFAULT")
+            if logger:
+                logger("[INFER] Usando pesos padrão do Faster R-CNN (torchvision)")
+        else:
+            weights_path = weights_path.expanduser().resolve()
+            if not weights_path.exists():
+                raise FileNotFoundError(f"Pesos não encontrados: {weights_path}")
+            state_dict = torch.load(weights_path, map_location="cpu")
+            num_classes = self._infer_faster_rcnn_num_classes(state_dict, logger)
+            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, num_classes=num_classes)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             if logger:
                 if missing:
@@ -209,6 +247,17 @@ class TorchvisionDetector(DetectionAlgorithm):
 
         model = ssd300_vgg16(weights=None, weights_backbone=None, num_classes=91)
         return model.anchor_generator.num_anchors_per_location()
+
+    def _infer_faster_rcnn_num_classes(self, state_dict: dict, logger: Optional[Logger]) -> int:
+        head_bias = state_dict.get("roi_heads.box_predictor.cls_score.bias")
+        if head_bias is not None:
+            num_classes = head_bias.numel()
+            if logger:
+                logger(f"[INFER] Inferido num_classes={num_classes} a partir de roi_heads.box_predictor.cls_score.bias")
+            return int(num_classes)
+        if logger:
+            logger("[INFER] Falha ao inferir num_classes para Faster R-CNN; usando 91 (padrão COCO)")
+        return 91
 
     @staticmethod
     def _format_label(label: torch.Tensor, score: torch.Tensor, class_names: Sequence[str]) -> str:
