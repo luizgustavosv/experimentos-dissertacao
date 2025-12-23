@@ -13,6 +13,7 @@ from PIL import Image
 from app.detectors.base import DetectorContext, Logger
 from app.detectors.torchvision_detectors import TorchvisionDetector
 from app.detectors.torchvision_models import build_faster_rcnn
+from app.detectors.utils_visdrone_coco import normalize_visdrone_to_coco
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
@@ -32,13 +33,33 @@ class FasterRCNNDetector(TorchvisionDetector):
         super().__init__(context, build_faster_rcnn)
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):
-        if dataset_type.lower() != "heridal":
-            raise ValueError("Normalização Faster R-CNN implementada apenas para o dataset HERIDAL.")
-
         dataset_dir = dataset_dir.expanduser().resolve()
         normalized_dir = normalized_dir.expanduser().resolve()
-        train_dir = dataset_dir / "train"
+        if not dataset_dir.exists():
+            raise FileNotFoundError(f"Diretório do dataset não encontrado: {dataset_dir}")
+        if self._is_visdrone_dataset(dataset_dir):
+            self._log(f"{self._tag()} Detectado dataset VisDrone em {dataset_dir}", logger)
+            artifacts = normalize_visdrone_to_coco(dataset_dir, normalized_dir, logger)
+            train_images = normalized_dir / "images" / "train"
+            val_images = normalized_dir / "images" / "val"
+            self._log(f"{self._tag()} COCO pronto em {normalized_dir}", logger)
+            self._log(f"{self._tag()} train_images={train_images}", logger)
+            self._log(f"{self._tag()} val_images={val_images}", logger)
+            self._log(f"{self._tag()} train_json={artifacts['train'].images_json}", logger)
+            self._log(f"{self._tag()} val_json={artifacts['val'].images_json}", logger)
+            self._log(f"{self._tag()} dataset_root deve ser normalized_dir para treino.", logger)
+            return
 
+        if self._is_heridal_dataset(dataset_dir):
+            self._normalize_heridal(dataset_dir, normalized_dir, logger)
+            return
+
+        raise ValueError(
+            "Não foi possível detectar o dataset. Procure por VisDrone2019-DET-* ou por train/annotations.csv (HERIDAL)."
+        )
+
+    def _normalize_heridal(self, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger]) -> None:
+        train_dir = dataset_dir / "train"
         if not train_dir.exists():
             raise FileNotFoundError(f"Pasta 'train' não encontrada em {dataset_dir}")
 
@@ -47,7 +68,7 @@ class FasterRCNNDetector(TorchvisionDetector):
             legacy_csv = train_dir / "_annotations.csv"
             if legacy_csv.exists():
                 csv_path = legacy_csv
-                self._log(f"[FRCNN][NORM] Usando arquivo legado de anotações: {legacy_csv.name}", logger)
+                self._log(f"{self._tag()} Usando arquivo legado de anotações: {legacy_csv.name}", logger)
             else:
                 raise FileNotFoundError(f"annotations.csv não encontrado em {train_dir}")
 
@@ -102,14 +123,14 @@ class FasterRCNNDetector(TorchvisionDetector):
         train_json.write_text(json.dumps(train_payload, indent=2), encoding="utf-8")
         val_json.write_text(json.dumps(val_payload, indent=2), encoding="utf-8")
 
-        self._log(f"[FRCNN][NORM] Imagens no disco: {total_images}", logger)
-        self._log(f"[FRCNN][NORM] Imagens com anotação: {images_with_ann}", logger)
-        self._log(f"[FRCNN][NORM] Imagens sem anotação: {images_without_ann}", logger)
-        self._log(f"[FRCNN][NORM] BBoxes válidos: {stats['valid_boxes']}", logger)
-        self._log(f"[FRCNN][NORM] BBoxes descartados: {stats['discarded_boxes']}", logger)
-        self._log(f"[FRCNN][NORM] Total de anotações escritas: {stats['valid_boxes']}", logger)
-        self._log(f"[FRCNN][NORM] JSON train: {train_json}", logger)
-        self._log(f"[FRCNN][NORM] JSON val: {val_json}", logger)
+        self._log(f"{self._tag()} Imagens no disco: {total_images}", logger)
+        self._log(f"{self._tag()} Imagens com anotação: {images_with_ann}", logger)
+        self._log(f"{self._tag()} Imagens sem anotação: {images_without_ann}", logger)
+        self._log(f"{self._tag()} BBoxes válidos: {stats['valid_boxes']}", logger)
+        self._log(f"{self._tag()} BBoxes descartados: {stats['discarded_boxes']}", logger)
+        self._log(f"{self._tag()} Total de anotações escritas: {stats['valid_boxes']}", logger)
+        self._log(f"{self._tag()} JSON train: {train_json}", logger)
+        self._log(f"{self._tag()} JSON val: {val_json}", logger)
 
         report = {
             "source_dataset": str(dataset_dir),
@@ -135,7 +156,7 @@ class FasterRCNNDetector(TorchvisionDetector):
         for path in images:
             key = path.name.lower()
             if key in deduped:
-                self._log(f"[FRCNN][NORM] Ignorando duplicata (case-insensitive): {path.name}", logger)
+                self._log(f"{self._tag()} Ignorando duplicata (case-insensitive): {path.name}", logger)
                 continue
             deduped[key] = path
         return deduped
@@ -154,7 +175,7 @@ class FasterRCNNDetector(TorchvisionDetector):
                     continue
                 key = filename.lower()
                 if key not in images:
-                    self._log(f"[FRCNN][NORM] Aviso: imagem no CSV não encontrada no disco: {filename}", logger)
+                    self._log(f"{self._tag()} Aviso: imagem no CSV não encontrada no disco: {filename}", logger)
                     continue
 
                 xmin = self._safe_int(row.get("xmin"))
@@ -162,7 +183,7 @@ class FasterRCNNDetector(TorchvisionDetector):
                 xmax = self._safe_int(row.get("xmax"))
                 ymax = self._safe_int(row.get("ymax"))
                 if None in (xmin, ymin, xmax, ymax):
-                    self._log(f"[FRCNN][NORM] Anotação ignorada por coordenadas ausentes: {row}", logger)
+                    self._log(f"{self._tag()} Anotação ignorada por coordenadas ausentes: {row}", logger)
                     continue
 
                 width = self._safe_int(row.get("width"))
@@ -197,7 +218,7 @@ class FasterRCNNDetector(TorchvisionDetector):
             categories[name] = next_id
             next_id += 1
         mapping = ", ".join(f"{name}->{cid}" for name, cid in categories.items())
-        self._log(f"[FRCNN][NORM] Mapeamento de classes: {mapping}", logger)
+        self._log(f"{self._tag()} Mapeamento de classes: {mapping}", logger)
         return categories
 
     def _build_coco_split(
@@ -236,7 +257,7 @@ class FasterRCNNDetector(TorchvisionDetector):
                     category_id = categories.get(label)
                     if category_id is None:
                         self._log(
-                            f"[FRCNN][NORM] Classe desconhecida '{label}' ignorada na imagem {img_path.name}",
+                            f"{self._tag()} Classe desconhecida '{label}' ignorada na imagem {img_path.name}",
                             logger,
                         )
                         stats["discarded_boxes"] += 1
@@ -296,3 +317,16 @@ class FasterRCNNDetector(TorchvisionDetector):
     @staticmethod
     def _list_images(root: Path) -> List[Path]:
         return [p for p in root.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
+
+    def _is_visdrone_dataset(self, dataset_dir: Path) -> bool:
+        if dataset_dir.name.startswith("VisDrone2019-DET-") and "challenge" not in dataset_dir.name.lower():
+            return True
+        return any(p.is_dir() and p.name.startswith("VisDrone2019-DET-") and "challenge" not in p.name.lower() for p in dataset_dir.iterdir())
+
+    @staticmethod
+    def _is_heridal_dataset(dataset_dir: Path) -> bool:
+        train_dir = dataset_dir / "train"
+        return train_dir.exists() and ((train_dir / "annotations.csv").exists() or (train_dir / "_annotations.csv").exists())
+
+    def _tag(self) -> str:
+        return f"[{self.context.name}][NORM]"
