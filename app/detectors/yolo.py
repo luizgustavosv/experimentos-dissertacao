@@ -150,12 +150,70 @@ class YoloDetector(DetectionAlgorithm):
     def validate(
         self,
         images_dir: Path,
+        weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
         pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
     ):
-        raise NotImplementedError("Validação via Ultralytics não implementada neste escopo de treino.")
+        from ultralytics import YOLO  # import tardio para evitar dependências pesadas em import
+
+        images_dir = images_dir.expanduser().resolve()
+        report_out = report_out.expanduser().resolve()
+        plots_dir = plots_dir.expanduser().resolve()
+
+        yaml_path = validate_yolo_dataset(images_dir).resolve()
+        weights_resolved = weights_path.expanduser().resolve() if weights_path else None
+        if weights_resolved is not None and not weights_resolved.exists():
+            raise FileNotFoundError(f"Pesos não encontrados: {weights_resolved}")
+
+        base_weights = str(weights_resolved) if weights_resolved else "yolov8n.pt"
+        device_str = resolve_device(self.config.device)
+        if logger:
+            weight_label = weights_resolved if weights_resolved else "pesos padrão (yolov8n.pt)"
+            logger(f"[VAL] {self.context.name} validando {yaml_path} em {device_str} usando {weight_label}")
+            if pedestrian_only:
+                logger("[VAL] Filtrando apenas classe pedestrian (0) durante a validação")
+
+        model = YOLO(base_weights)
+        val_name = report_out.stem
+        results = model.val(
+            data=str(yaml_path),
+            imgsz=640,
+            device=device_str,
+            project=str(plots_dir),
+            name=val_name,
+            exist_ok=True,
+            verbose=False,
+            plots=True,
+            classes=[0] if pedestrian_only else None,
+        )
+
+        run_dir = Path(getattr(results, "save_dir", plots_dir / val_name))
+        run_dir.mkdir(parents=True, exist_ok=True)
+        metrics = self._build_metrics_from_results(results, device_str, weights_resolved or Path("yolov8n.pt"))
+
+        report_builder = ReportBuilder(self.context.name)
+        metrics_plot = run_dir / "metrics_summary.png"
+        report_builder.save_plot(metrics_plot, metrics)
+        report_builder.save_report(
+            report_path=report_out,
+            metrics=metrics,
+            operation="Validação",
+            source_dir=images_dir,
+            plot_path=metrics_plot,
+            weights_path=weights_resolved or Path("yolov8n.pt"),
+        )
+
+        if logger:
+            logger(
+                f"[VAL] Precisão: {metrics.precision:.3f} | Recall: {metrics.recall:.3f} | mAP@0.50: {metrics.map50:.3f} | mAP@0.50:0.95: {metrics.map50_95:.3f}"
+            )
+        if logger:
+            logger(f"[VAL] Gráficos salvos em {run_dir}")
+            logger(f"[VAL] Relatório salvo em {report_out}")
+
+        return metrics
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):
         from app.datasets.normalizer import normalize_dataset as normalize_pipeline
@@ -207,3 +265,30 @@ class YoloDetector(DetectionAlgorithm):
                     continue
                 previews.append(extra)
         return previews[:limit]
+
+    @staticmethod
+    def _build_metrics_from_results(results, device_str: str, weights_path: Path) -> Metrics:
+        box = getattr(results, "box", None)
+        precision = float(getattr(box, "mp", 0.0)) if box is not None else 0.0
+        recall = float(getattr(box, "mr", 0.0)) if box is not None else 0.0
+        map50 = float(getattr(box, "map50", 0.0)) if box is not None else 0.0
+        map50_95 = float(getattr(box, "map", 0.0)) if box is not None else 0.0
+
+        speed = getattr(results, "speed", {}) if results is not None else {}
+        extra = {}
+        for key in ["preprocess", "inference", "postprocess"]:
+            if key in speed:
+                extra[f"speed_{key}_ms"] = float(speed[key])
+
+        return Metrics(
+            precision=precision,
+            recall=recall,
+            map50=map50,
+            map50_95=map50_95,
+            epochs=None,
+            train_images=None,
+            device=device_str,
+            weights_path=weights_path,
+            map_computed=True,
+            extra=extra,
+        )
