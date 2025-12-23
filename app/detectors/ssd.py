@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+import torch
+
 from app.datasets.heridal_to_voc import normalize_heridal_to_voc
 from app.datasets.visdrone_to_voc import find_visdrone_splits, normalize_visdrone_to_voc
 from app.detectors.base import DetectorContext, Logger
@@ -10,12 +12,13 @@ from app.detectors.config import TrainConfig
 from app.detectors.dataset_voc import PascalVOCDataset
 from app.detectors.torchvision_detectors import TorchvisionDetector
 from app.detectors.torchvision_train import train_torchvision_detector
-from app.detectors.torchvision_models import build_ssd
 from app.detectors.utils import resolve_device, validate_voc_dataset
 
 
 class SSDDetector(TorchvisionDetector):
     def __init__(self, context: DetectorContext):
+        from app.detectors.torchvision_models import build_ssd
+
         super().__init__(context, build_ssd)
 
     def train(
@@ -32,19 +35,21 @@ class SSDDetector(TorchvisionDetector):
         dataset_root, class_names, train_ids, val_ids = validate_voc_dataset(dataset_dir)
         class_to_idx = {name: idx + 1 for idx, name in enumerate(class_names)}
         device_str = resolve_device(self.config.device)
-        num_classes = len(class_names) + 1  # +1 para background
+        num_classes = 2 if len(class_names) == 1 else len(class_names) + 1  # +1 para background
 
         if logger:
             logger(f"[TRAIN] {self.context.name} em {device_str} com {num_classes} classes (Pascal VOC)")
             logger(f"[DATA] Raiz do dataset VOC: {dataset_root}")
             logger(f"[DATA] Splits: train={len(train_ids)}, val={len(val_ids)}")
             logger(f"[DATA] Classes: {', '.join(class_names)}")
+            if num_classes == 2:
+                logger("[SSD] num_classes_experiment=2 (background+human)")
 
         transform = transforms.Compose([transforms.ToTensor()])
         train_dataset = PascalVOCDataset(dataset_root, train_ids, class_to_idx, transforms=transform)
         val_dataset = PascalVOCDataset(dataset_root, val_ids, class_to_idx, transforms=transform)
 
-        model = self.build_model(num_classes)
+        model = self._build_ssd_model(num_classes, pretrained_weights, logger)
         metrics = train_torchvision_detector(
             model,
             dataset_root,
@@ -83,3 +88,91 @@ class SSDDetector(TorchvisionDetector):
         if logger:
             logger(f"[SSD][NORM] Dataset pronto em {normalized_path}")
         return normalized_path
+
+    def _build_ssd_model(self, num_classes: int, pretrained_weights: Optional[Path], logger: Optional[Logger]):
+        from torchvision.models.detection import SSD300_VGG16_Weights, ssd300_vgg16
+
+        model = ssd300_vgg16(weights=None, weights_backbone=SSD300_VGG16_Weights.DEFAULT, num_classes=num_classes)
+        state_dict, checkpoint_num_classes, checkpoint_label = self._load_checkpoint_state(pretrained_weights, logger)
+
+        if logger:
+            logger(f"[SSD][WEIGHTS] checkpoint_path={checkpoint_label}")
+            logger(f"[SSD][WEIGHTS] checkpoint_num_classes={checkpoint_num_classes if checkpoint_num_classes else 'desconhecido'}")
+            logger(f"[SSD][WEIGHTS] num_classes_model={num_classes}")
+
+        if state_dict:
+            drop_heads = checkpoint_num_classes is None or checkpoint_num_classes != num_classes
+            filtered_state_dict, removed_keys = self._filter_ssd_state_dict(state_dict, drop_heads=drop_heads)
+            missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
+            loaded_keys = [k for k in filtered_state_dict.keys() if k not in unexpected]
+            loaded_params = sum(filtered_state_dict[k].numel() for k in loaded_keys if hasattr(filtered_state_dict[k], "numel"))
+            if logger:
+                logger(
+                    "[SSD][WEIGHTS] política de carregamento: "
+                    f"{'descartando heads incompatíveis' if drop_heads else 'mantendo heads do checkpoint'}"
+                )
+                if removed_keys:
+                    logger(f"[SSD][WEIGHTS] Heads removidos do checkpoint: {removed_keys}")
+                logger(
+                    f"[SSD][WEIGHTS] parâmetros carregados={loaded_params} | missing={len(missing)} | unexpected={len(unexpected)}"
+                )
+                if missing:
+                    logger(f"[SSD][WEIGHTS] missing_keys: {missing}")
+                if unexpected:
+                    logger(f"[SSD][WEIGHTS] unexpected_keys: {unexpected}")
+        else:
+            if logger:
+                logger("[SSD][WEIGHTS] Nenhum checkpoint aplicado; prosseguindo apenas com backbone pré-treinado")
+
+        return model
+
+    def _load_checkpoint_state(
+        self, pretrained_weights: Optional[Path], logger: Optional[Logger]
+    ) -> tuple[Optional[dict], Optional[int], str]:
+        from torchvision.models.detection import SSD300_VGG16_Weights
+
+        if pretrained_weights:
+            weights_path = pretrained_weights.expanduser().resolve()
+            if not weights_path.exists():
+                raise FileNotFoundError(f"Pesos não encontrados: {weights_path}")
+            state_dict = torch.load(weights_path, map_location="cpu")
+            checkpoint_num_classes = self._infer_ssd_num_classes(state_dict, logger)
+            return state_dict, checkpoint_num_classes, str(weights_path)
+
+        weights_enum = SSD300_VGG16_Weights.DEFAULT
+        checkpoint_num_classes = len(weights_enum.meta.get("categories", [])) if weights_enum.meta.get("categories") else None
+        try:
+            state_dict = weights_enum.get_state_dict(progress=True)
+        except Exception as exc:  # pragma: no cover - depende de rede/cache
+            state_dict = None
+            if logger:
+                logger(f"[SSD][WEIGHTS][WARN] Falha ao obter pesos padrão do SSD (COCO): {exc}")
+        return state_dict, checkpoint_num_classes, "SSD300_VGG16_Weights.DEFAULT"
+
+    @staticmethod
+    def _filter_ssd_state_dict(state_dict: dict, drop_heads: bool):
+        head_markers = (
+            "head.classification_head",
+            "head.regression_head",
+            "cls_headers",
+            "box_headers",
+            ".cls.",
+            ".cls_",
+            ".conf",
+            ".bbox",
+            ".box",
+            ".reg",
+            ".loc",
+        )
+        filtered = {}
+        removed = []
+        for key, value in state_dict.items():
+            lower_key = key.lower()
+            if lower_key.startswith("backbone."):
+                filtered[key] = value
+                continue
+            if drop_heads and any(marker in lower_key for marker in head_markers):
+                removed.append(key)
+                continue
+            filtered[key] = value
+        return filtered, removed
