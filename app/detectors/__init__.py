@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Dict
 
 from app.detectors.base import DetectionAlgorithm, DetectorContext
+from app.detectors.faster_rcnn import FasterRCNNDetector
 from app.detectors.ssd import SSDDetector
 from app.detectors.torchvision_detectors import TorchvisionDetector
-from app.detectors.torchvision_models import build_faster_rcnn, build_retinanet
+from app.detectors.torchvision_models import build_retinanet
 from app.detectors.yolo import YoloDetector
 
 
@@ -41,6 +42,6 @@ def load_detectors() -> Dict[str, DetectionAlgorithm]:
     return {
         "YOLO": YoloDetector(architectures["YOLO"]),
         "SSD": SSDDetector(architectures["SSD"]),
-        "Faster R-CNN": TorchvisionDetector(architectures["Faster R-CNN"], build_faster_rcnn),
+        "Faster R-CNN": FasterRCNNDetector(architectures["Faster R-CNN"]),
         "RetinaNet": TorchvisionDetector(architectures["RetinaNet"], build_retinanet),
     }
