@@ -16,12 +16,20 @@ from app.detectors.base import Logger
 HUMAN_CLASS_NAME = "human"
 
 
-def _list_train_images(train_dir: Path) -> List[Path]:
-    patterns = ["*.jpg", "*.JPG", "*.jpeg", "*.png"]
-    disk_images: List[Path] = []
-    for pattern in patterns:
-        disk_images.extend(train_dir.glob(pattern))
-    return sorted(disk_images)
+def _list_train_images(train_dir: Path) -> Tuple[List[Path], int, int]:
+    allowed_suffixes = {".jpg", ".jpeg", ".png"}
+    raw_images: List[Path] = []
+    for path in train_dir.iterdir():
+        if path.is_file() and path.suffix.lower() in allowed_suffixes:
+            raw_images.append(path)
+
+    unique_by_key: Dict[str, Path] = {}
+    for path in raw_images:
+        key = path.name.lower()
+        unique_by_key.setdefault(key, path)
+
+    unique_images = sorted(unique_by_key.values(), key=lambda p: p.name.lower())
+    return unique_images, len(raw_images), len(unique_images)
 
 
 def _resolve_image_size(
@@ -61,7 +69,7 @@ def _resolve_image_size(
 
 
 def parse_heridal_csv(
-    dataset_dir: Path, normalized_dir: Path, disk_basenames: Set[str], logger: Optional[Logger] = None
+    dataset_dir: Path, normalized_dir: Path, disk_basenames_lower: Set[str], logger: Optional[Logger] = None
 ) -> Tuple[Dict[str, List[Tuple[int, int, int, int]]], Dict[str, Tuple[int, int]], int, int, List[str], dict]:
     dataset_dir = dataset_dir.expanduser().resolve()
     normalized_dir = normalized_dir.expanduser().resolve()
@@ -93,10 +101,11 @@ def parse_heridal_csv(
                 continue
             filename = filename.replace("\\", "/")
             basename = Path(filename).name
+            basename_lower = basename.lower()
             unique_in_csv.add(basename)
             annotations_by_basename.setdefault(basename, [])
 
-            if basename not in disk_basenames:
+            if basename_lower not in disk_basenames_lower:
                 discarded_bboxes += 1
                 missing_on_disk.add(basename)
                 msg = f"Imagem ausente referenciada no CSV: {basename}"
@@ -224,12 +233,31 @@ def write_imagesets(images_per_split: Dict[str, List[str]], imagesets_dir: Path)
 def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None) -> Path:
     dataset_dir = dataset_dir.expanduser().resolve()
     normalized_dir = normalized_dir.expanduser().resolve()
+    generation_markers = ["images", "labels", "annotations_voc", "Annotations", "JPEGImages", "ImageSets"]
+    has_existing_outputs = normalized_dir.exists() and any((normalized_dir / marker).exists() for marker in generation_markers)
+    if has_existing_outputs:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target_normalized_dir = normalized_dir / f"run-{timestamp}"
+        if logger:
+            logger(f"[SSD][NORM][WARN] Saída existente detectada em {normalized_dir}; escrevendo em subpasta segura {target_normalized_dir}")
+    else:
+        target_normalized_dir = normalized_dir
+    target_normalized_dir.mkdir(parents=True, exist_ok=True)
+    if logger:
+        logger(f"[SSD][NORM] Diretório final de saída: {target_normalized_dir}")
 
     train_images_dir = dataset_dir / "train"
-    disk_images = _list_train_images(train_images_dir)
+    disk_images, disk_images_raw_count, disk_images_unique_count = _list_train_images(train_images_dir)
     disk_basenames = [path.name for path in disk_images]
+    disk_basename_by_lower = {path.name.lower(): path.name for path in disk_images}
+    disk_basenames_lower = set(disk_basename_by_lower.keys())
     total_images_on_disk = len(disk_basenames)
+    duplicates_removed = disk_images_raw_count - disk_images_unique_count
     if logger:
+        logger(f"[SSD][NORM] Imagens no disco (train) - bruto: {disk_images_raw_count}")
+        logger(f"[SSD][NORM] Imagens no disco (train) - únicas: {disk_images_unique_count}")
+        if duplicates_removed:
+            logger(f"[SSD][NORM][WARN] Duplicatas removidas: {duplicates_removed}")
         logger(f"[SSD][NORM] Imagens no disco (train): {total_images_on_disk}")
 
     (
@@ -239,14 +267,30 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
         discarded_bboxes,
         warnings,
         audit_data,
-    ) = parse_heridal_csv(dataset_dir, normalized_dir, set(disk_basenames), logger=logger)
+    ) = parse_heridal_csv(dataset_dir, target_normalized_dir, disk_basenames_lower, logger=logger)
     if logger:
         logger(f"[SSD][NORM] Imagens únicas no CSV: {len(annotations_by_basename)}")
+
+    remapped_annotations: Dict[str, List[Tuple[int, int, int, int]]] = {}
+    for name, boxes in annotations_by_basename.items():
+        key = disk_basename_by_lower.get(name.lower(), name)
+        remapped_annotations.setdefault(key, []).extend(boxes)
+    annotations_by_basename = remapped_annotations
+
+    remapped_sizes: Dict[str, Tuple[int, int]] = {}
+    for name, size in sizes_by_basename.items():
+        key = disk_basename_by_lower.get(name.lower(), name)
+        remapped_sizes.setdefault(key, size)
+    sizes_by_basename = remapped_sizes
 
     if not disk_basenames:
         raise ValueError("Nenhuma imagem encontrada em dataset_dir/train.")
 
-    all_basenames: List[str] = list(disk_basenames)
+    all_basenames: List[str] = [path.name for path in disk_images]
+    lower_basenames = [name.lower() for name in all_basenames]
+    if len(all_basenames) != len(set(lower_basenames)):
+        raise ValueError("Nomes de arquivo duplicados após deduplicação case-insensitive.")
+
     rng = random.Random(42)
     rng.shuffle(all_basenames)
 
@@ -255,14 +299,22 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
     for idx, basename in enumerate(all_basenames):
         split_assignments[basename] = "train" if idx < train_limit else "val"
 
-    train_count = sum(1 for split in split_assignments.values() if split == "train")
-    val_count = sum(1 for split in split_assignments.values() if split == "val")
+    train_set = {name for name, split in split_assignments.items() if split == "train"}
+    val_set = {name for name, split in split_assignments.items() if split == "val"}
+    train_lower = {name.lower() for name in train_set}
+    val_lower = {name.lower() for name in val_set}
+    intersection_empty = not train_lower.intersection(val_lower)
+    if not intersection_empty:
+        raise ValueError("Interseção não vazia detectada entre conjuntos de treino e validação.")
+
+    train_count = len(train_set)
+    val_count = len(val_set)
     if logger:
         logger(f"[SSD][NORM] Split (disco) -> train: {train_count}, val: {val_count}")
 
-    image_root = normalized_dir / "images"
-    ann_root = normalized_dir / "annotations_voc"
-    imagesets_root = normalized_dir / "ImageSets" / "Main"
+    image_root = target_normalized_dir / "images"
+    ann_root = target_normalized_dir / "annotations_voc"
+    imagesets_root = target_normalized_dir / "ImageSets" / "Main"
 
     for split in ["train", "val"]:
         (image_root / split).mkdir(parents=True, exist_ok=True)
@@ -321,7 +373,7 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
 
     write_imagesets(images_per_split, imagesets_root)
 
-    labels_path = normalized_dir / "labels.txt"
+    labels_path = target_normalized_dir / "labels.txt"
     labels_path.write_text(f"{HUMAN_CLASS_NAME}\n", encoding="utf-8")
 
     metadata = {
@@ -336,7 +388,7 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
         "total_xml_written": total_xml_written,
         "avisos": warnings,
     }
-    (normalized_dir / "dataset.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    (target_normalized_dir / "dataset.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
     missing_on_disk = audit_data.get("missing_on_disk", set())
     unique_in_csv = audit_data.get("unique_in_csv", set())
@@ -352,15 +404,18 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
     if logger:
         for msg in summary_log:
             logger(msg)
-
     normalization_report = {
         "summary": {
+            "disk_images_raw_count": disk_images_raw_count,
+            "disk_images_unique_count": disk_images_unique_count,
+            "duplicates_removed_count": duplicates_removed,
             "total_images_on_disk": total_images_on_disk,
             "unique_images_in_csv": len(unique_in_csv),
             "images_with_annotations": images_with_annotations,
             "images_without_annotations": images_without_annotations,
             "train_count": train_count,
             "val_count": val_count,
+            "train_val_intersection_empty": intersection_empty,
             "total_xml_written": total_xml_written,
             "bboxes_total": total_bboxes,
             "bboxes_descartados": discarded_bboxes,
@@ -371,10 +426,10 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
             for stem, names in list(collisions.items())[:200]
         ],
     }
-    report_path = normalized_dir / "normalization_report.json"
+    report_path = target_normalized_dir / "normalization_report.json"
     report_path.write_text(json.dumps(normalization_report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if logger:
-        logger(f"[SSD][NORM] Normalização concluída em {normalized_dir}")
+        logger(f"[SSD][NORM] Normalização concluída em {target_normalized_dir}")
 
-    return normalized_dir
+    return target_normalized_dir
