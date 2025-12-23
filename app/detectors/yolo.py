@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
+
+import yaml
 
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.utils import copy_ultralytics_checkpoint, resolve_device, seed_everything, validate_yolo_dataset
 from app.metrics import InferencePerformance, Metrics
 from app.reporting.reports import ReportBuilder
+
+
+@contextmanager
+def _pushd(directory: Path):
+    previous_cwd = Path.cwd()
+    os.chdir(directory)
+    try:
+        yield
+    finally:
+        os.chdir(previous_cwd)
 
 
 class YoloDetector(DetectionAlgorithm):
@@ -149,7 +163,7 @@ class YoloDetector(DetectionAlgorithm):
 
     def validate(
         self,
-        dataset_path: Path,
+        dataset_yaml_path: Path,
         weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
@@ -158,10 +172,49 @@ class YoloDetector(DetectionAlgorithm):
     ):
         from ultralytics import YOLO  # import tardio para evitar dependências pesadas em import
 
+        dataset_yaml_path = Path(dataset_yaml_path).expanduser().resolve(strict=True)
         report_out = report_out.expanduser().resolve()
         plots_dir = plots_dir.expanduser().resolve()
 
-        dataset_yaml_path = self._resolve_dataset_yaml_path(dataset_path).resolve()
+        yaml_text = dataset_yaml_path.read_text(encoding="utf-8")
+        missing_keys = [key for key in ("path:", "train:", "val:") if key not in yaml_text]
+        if missing_keys:
+            raise ValueError(
+                f"dataset.yaml {dataset_yaml_path} não contém as chaves esperadas: {', '.join(missing_keys)}"
+            )
+
+        cfg = yaml.safe_load(yaml_text) or {}
+        try:
+            train_value = cfg["train"]
+            val_value = cfg["val"]
+        except KeyError as exc:
+            raise KeyError(f"Chave obrigatória ausente em {dataset_yaml_path}: {exc}") from exc
+
+        root = Path(str(cfg.get("path", ""))).expanduser()
+        if not root.is_absolute():
+            root = (dataset_yaml_path.parent / root).resolve()
+        train_dir = (root / str(train_value)).resolve()
+        val_dir = (root / str(val_value)).resolve()
+
+        def _list_dir(path: Path) -> List[str]:
+            if path.exists() and path.is_dir():
+                return sorted(entry.name for entry in path.iterdir())
+            return []
+
+        if not train_dir.exists() or not val_dir.exists():
+            root_listing = _list_dir(root)
+            images_listing = _list_dir(root / "images")
+            raise FileNotFoundError(
+                "Pastas de treino/validação não encontradas ou inacessíveis.\n"
+                f"dataset_yaml_path={dataset_yaml_path}\n"
+                f"cfg.path={repr(cfg.get('path', ''))}\n"
+                f"root={root}\n"
+                f"train_dir={repr(train_dir)}\n"
+                f"val_dir={repr(val_dir)}\n"
+                f"root_contents={root_listing}\n"
+                f"root_images_contents={images_listing}\n"
+            )
+
         weights_resolved = weights_path.expanduser().resolve() if weights_path else Path("yolov8n.pt")
         if weights_path is not None and not weights_resolved.exists():
             raise FileNotFoundError(f"Pesos não encontrados: {weights_resolved}")
@@ -174,7 +227,14 @@ class YoloDetector(DetectionAlgorithm):
                 logger("[VAL] Filtrando apenas classe pedestrian (0) durante a validação")
 
         model = YOLO(base_weights)
-        results = model.val(data=dataset_yaml_path)
+        with _pushd(dataset_yaml_path.parent):
+            results = model.val(
+                data=str(dataset_yaml_path),
+                project=str(report_out.parent),
+                name=report_out.stem,
+                save_json=True,
+                plots=True,
+            )
         if logger:
             logger(f"[VAL] Validação concluída para {dataset_yaml_path}")
 
@@ -204,19 +264,6 @@ class YoloDetector(DetectionAlgorithm):
             logger(f"[VAL] cwd final: {Path.cwd()}")
 
         return metrics
-
-    @staticmethod
-    def _resolve_dataset_yaml_path(dataset_input: Path) -> Path:
-        dataset_input = dataset_input.expanduser()
-        if dataset_input.suffix.lower() in {".yaml", ".yml"}:
-            yaml_path = dataset_input
-        else:
-            yaml_path = dataset_input / "dataset.yaml"
-        if not yaml_path.exists():
-            raise FileNotFoundError(
-                f"dataset.yaml não encontrado. Caminho informado: {dataset_input.resolve()} | Esperado: {yaml_path.resolve()}"
-            )
-        return yaml_path.resolve()
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):
         from app.datasets.normalizer import normalize_dataset as normalize_pipeline
