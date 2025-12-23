@@ -51,13 +51,16 @@ class ExperimentController:
         self,
         algorithm_key: str,
         images_dir: Path,
+        weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
         pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
-        metrics = detector.validate(images_dir, report_out, plots_dir, pedestrian_only=pedestrian_only, logger=logger)
+        metrics = detector.validate(
+            images_dir, weights_path, report_out, plots_dir, pedestrian_only=pedestrian_only, logger=logger
+        )
         return OperationResult(metrics=metrics, message="Validação concluída.")
 
     def execute_normalize(

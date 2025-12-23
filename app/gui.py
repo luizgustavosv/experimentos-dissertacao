@@ -29,6 +29,7 @@ class DetectorApp(tk.Tk):
             "weights": tk.StringVar(),
             "pretrained": tk.StringVar(),
             "inference_weights": tk.StringVar(),
+            "validation_weights": tk.StringVar(),
             "images": tk.StringVar(),
             "report": tk.StringVar(),
             "plots": tk.StringVar(),
@@ -130,6 +131,7 @@ class DetectorApp(tk.Tk):
             self._add_path_selector("Relatório PDF da inferência", "report", is_file=True, defaultextension=".pdf")
             self._add_pedestrian_filter_selector()
         elif action == "Validar":
+            self._add_path_selector("Pesos para validação", "validation_weights")
             self._add_path_selector("Imagens de validação", "images", is_dir=True)
             self._add_path_selector("Pasta para gráficos", "plots", is_dir=True)
             self._add_path_selector("Relatório PDF da validação", "report", is_file=True, defaultextension=".pdf")
@@ -309,6 +311,8 @@ class DetectorApp(tk.Tk):
 
             elif action == "Validar":
                 images = Path(self.path_vars["images"].get())
+                weights_raw = self.path_vars["validation_weights"].get().strip()
+                weights = Path(weights_raw) if weights_raw else None
                 plots = Path(self.path_vars["plots"].get())
                 report = Path(self.path_vars["report"].get())
                 pedestrian_only = bool(self.pedestrian_only_var.get())
@@ -318,6 +322,7 @@ class DetectorApp(tk.Tk):
                         algorithm_key,
                         {
                             "imagens": images,
+                            "pesos": weights or "padrão",
                             "graficos": plots,
                             "relatorio": report,
                             "apenas_pedestrian": pedestrian_only,
@@ -327,7 +332,7 @@ class DetectorApp(tk.Tk):
 
                 def run_action() -> OperationResult:
                     return self.controller.execute_validate(
-                        algorithm_key, images, report, plots, pedestrian_only, prompt_logger
+                        algorithm_key, images, weights, report, plots, pedestrian_only, prompt_logger
                     )
 
             elif action == "Normalizar dataset":

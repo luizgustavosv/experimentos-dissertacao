@@ -45,6 +45,7 @@ class DetectionAlgorithm:
     def validate(
         self,
         images_dir: Path,
+        weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
         pedestrian_only: bool = False,
