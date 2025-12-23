@@ -42,7 +42,28 @@ class _ForwardToLoggerHandler(logging.Handler):
         self.forward(msg)
 
 
-def _configure_logging(verbose: bool, log_dir: Path, external_logger: Optional[Logger]) -> tuple[logging.Logger, Path]:
+def _safe_stream(prefer: str, log_dir: Path):
+    cand = getattr(sys, f"__{prefer}__", None)
+    if cand is not None and hasattr(cand, "fileno"):
+        try:
+            cand.fileno()
+            return cand
+        except Exception:
+            pass
+    cand2 = getattr(sys, prefer, None)
+    if cand2 is not None and hasattr(cand2, "fileno"):
+        try:
+            cand2.fileno()
+            return cand2
+        except Exception:
+            pass
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return open(log_dir / f"fallback_{prefer}.log", "a", encoding="utf-8")
+
+
+def _configure_logging(
+    verbose: bool, log_dir: Path, external_logger: Optional[Logger], stream_override=None
+) -> tuple[logging.Logger, Path]:
     logger = logging.getLogger("ssd_train")
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
@@ -54,7 +75,7 @@ def _configure_logging(verbose: bool, log_dir: Path, external_logger: Optional[L
     log_path = log_dir / f"ssd_train_{datetime.now():%Y%m%d_%H%M%S}.log"
     formatter = logging.Formatter(fmt="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-    stream_handler = logging.StreamHandler(stream=sys.stdout)
+    stream_handler = logging.StreamHandler(stream=stream_override or _safe_stream("stdout", log_dir))
     stream_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
     stream_handler.setFormatter(formatter)
     stream_handler.flush = stream_handler.stream.flush  # type: ignore[assignment]
@@ -76,7 +97,9 @@ def _configure_logging(verbose: bool, log_dir: Path, external_logger: Optional[L
     return logger, log_path
 
 
-def _start_watchdog(log_path: Path, last_progress: list[float], stop_event: threading.Event, logger: logging.Logger, timeout: int = 300):
+def _start_watchdog(
+    log_path: Path, last_progress: list[float], stop_event: threading.Event, logger: logging.Logger, safe_stderr=None, timeout: int = 300
+):
     def _watch() -> None:  # pragma: no cover - monitoramento em tempo real
         while not stop_event.wait(5):
             if time.monotonic() - last_progress[0] > timeout:
@@ -84,7 +107,8 @@ def _start_watchdog(log_path: Path, last_progress: list[float], stop_event: thre
                 with log_path.open("a", encoding="utf-8") as fh:
                     fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [WATCHDOG] dump de stack após {timeout}s sem progresso.\\n")
                     faulthandler.dump_traceback(file=fh)
-                faulthandler.dump_traceback(file=sys.stderr)
+                target_stream = safe_stderr or _safe_stream("stderr", log_path.parent)
+                faulthandler.dump_traceback(file=target_stream)
                 last_progress[0] = time.monotonic()
 
     thread = threading.Thread(target=_watch, name="ssd-train-watchdog", daemon=True)
@@ -110,8 +134,14 @@ def train_torchvision_detector(
     train_dataset=None,
     val_dataset=None,
 ) -> Metrics:
-    faulthandler.enable()
-    logging_logger, log_path = _configure_logging(config.verbose, config.log_dir, logger)
+    log_dir = Path(config.log_dir).expanduser().resolve()
+    safe_stdout = _safe_stream("stdout", log_dir)
+    safe_stderr = _safe_stream("stderr", log_dir)
+    logging_logger, log_path = _configure_logging(config.verbose, log_dir, logger, stream_override=safe_stdout)
+    try:
+        faulthandler.enable(file=safe_stderr)
+    except Exception as exc:  # pragma: no cover - compatibilidade com ambientes sem fileno
+        logging_logger.warning("Não foi possível habilitar faulthandler no stream seguro: %s", exc)
     try:
         signal.signal(signal.SIGTERM, lambda _sig, _frame: sys.exit(1))
     except Exception:  # pragma: no cover - compatibilidade com ambientes sem suporte
@@ -198,7 +228,7 @@ def train_torchvision_detector(
 
         last_progress = [time.monotonic()]
         watchdog_stop = threading.Event()
-        watchdog_thread = _start_watchdog(log_path, last_progress, watchdog_stop, logging_logger)
+        watchdog_thread = _start_watchdog(log_path, last_progress, watchdog_stop, logging_logger, safe_stderr=safe_stderr)
 
         last_loss = None
         heartbeat_seconds = 10
@@ -211,7 +241,18 @@ def train_torchvision_detector(
             last_heartbeat = time.perf_counter()
             total_batches = len(train_loader)
             logging_logger.info("Epoch %d/%d | num_batches=%d", epoch, config.epochs, total_batches)
-            progress = tqdm(total=total_batches, desc=f"Epoch {epoch}/{config.epochs}", leave=False) if tqdm else None
+            progress = None
+            if tqdm:
+                try:
+                    progress = tqdm(
+                        total=total_batches,
+                        desc=f"Epoch {epoch}/{config.epochs}",
+                        leave=False,
+                        file=safe_stderr,
+                        dynamic_ncols=False,
+                    )
+                except Exception as exc:  # pragma: no cover - fallback automático
+                    logging_logger.warning("tqdm não pôde iniciar; usando logs periódicos. erro=%s", exc)
             for step, (images, targets) in enumerate(train_loader, start=1):
                 batch_start = time.perf_counter()
                 images = [img.to(device_str) for img in images]
@@ -230,20 +271,27 @@ def train_torchvision_detector(
                 avg_loss = running_loss / step
                 lr = lr_scheduler.get_last_lr()[0]
                 if progress:
-                    progress.set_postfix(loss=losses.item(), avg_loss=avg_loss, lr=f"{lr:.2e}", batch_time=f"{elapsed_batch:.3f}s")
-                    progress.update(1)
-                    if step % log_every_batches == 0 or time.perf_counter() - last_heartbeat >= heartbeat_seconds:
-                        logging_logger.info(
-                            "[heartbeat] epoch=%d step=%d/%d loss=%.4f avg_loss=%.4f lr=%.6f batch_time=%.3fs",
-                            epoch,
-                            step,
-                            total_batches,
-                            losses.item(),
-                            avg_loss,
-                            lr,
-                            elapsed_batch,
-                        )
-                        last_heartbeat = time.perf_counter()
+                    try:
+                        progress.set_postfix(loss=losses.item(), avg_loss=avg_loss, lr=f"{lr:.2e}", batch_time=f"{elapsed_batch:.3f}s")
+                        progress.update(1)
+                        if step % log_every_batches == 0 or time.perf_counter() - last_heartbeat >= heartbeat_seconds:
+                            logging_logger.info(
+                                "[heartbeat] epoch=%d step=%d/%d loss=%.4f avg_loss=%.4f lr=%.6f batch_time=%.3fs",
+                                epoch,
+                                step,
+                                total_batches,
+                                losses.item(),
+                                avg_loss,
+                                lr,
+                                elapsed_batch,
+                            )
+                            last_heartbeat = time.perf_counter()
+                    except Exception as exc:  # pragma: no cover - fallback automático
+                        logging_logger.warning("tqdm falhou durante a atualização; revertendo para logs periódicos. erro=%s", exc)
+                        try:
+                            progress.close()
+                        finally:
+                            progress = None
                 else:
                     now = time.perf_counter()
                     if step % log_every_batches == 0 or (now - last_heartbeat) >= heartbeat_seconds:
@@ -318,3 +366,13 @@ def train_torchvision_detector(
             watchdog_stop.set()
         if watchdog_thread:
             watchdog_thread.join(timeout=1)
+
+# Bloco de teste rápido (manual) para ambientes com sys.stderr sem fileno:
+# -------------------------------------------------------------------------
+# class _NoFileno:
+#     def write(self, msg): ...
+#     def flush(self): ...
+# sys.stderr = _NoFileno()  # simula PromptLogForwarder sem fileno
+# cfg = TrainConfig(epochs=1, log_dir=Path("logs/test_fileno"))
+# train_torchvision_detector(model, dataset_dir, train_ann, val_ann, weights_out, cfg)
+# # Esperado: treino inicia, logs no console ou em logs/test_fileno/fallback_stderr.log.
