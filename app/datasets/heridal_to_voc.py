@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import random
 import shutil
@@ -32,15 +31,7 @@ def _list_train_images(train_dir: Path) -> Tuple[List[Path], int, int]:
     return unique_images, len(raw_images), len(unique_images)
 
 
-def _resolve_image_size(
-    basename: str,
-    sizes_by_basename: Dict[str, Tuple[int, int]],
-    image_path: Path,
-) -> Tuple[int, int]:
-    size_from_csv = sizes_by_basename.get(basename)
-    if size_from_csv and all(dim > 0 for dim in size_from_csv):
-        return size_from_csv
-
+def _probe_image_size(image_path: Path) -> Tuple[int, int]:
     try:
         from PIL import Image  # type: ignore
 
@@ -64,6 +55,41 @@ def _resolve_image_size(
         raise RuntimeError(
             "Pillow (PIL) não está instalado e não foi possível usar OpenCV para obter dimensões; instale Pillow."
         )
+
+    raise RuntimeError(f"Não foi possível determinar dimensões para {image_path}.")
+
+
+def _resolve_image_size(
+    basename: str,
+    sizes_by_basename: Dict[str, Tuple[int, int]],
+    image_path: Path,
+    warnings: List[str],
+    logger: Optional[Logger],
+) -> Tuple[int, int]:
+    size_from_csv = sizes_by_basename.get(basename)
+    measured_width, measured_height = None, None
+    try:
+        measured_width, measured_height = _probe_image_size(image_path)
+    except Exception as exc:
+        warnings.append(str(exc))
+        if logger:
+            logger(f"[SSD][NORM][WARN] {exc}")
+
+    if size_from_csv and all(dim > 0 for dim in size_from_csv):
+        if measured_width and measured_height and (measured_width, measured_height) != size_from_csv:
+            msg = (
+                f"Tamanho divergente para {basename}: CSV={size_from_csv}, imagem={measured_width}x{measured_height}; "
+                f"usando dimensões medidas."
+            )
+            warnings.append(msg)
+            if logger:
+                logger(f"[SSD][NORM][WARN] {msg}")
+        if measured_width and measured_height:
+            return measured_width, measured_height
+        return size_from_csv
+
+    if measured_width and measured_height:
+        return measured_width, measured_height
 
     raise RuntimeError(f"Não foi possível determinar dimensões para {image_path}.")
 
@@ -132,12 +158,12 @@ def parse_heridal_csv(
             if basename not in sizes_by_basename:
                 sizes_by_basename[basename] = (width, height)
 
-            xmin = max(0, min(xmin, width - 1))
-            ymin = max(0, min(ymin, height - 1))
-            xmax = max(0, min(xmax, width - 1))
-            ymax = max(0, min(ymax, height - 1))
+            xmin = max(0, xmin)
+            ymin = max(0, ymin)
+            xmax = min(xmax, width - 1)
+            ymax = min(ymax, height - 1)
 
-            if xmin >= xmax or ymin >= ymax:
+            if xmin >= xmax or ymin >= ymax or xmax <= 0 or ymax <= 0:
                 discarded_bboxes += 1
                 msg = f"BBox inválido para {basename}: ({xmin}, {ymin}, {xmax}, {ymax}); descartado."
                 warnings.append(msg)
@@ -230,23 +256,71 @@ def write_imagesets(images_per_split: Dict[str, List[str]], imagesets_dir: Path)
                 fh.write(f"{Path(fname).stem}\n")
 
 
-def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None) -> Path:
-    dataset_dir = dataset_dir.expanduser().resolve()
+def _resolve_output_dir(normalized_dir: Path, logger: Optional[Logger]) -> Path:
     normalized_dir = normalized_dir.expanduser().resolve()
-    generation_markers = ["images", "labels", "annotations_voc", "Annotations", "JPEGImages", "ImageSets"]
+    generation_markers = ["JPEGImages", "Annotations", "ImageSets", "normalization_report.json"]
     has_existing_outputs = normalized_dir.exists() and any((normalized_dir / marker).exists() for marker in generation_markers)
     if has_existing_outputs:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         target_normalized_dir = normalized_dir / f"run-{timestamp}"
         if logger:
-            logger(f"[SSD][NORM][WARN] Saída existente detectada em {normalized_dir}; escrevendo em subpasta segura {target_normalized_dir}")
+            logger(
+                f"[SSD][NORM][WARN] Saída existente detectada em {normalized_dir}; "
+                f"escrevendo em subpasta segura {target_normalized_dir}"
+            )
     else:
         target_normalized_dir = normalized_dir
     target_normalized_dir.mkdir(parents=True, exist_ok=True)
     if logger:
         logger(f"[SSD][NORM] Diretório final de saída: {target_normalized_dir}")
+    return target_normalized_dir
+
+
+def _validate_integrity(
+    images_per_split: Dict[str, List[str]],
+    stem_to_filename: Dict[str, str],
+    jpeg_dir: Path,
+    ann_dir: Path,
+) -> Tuple[bool, List[dict]]:
+    failures: List[dict] = []
+    for split_name, stems in images_per_split.items():
+        for stem in stems:
+            filename = stem_to_filename.get(stem)
+            image_path = jpeg_dir / filename if filename else None
+            xml_path = ann_dir / f"{stem}.xml"
+            missing_items = []
+            if filename is None:
+                missing_items.append("filename_lookup")
+            else:
+                if not image_path.exists():
+                    missing_items.append("image")
+                if not xml_path.exists():
+                    missing_items.append("xml")
+            if missing_items:
+                failures.append(
+                    {
+                        "split": split_name,
+                        "id": stem,
+                        "filename": filename,
+                        "missing": missing_items,
+                        "image_path": str(image_path) if image_path else None,
+                        "xml_path": str(xml_path),
+                    }
+                )
+            if len(failures) >= 50:
+                break
+        if len(failures) >= 50:
+            break
+    return len(failures) == 0, failures
+
+
+def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None) -> Path:
+    dataset_dir = dataset_dir.expanduser().resolve()
+    target_normalized_dir = _resolve_output_dir(normalized_dir, logger)
 
     train_images_dir = dataset_dir / "train"
+    if not train_images_dir.exists():
+        raise FileNotFoundError(f"Diretório de imagens do HERIDAL não encontrado: {train_images_dir}")
     disk_images, disk_images_raw_count, disk_images_unique_count = _list_train_images(train_images_dir)
     disk_basenames = [path.name for path in disk_images]
     disk_basename_by_lower = {path.name.lower(): path.name for path in disk_images}
@@ -286,150 +360,167 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
     if not disk_basenames:
         raise ValueError("Nenhuma imagem encontrada em dataset_dir/train.")
 
-    all_basenames: List[str] = [path.name for path in disk_images]
-    lower_basenames = [name.lower() for name in all_basenames]
-    if len(all_basenames) != len(set(lower_basenames)):
-        raise ValueError("Nomes de arquivo duplicados após deduplicação case-insensitive.")
+    unique_in_csv = audit_data.get("unique_in_csv", set())
+    missing_on_disk = audit_data.get("missing_on_disk", set())
+
+    normalized_annotations: Dict[str, List[Tuple[int, int, int, int]]] = {}
+    for name, boxes in annotations_by_basename.items():
+        resolved_name = disk_basename_by_lower.get(name.lower())
+        if resolved_name:
+            normalized_annotations.setdefault(resolved_name, []).extend(boxes)
+
+    normalized_sizes: Dict[str, Tuple[int, int]] = {}
+    for name, size in sizes_by_basename.items():
+        resolved_name = disk_basename_by_lower.get(name.lower())
+        if resolved_name:
+            normalized_sizes.setdefault(resolved_name, size)
+
+    stem_to_filename: Dict[str, str] = {}
+    seen_lower_stems: Dict[str, str] = {}
+    stem_collisions: Dict[str, Set[str]] = {}
+    selected_basenames: List[str] = []
+    for basename in sorted(normalized_annotations.keys()):
+        stem = Path(basename).stem
+        lower_stem = stem.lower()
+        if lower_stem in seen_lower_stems and seen_lower_stems[lower_stem] != basename:
+            stem_collisions.setdefault(stem, set()).update({seen_lower_stems[lower_stem], basename})
+            warnings.append(
+                f"Colisão de stem '{stem}' entre '{seen_lower_stems[lower_stem]}' e '{basename}'. "
+                "Apenas a primeira ocorrência será usada para evitar IDs duplicados."
+            )
+            if logger:
+                logger(f"[SSD][NORM][WARN] {warnings[-1]}")
+            continue
+        seen_lower_stems[lower_stem] = basename
+        stem_to_filename[stem] = basename
+        selected_basenames.append(basename)
+
+    if not selected_basenames:
+        raise ValueError("Nenhuma imagem válida foi encontrada no CSV que também exista no disco.")
 
     rng = random.Random(42)
-    rng.shuffle(all_basenames)
+    shuffled = selected_basenames[:]
+    rng.shuffle(shuffled)
 
-    split_assignments: Dict[str, str] = {}
-    train_limit = int(len(all_basenames) * 0.8)
-    for idx, basename in enumerate(all_basenames):
-        split_assignments[basename] = "train" if idx < train_limit else "val"
+    total_usable_images = len(shuffled)
+    train_count = int(total_usable_images * 0.8)
+    val_count = total_usable_images - train_count
+    train_items = shuffled[:train_count]
+    val_items = shuffled[train_count:]
 
-    train_set = {name for name, split in split_assignments.items() if split == "train"}
-    val_set = {name for name, split in split_assignments.items() if split == "val"}
-    train_lower = {name.lower() for name in train_set}
-    val_lower = {name.lower() for name in val_set}
-    intersection_empty = not train_lower.intersection(val_lower)
-    if not intersection_empty:
-        raise ValueError("Interseção não vazia detectada entre conjuntos de treino e validação.")
+    images_per_split: Dict[str, List[str]] = {
+        "train": [Path(name).stem for name in train_items],
+        "val": [Path(name).stem for name in val_items],
+    }
 
-    train_count = len(train_set)
-    val_count = len(val_set)
-    if logger:
-        logger(f"[SSD][NORM] Split (disco) -> train: {train_count}, val: {val_count}")
+    if set(images_per_split["train"]).intersection(images_per_split["val"]):
+        raise ValueError("Conjuntos de treino e validação apresentam interseção após split.")
+    all_ids = images_per_split["train"] + images_per_split["val"]
+    if len(all_ids) != len(set(all_ids)):
+        raise ValueError("IDs duplicados detectados nos splits gerados.")
 
-    image_root = target_normalized_dir / "images"
-    ann_root = target_normalized_dir / "annotations_voc"
-    imagesets_root = target_normalized_dir / "ImageSets" / "Main"
+    jpeg_dir = target_normalized_dir / "JPEGImages"
+    ann_dir = target_normalized_dir / "Annotations"
+    imagesets_dir = target_normalized_dir / "ImageSets" / "Main"
+    jpeg_dir.mkdir(parents=True, exist_ok=True)
+    ann_dir.mkdir(parents=True, exist_ok=True)
+    imagesets_dir.mkdir(parents=True, exist_ok=True)
 
-    for split in ["train", "val"]:
-        (image_root / split).mkdir(parents=True, exist_ok=True)
-        (ann_root / split).mkdir(parents=True, exist_ok=True)
-    imagesets_root.mkdir(parents=True, exist_ok=True)
-
-    images_per_split: Dict[str, List[str]] = {"train": [], "val": []}
-    collisions: Dict[str, Set[str]] = {}
-    map_stem_to_basename: Dict[str, str] = {}
-    used_output_stems: Set[str] = set()
     images_with_annotations = 0
     images_without_annotations = 0
     total_xml_written = 0
+    post_validation_discarded = 0
+    sample_examples: List[dict] = []
 
-    for basename in all_basenames:
-        split = split_assignments.get(basename, "train")
+    for basename in selected_basenames:
         stem = Path(basename).stem
-        output_stem = stem
-        if stem in map_stem_to_basename and map_stem_to_basename[stem] != basename:
-            collisions.setdefault(stem, set()).update({map_stem_to_basename[stem], basename})
-            hash_suffix = hashlib.md5(basename.encode("utf-8")).hexdigest()[:8]
-            output_stem = f"{stem}_{hash_suffix}"
-            if logger:
-                logger(f"[SSD][NORM][WARN] Colisão de stem '{stem}' entre '{map_stem_to_basename[stem]}' e '{basename}'. Renomeando para '{output_stem}'.")
-        map_stem_to_basename.setdefault(stem, basename)
-        if output_stem in used_output_stems:
-            extra_hash = hashlib.md5(f"{basename}-{output_stem}".encode("utf-8")).hexdigest()[:8]
-            output_stem = f"{output_stem}_{extra_hash}"
-            if logger:
-                logger(f"[SSD][NORM][WARN] Stem resultante duplicado; ajustado para '{output_stem}'.")
-        used_output_stems.add(output_stem)
-
-        output_filename = f"{output_stem}{Path(basename).suffix}"
-        dest_image = image_root / split / output_filename
         src_image = train_images_dir / basename
+        dest_image = jpeg_dir / basename
         shutil.copy2(src_image, dest_image)
 
-        bboxes = annotations_by_basename.get(basename, [])
-        if bboxes:
+        width, height = _resolve_image_size(basename, normalized_sizes, src_image, warnings, logger)
+        original_bboxes = normalized_annotations.get(basename, [])
+        valid_bboxes: List[Tuple[int, int, int, int]] = []
+        for xmin, ymin, xmax, ymax in original_bboxes:
+            xmin = max(0, min(xmin, width - 1))
+            ymin = max(0, min(ymin, height - 1))
+            xmax = max(0, min(xmax, width - 1))
+            ymax = max(0, min(ymax, height - 1))
+            if xmin >= xmax or ymin >= ymax:
+                post_validation_discarded += 1
+                warnings.append(
+                    f"BBox descartado após validação final em {basename}: ({xmin}, {ymin}, {xmax}, {ymax})."
+                )
+                if logger:
+                    logger(f"[SSD][NORM][WARN] {warnings[-1]}")
+                continue
+            valid_bboxes.append((xmin, ymin, xmax, ymax))
+
+        if valid_bboxes:
             images_with_annotations += 1
         else:
             images_without_annotations += 1
 
-        width, height = _resolve_image_size(basename, sizes_by_basename, src_image)
-        write_voc_xml(
-            dest_image,
-            width,
-            height,
-            bboxes,
-            ann_root / split / f"{output_stem}.xml",
-        )
+        xml_path = ann_dir / f"{stem}.xml"
+        write_voc_xml(dest_image, width, height, valid_bboxes, xml_path)
         total_xml_written += 1
-        if logger and not bboxes:
-            logger(f"[SSD][NORM][WARN] XML gerado sem bboxes para {basename}.")
-        images_per_split.setdefault(split, []).append(output_filename)
+        if len(sample_examples) < 10:
+            sample_examples.append(
+                {"id": stem, "filename": basename, "xml_path": str(xml_path), "bboxes": len(valid_bboxes)}
+            )
 
-    write_imagesets(images_per_split, imagesets_root)
+    write_imagesets(images_per_split, imagesets_dir)
 
     labels_path = target_normalized_dir / "labels.txt"
     labels_path.write_text(f"{HUMAN_CLASS_NAME}\n", encoding="utf-8")
 
-    metadata = {
-        "origem": "HERIDAL",
-        "formato": "VOC",
-        "classes": [HUMAN_CLASS_NAME],
-        "timestamp": datetime.now().isoformat(),
-        "bboxes_total": total_bboxes,
-        "bboxes_descartados": discarded_bboxes,
-        "images_with_annotations": images_with_annotations,
-        "images_without_annotations": images_without_annotations,
-        "total_xml_written": total_xml_written,
-        "avisos": warnings,
-    }
-    (target_normalized_dir / "dataset.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    missing_on_disk = audit_data.get("missing_on_disk", set())
-    unique_in_csv = audit_data.get("unique_in_csv", set())
-    summary_log = [
-        f"[SSD][NORM] total_images_on_disk: {total_images_on_disk}",
-        f"[SSD][NORM] unique_images_in_csv: {len(unique_in_csv)}",
-        f"[SSD][NORM] missing_on_disk: {len(missing_on_disk)}",
-        f"[SSD][NORM] images_with_annotations: {images_with_annotations}",
-        f"[SSD][NORM] images_without_annotations: {images_without_annotations}",
-        f"[SSD][NORM] total_xml_written: {total_xml_written}",
-        f"[SSD][NORM] count_collisions: {len(collisions)}",
-    ]
-    if logger:
-        for msg in summary_log:
-            logger(msg)
     normalization_report = {
         "summary": {
-            "disk_images_raw_count": disk_images_raw_count,
-            "disk_images_unique_count": disk_images_unique_count,
-            "duplicates_removed_count": duplicates_removed,
-            "total_images_on_disk": total_images_on_disk,
-            "unique_images_in_csv": len(unique_in_csv),
+            "imagens_no_disco": total_images_on_disk,
+            "imagens_unicas_no_csv": len(unique_in_csv),
+            "imagens_usadas_no_split": total_usable_images,
+            "bboxes_total": total_bboxes,
+            "bboxes_descartadas": discarded_bboxes + post_validation_discarded,
+            "bboxes_descartadas_pre_validacao": discarded_bboxes,
+            "bboxes_descartadas_pos_validacao": post_validation_discarded,
+            "train": len(images_per_split["train"]),
+            "val": len(images_per_split["val"]),
+            "test": 0,
             "images_with_annotations": images_with_annotations,
             "images_without_annotations": images_without_annotations,
-            "train_count": train_count,
-            "val_count": val_count,
-            "train_val_intersection_empty": intersection_empty,
             "total_xml_written": total_xml_written,
-            "bboxes_total": total_bboxes,
-            "bboxes_descartados": discarded_bboxes,
         },
-        "missing_on_disk_sample": sorted(list(missing_on_disk))[:200],
-        "collisions_sample": [
-            {"stem": stem, "basenames": sorted(list(names))}
-            for stem, names in list(collisions.items())[:200]
+        "datasets": {
+            "JPEGImages": str(jpeg_dir),
+            "Annotations": str(ann_dir),
+            "ImageSets": str(imagesets_dir),
+        },
+        "warnings": warnings,
+        "missing_on_disk_sample": sorted(list(missing_on_disk))[:50],
+        "stem_collisions_sample": [
+            {"stem": stem, "basenames": sorted(list(names))} for stem, names in stem_collisions.items()
         ],
+        "samples": sample_examples,
     }
+
+    integrity_ok, integrity_failures = _validate_integrity(images_per_split, stem_to_filename, jpeg_dir, ann_dir)
+    normalization_report["integrity"] = {"ok": integrity_ok, "failures": integrity_failures}
     report_path = target_normalized_dir / "normalization_report.json"
     report_path.write_text(json.dumps(normalization_report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if logger:
-        logger(f"[SSD][NORM] Normalização concluída em {target_normalized_dir}")
+        logger(f"[SSD][NORM] imagens_no_disco: {total_images_on_disk}")
+        logger(f"[SSD][NORM] imagens_unicas_no_csv: {len(unique_in_csv)}")
+        logger(f"[SSD][NORM] imagens_usadas_no_split: {total_usable_images}")
+        logger(f"[SSD][NORM] bboxes_total: {total_bboxes}")
+        logger(f"[SSD][NORM] bboxes_descartadas: {discarded_bboxes + post_validation_discarded}")
+        logger(f"[SSD][NORM] split -> train: {len(images_per_split['train'])}, val: {len(images_per_split['val'])}")
+        if not integrity_ok:
+            logger(f"[SSD][NORM][ERROR] Falha de integridade detectada; consulte {report_path}")
+        else:
+            logger(f"[SSD][NORM] Normalização concluída em {target_normalized_dir}")
+
+    if not integrity_ok:
+        raise RuntimeError("Falha de integridade após normalização; consulte normalization_report.json para detalhes.")
 
     return target_normalized_dir
