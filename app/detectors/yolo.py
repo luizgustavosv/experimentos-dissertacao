@@ -116,7 +116,7 @@ class YoloDetector(DetectionAlgorithm):
             if results and hasattr(results[0], "save_dir")
             else predictions_root / report_out.stem
         )
-        previews = self._collect_previews(save_dir)
+        previews = self._collect_detection_previews(results, save_dir)
 
         report_builder = ReportBuilder(self.context.name)
         report_builder.save_report(
@@ -164,3 +164,29 @@ class YoloDetector(DetectionAlgorithm):
         extensions = {".jpg", ".jpeg", ".png", ".bmp"}
         previews = [p for p in preview_dir.iterdir() if p.suffix.lower() in extensions and p.is_file()]
         return sorted(previews)[:limit]
+
+    @staticmethod
+    def _collect_detection_previews(results, save_dir: Path, limit: int = 10) -> List[Path]:
+        if not results:
+            return []
+        previews: List[Path] = []
+        for res in results:
+            boxes = getattr(res, "boxes", None)
+            if boxes is None or len(boxes) == 0:
+                continue
+            img_name = Path(res.path).name
+            candidate = save_dir / img_name
+            if candidate.exists():
+                previews.append(candidate)
+            if len(previews) >= limit:
+                break
+        if len(previews) < limit and save_dir.exists():
+            for extra in sorted(save_dir.iterdir()):
+                if len(previews) >= limit:
+                    break
+                if extra in previews:
+                    continue
+                if extra.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp"}:
+                    continue
+                previews.append(extra)
+        return previews[:limit]
