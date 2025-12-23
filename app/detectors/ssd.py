@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -90,14 +90,43 @@ class SSDDetector(TorchvisionDetector):
         return normalized_path
 
     def _build_ssd_model(self, num_classes: int, pretrained_weights: Optional[Path], logger: Optional[Logger]):
+        from torchvision.models import VGG16_Weights
         from torchvision.models.detection import SSD300_VGG16_Weights, ssd300_vgg16
 
-        model = ssd300_vgg16(weights=None, weights_backbone=SSD300_VGG16_Weights.DEFAULT, num_classes=num_classes)
-        state_dict, checkpoint_num_classes, checkpoint_label = self._load_checkpoint_state(pretrained_weights, logger)
+        mode, checkpoint_path = self._resolve_ssd_pretrained_mode(pretrained_weights)
+
+        weights: Optional[SSD300_VGG16_Weights] = None
+        weights_backbone: Optional[VGG16_Weights] = None
+        state_dict: Optional[dict] = None
+        checkpoint_num_classes: Optional[int] = None
+        checkpoint_label = "<none>"
+
+        if mode == "ssd_coco":
+            weights = SSD300_VGG16_Weights.DEFAULT
+            checkpoint_label = "SSD300_VGG16_Weights.DEFAULT"
+        elif mode == "backbone_imagenet":
+            weights_backbone = VGG16_Weights.DEFAULT
+            checkpoint_label = "VGG16_Weights.DEFAULT"
+        elif mode == "from_checkpoint_path":
+            state_dict, checkpoint_num_classes, checkpoint_label = self._load_checkpoint_state(checkpoint_path, logger)
+        else:  # pragma: no cover - proteção extra para casos não previstos
+            raise ValueError(f"Modo de pré-treino SSD desconhecido: {mode}")
+
+        if logger:
+            logger(f"[SSD][INIT] mode={mode} weights={weights} weights_backbone={weights_backbone}")
+            logger(
+                f"[SSD][INIT] weights_type={type(weights).__name__ if weights is not None else 'None'} | "
+                f"weights_backbone_type={type(weights_backbone).__name__ if weights_backbone is not None else 'None'}"
+            )
+
+        constructor_num_classes = num_classes if weights is None else None
+        model = ssd300_vgg16(weights=weights, weights_backbone=weights_backbone, num_classes=constructor_num_classes)
 
         if logger:
             logger(f"[SSD][WEIGHTS] checkpoint_path={checkpoint_label}")
-            logger(f"[SSD][WEIGHTS] checkpoint_num_classes={checkpoint_num_classes if checkpoint_num_classes else 'desconhecido'}")
+            logger(
+                f"[SSD][WEIGHTS] checkpoint_num_classes={checkpoint_num_classes if checkpoint_num_classes else 'desconhecido'}"
+            )
             logger(f"[SSD][WEIGHTS] num_classes_model={num_classes}")
 
         if state_dict:
@@ -126,28 +155,27 @@ class SSDDetector(TorchvisionDetector):
 
         return model
 
-    def _load_checkpoint_state(
-        self, pretrained_weights: Optional[Path], logger: Optional[Logger]
-    ) -> tuple[Optional[dict], Optional[int], str]:
-        from torchvision.models.detection import SSD300_VGG16_Weights
+    @staticmethod
+    def _resolve_ssd_pretrained_mode(pretrained_weights: Optional[Path]) -> Tuple[str, Optional[Path]]:
+        if pretrained_weights is None:
+            return "ssd_coco", None
 
-        if pretrained_weights:
-            weights_path = pretrained_weights.expanduser().resolve()
-            if not weights_path.exists():
-                raise FileNotFoundError(f"Pesos não encontrados: {weights_path}")
-            state_dict = torch.load(weights_path, map_location="cpu")
-            checkpoint_num_classes = self._infer_ssd_num_classes(state_dict, logger)
-            return state_dict, checkpoint_num_classes, str(weights_path)
+        lower_value = str(pretrained_weights).strip().lower()
+        if lower_value == "ssd_coco":
+            return "ssd_coco", None
+        if lower_value in {"backbone_imagenet", "imagenet"}:
+            return "backbone_imagenet", None
 
-        weights_enum = SSD300_VGG16_Weights.DEFAULT
-        checkpoint_num_classes = len(weights_enum.meta.get("categories", [])) if weights_enum.meta.get("categories") else None
-        try:
-            state_dict = weights_enum.get_state_dict(progress=True)
-        except Exception as exc:  # pragma: no cover - depende de rede/cache
-            state_dict = None
-            if logger:
-                logger(f"[SSD][WEIGHTS][WARN] Falha ao obter pesos padrão do SSD (COCO): {exc}")
-        return state_dict, checkpoint_num_classes, "SSD300_VGG16_Weights.DEFAULT"
+        as_path = Path(pretrained_weights)
+        return "from_checkpoint_path", as_path
+
+    def _load_checkpoint_state(self, pretrained_weights: Path, logger: Optional[Logger]) -> tuple[Optional[dict], Optional[int], str]:
+        weights_path = pretrained_weights.expanduser().resolve()
+        if not weights_path.exists():
+            raise FileNotFoundError(f"Pesos não encontrados: {weights_path}")
+        state_dict = torch.load(weights_path, map_location="cpu")
+        checkpoint_num_classes = self._infer_ssd_num_classes(state_dict, logger)
+        return state_dict, checkpoint_num_classes, str(weights_path)
 
     @staticmethod
     def _filter_ssd_state_dict(state_dict: dict, drop_heads: bool):

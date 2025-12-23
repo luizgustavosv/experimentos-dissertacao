@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torchvision
+from torchvision.models import VGG16_Weights
 from torchvision.models.detection import SSD300_VGG16_Weights
 
 
@@ -14,5 +15,5 @@ def build_retinanet(num_classes: int):
 
 def build_ssd(num_classes: int):
     return torchvision.models.detection.ssd300_vgg16(
-        weights=None, weights_backbone=SSD300_VGG16_Weights.DEFAULT, num_classes=num_classes
+        weights=None, weights_backbone=VGG16_Weights.DEFAULT, num_classes=num_classes
     )
