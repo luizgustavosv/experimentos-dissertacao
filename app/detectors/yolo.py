@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import time
+import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
+
+import yaml
 
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
@@ -158,7 +162,8 @@ class YoloDetector(DetectionAlgorithm):
     ):
         from ultralytics import YOLO  # import tardio para evitar dependências pesadas em import
 
-        dataset_yaml_path = Path(dataset_yaml_path).expanduser().resolve(strict=True)
+        dataset_yaml_path = Path(dataset_yaml_path)
+        yaml_path_abs = dataset_yaml_path.resolve(strict=True)
         report_out = report_out.expanduser().resolve()
         plots_dir = plots_dir.expanduser().resolve()
 
@@ -168,19 +173,44 @@ class YoloDetector(DetectionAlgorithm):
 
         device_str = resolve_device(self.config.device)
         if logger:
-            logger(f"[VAL] {self.context.name} validando {dataset_yaml_path} em {device_str} usando {weights_resolved}")
+            logger(f"[VAL] {self.context.name} validando {yaml_path_abs} em {device_str} usando {weights_resolved}")
             if pedestrian_only:
                 logger("[VAL] Filtrando apenas classe pedestrian (0) durante a validação")
 
-        model = YOLO(weights_resolved)
-        results = model.val(
-            data=str(dataset_yaml_path),
-            project=str(plots_dir),
-            name=report_out.stem,
-            save_json=True,
-            plots=True,
-            classes=[0] if pedestrian_only else None,
+        cfg = yaml.safe_load(yaml_path_abs.read_text(encoding="utf-8"))
+        root = Path(cfg["path"]).expanduser()
+        if not root.is_absolute():
+            root = (yaml_path_abs.parent / root).resolve()
+        train_dir = (root / cfg["train"]).resolve()
+        val_dir = (root / cfg["val"]).resolve()
+
+        self._log(
+            f"[VAL][DATA] yaml_path_abs={repr(yaml_path_abs)} cfg_path={repr(cfg['path'])} root={repr(root)} "
+            f"train_dir={repr(train_dir)} val_dir={repr(val_dir)}",
+            logger,
         )
+        self._log(
+            f"[VAL][DATA] exists? train_dir={train_dir.exists()} val_dir={val_dir.exists()}",
+            logger,
+        )
+        if not val_dir.exists():
+            raise Exception(
+                "[VAL][DATA] Diretório de validação inexistente "
+                f"yaml_path_abs={repr(yaml_path_abs)} cfg_path={repr(cfg['path'])} root={repr(root)} "
+                f"train_dir={repr(train_dir)} val_dir={repr(val_dir)} "
+                f"train_exists={train_dir.exists()} val_exists={val_dir.exists()}"
+            )
+
+        model = YOLO(weights_resolved)
+        with self._temporary_cwd(yaml_path_abs.parent):
+            results = model.val(
+                data=str(yaml_path_abs),
+                project=str(plots_dir),
+                name=report_out.stem,
+                save_json=True,
+                plots=True,
+                classes=[0] if pedestrian_only else None,
+            )
 
         run_dir = Path(getattr(results, "save_dir", plots_dir / report_out.stem))
         metrics = self._build_metrics_from_results(results, device_str, weights_resolved)
@@ -192,7 +222,7 @@ class YoloDetector(DetectionAlgorithm):
             report_path=report_out,
             metrics=metrics,
             operation="Validação",
-            source_dir=dataset_yaml_path.parent,
+            source_dir=yaml_path_abs.parent,
             plot_path=metrics_plot,
             weights_path=weights_resolved,
         )
@@ -205,6 +235,16 @@ class YoloDetector(DetectionAlgorithm):
             logger(f"[VAL] Relatório salvo em {report_out}")
 
         return metrics
+
+    @staticmethod
+    @contextmanager
+    def _temporary_cwd(path: Path):
+        previous = Path.cwd()
+        os.chdir(path)
+        try:
+            yield
+        finally:
+            os.chdir(previous)
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):
         from app.datasets.normalizer import normalize_dataset as normalize_pipeline
