@@ -378,7 +378,9 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
     stem_to_filename: Dict[str, str] = {}
     seen_lower_stems: Dict[str, str] = {}
     stem_collisions: Dict[str, Set[str]] = {}
-    selected_basenames: List[str] = []
+    usable_items: List[Tuple[str, str, List[Tuple[int, int, int, int]], int, int]] = []
+    skipped_no_annotations: List[str] = []
+    post_validation_discarded = 0
     for basename in sorted(normalized_annotations.keys()):
         stem = Path(basename).stem
         lower_stem = stem.lower()
@@ -392,52 +394,8 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
                 logger(f"[SSD][NORM][WARN] {warnings[-1]}")
             continue
         seen_lower_stems[lower_stem] = basename
-        stem_to_filename[stem] = basename
-        selected_basenames.append(basename)
 
-    if not selected_basenames:
-        raise ValueError("Nenhuma imagem válida foi encontrada no CSV que também exista no disco.")
-
-    rng = random.Random(42)
-    shuffled = selected_basenames[:]
-    rng.shuffle(shuffled)
-
-    total_usable_images = len(shuffled)
-    train_count = int(total_usable_images * 0.8)
-    val_count = total_usable_images - train_count
-    train_items = shuffled[:train_count]
-    val_items = shuffled[train_count:]
-
-    images_per_split: Dict[str, List[str]] = {
-        "train": [Path(name).stem for name in train_items],
-        "val": [Path(name).stem for name in val_items],
-    }
-
-    if set(images_per_split["train"]).intersection(images_per_split["val"]):
-        raise ValueError("Conjuntos de treino e validação apresentam interseção após split.")
-    all_ids = images_per_split["train"] + images_per_split["val"]
-    if len(all_ids) != len(set(all_ids)):
-        raise ValueError("IDs duplicados detectados nos splits gerados.")
-
-    jpeg_dir = target_normalized_dir / "JPEGImages"
-    ann_dir = target_normalized_dir / "Annotations"
-    imagesets_dir = target_normalized_dir / "ImageSets" / "Main"
-    jpeg_dir.mkdir(parents=True, exist_ok=True)
-    ann_dir.mkdir(parents=True, exist_ok=True)
-    imagesets_dir.mkdir(parents=True, exist_ok=True)
-
-    images_with_annotations = 0
-    images_without_annotations = 0
-    total_xml_written = 0
-    post_validation_discarded = 0
-    sample_examples: List[dict] = []
-
-    for basename in selected_basenames:
-        stem = Path(basename).stem
         src_image = train_images_dir / basename
-        dest_image = jpeg_dir / basename
-        shutil.copy2(src_image, dest_image)
-
         width, height = _resolve_image_size(basename, normalized_sizes, src_image, warnings, logger)
         original_bboxes = normalized_annotations.get(basename, [])
         valid_bboxes: List[Tuple[int, int, int, int]] = []
@@ -456,11 +414,53 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
                 continue
             valid_bboxes.append((xmin, ymin, xmax, ymax))
 
-        if valid_bboxes:
-            images_with_annotations += 1
-        else:
-            images_without_annotations += 1
+        if not valid_bboxes:
+            skipped_no_annotations.append(basename)
+            continue
 
+        stem_to_filename[stem] = basename
+        usable_items.append((stem, basename, valid_bboxes, width, height))
+
+    if not usable_items:
+        raise ValueError("Nenhuma imagem válida foi encontrada no CSV que também exista no disco.")
+
+    rng = random.Random(42)
+    shuffled = usable_items[:]
+    rng.shuffle(shuffled)
+
+    total_usable_images = len(shuffled)
+    train_count = int(total_usable_images * 0.8)
+    val_count = total_usable_images - train_count
+    train_items = shuffled[:train_count]
+    val_items = shuffled[train_count:]
+
+    images_per_split: Dict[str, List[str]] = {
+        "train": [item[0] for item in train_items],
+        "val": [item[0] for item in val_items],
+    }
+
+    if set(images_per_split["train"]).intersection(images_per_split["val"]):
+        raise ValueError("Conjuntos de treino e validação apresentam interseção após split.")
+    all_ids = images_per_split["train"] + images_per_split["val"]
+    if len(all_ids) != len(set(all_ids)):
+        raise ValueError("IDs duplicados detectados nos splits gerados.")
+
+    jpeg_dir = target_normalized_dir / "JPEGImages"
+    ann_dir = target_normalized_dir / "Annotations"
+    imagesets_dir = target_normalized_dir / "ImageSets" / "Main"
+    jpeg_dir.mkdir(parents=True, exist_ok=True)
+    ann_dir.mkdir(parents=True, exist_ok=True)
+    imagesets_dir.mkdir(parents=True, exist_ok=True)
+
+    images_with_annotations = len(usable_items)
+    images_without_annotations = len(skipped_no_annotations)
+    total_xml_written = 0
+    sample_examples: List[dict] = []
+
+    for stem, basename, valid_bboxes, width, height in usable_items:
+        src_image = train_images_dir / basename
+        dest_image = jpeg_dir / basename
+        shutil.copy2(src_image, dest_image)
         xml_path = ann_dir / f"{stem}.xml"
         write_voc_xml(dest_image, width, height, valid_bboxes, xml_path)
         total_xml_written += 1
@@ -490,6 +490,10 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
             "images_without_annotations": images_without_annotations,
             "total_xml_written": total_xml_written,
         },
+        "skipped_no_annotations": {
+            "count": len(skipped_no_annotations),
+            "examples": skipped_no_annotations[:200],
+        },
         "datasets": {
             "JPEGImages": str(jpeg_dir),
             "Annotations": str(ann_dir),
@@ -511,6 +515,8 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
     if logger:
         logger(f"[SSD][NORM] imagens_no_disco: {total_images_on_disk}")
         logger(f"[SSD][NORM] imagens_unicas_no_csv: {len(unique_in_csv)}")
+        logger(f"[SSD][NORM] imagens_com_bbox: {images_with_annotations}")
+        logger(f"[SSD][NORM] imagens_sem_bbox: {images_without_annotations}")
         logger(f"[SSD][NORM] imagens_usadas_no_split: {total_usable_images}")
         logger(f"[SSD][NORM] bboxes_total: {total_bboxes}")
         logger(f"[SSD][NORM] bboxes_descartadas: {discarded_bboxes + post_validation_discarded}")
