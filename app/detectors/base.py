@@ -37,11 +37,19 @@ class DetectionAlgorithm:
         images_dir: Path,
         weights_path: Optional[Path],
         report_out: Path,
+        pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
     ) -> InferencePerformance:
         raise NotImplementedError
 
-    def validate(self, images_dir: Path, report_out: Path, plots_dir: Path, logger: Optional[Logger] = None) -> Metrics:
+    def validate(
+        self,
+        images_dir: Path,
+        report_out: Path,
+        plots_dir: Path,
+        pedestrian_only: bool = False,
+        logger: Optional[Logger] = None,
+    ) -> Metrics:
         raise NotImplementedError
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):

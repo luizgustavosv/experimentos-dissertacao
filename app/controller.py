@@ -40,10 +40,11 @@ class ExperimentController:
         images_dir: Path,
         weights_path: Optional[Path],
         report_out: Path,
+        pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
-        performance = detector.infer(images_dir, weights_path, report_out, logger)
+        performance = detector.infer(images_dir, weights_path, report_out, pedestrian_only=pedestrian_only, logger=logger)
         return OperationResult(inference_performance=performance, message="Inferência concluída.")
 
     def execute_validate(
@@ -52,10 +53,11 @@ class ExperimentController:
         images_dir: Path,
         report_out: Path,
         plots_dir: Path,
+        pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
-        metrics = detector.validate(images_dir, report_out, plots_dir, logger)
+        metrics = detector.validate(images_dir, report_out, plots_dir, pedestrian_only=pedestrian_only, logger=logger)
         return OperationResult(metrics=metrics, message="Validação concluída.")
 
     def execute_normalize(

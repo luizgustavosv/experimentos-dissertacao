@@ -65,7 +65,14 @@ class YoloDetector(DetectionAlgorithm):
             map_computed=False,
         )
 
-    def infer(self, images_dir: Path, weights_path: Optional[Path], report_out: Path, logger: Optional[Logger] = None):
+    def infer(
+        self,
+        images_dir: Path,
+        weights_path: Optional[Path],
+        report_out: Path,
+        pedestrian_only: bool = False,
+        logger: Optional[Logger] = None,
+    ):
         from ultralytics import YOLO  # import tardio para evitar dependências pesadas em import
 
         images_dir = images_dir.expanduser().resolve()
@@ -92,15 +99,18 @@ class YoloDetector(DetectionAlgorithm):
         model = YOLO(str(weights_path))
         predictions_root = report_out.parent / "predictions"
         start = time.perf_counter()
-        results = model.predict(
-            source=str(images_dir),
-            imgsz=640,
-            device=device_str,
-            save=True,
-            project=str(predictions_root),
-            name=report_out.stem,
-            exist_ok=True,
-        )
+        predict_kwargs = {
+            "source": str(images_dir),
+            "imgsz": 640,
+            "device": device_str,
+            "save": True,
+            "project": str(predictions_root),
+            "name": report_out.stem,
+            "exist_ok": True,
+        }
+        if pedestrian_only:
+            predict_kwargs["classes"] = [0]
+        results = model.predict(**predict_kwargs)
         elapsed = time.perf_counter() - start
 
         total_images = len(image_paths)
@@ -137,7 +147,14 @@ class YoloDetector(DetectionAlgorithm):
 
         return performance
 
-    def validate(self, images_dir: Path, report_out: Path, plots_dir: Path, logger: Optional[Logger] = None):
+    def validate(
+        self,
+        images_dir: Path,
+        report_out: Path,
+        plots_dir: Path,
+        pedestrian_only: bool = False,
+        logger: Optional[Logger] = None,
+    ):
         raise NotImplementedError("Validação via Ultralytics não implementada neste escopo de treino.")
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):

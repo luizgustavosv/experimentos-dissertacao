@@ -4,8 +4,23 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from app.datasets.ir import AnnotationRecord, DatasetIR, ImageRecord
-from app.datasets.utils import clip_bbox, is_image_file, load_image_size, load_json
+from app.datasets.utils import clip_bbox, is_image_file, load_image_size
 from app.detectors.base import Logger
+
+
+VISDRONE_CLASS_NAMES = [
+    "pedestrian",
+    "people",
+    "bicycle",
+    "car",
+    "van",
+    "truck",
+    "tricycle",
+    "awning-tricycle",
+    "bus",
+    "motor",
+]
+VALID_VISDRONE_CATEGORIES = set(range(1, len(VISDRONE_CLASS_NAMES) + 1))
 
 
 def _classify_split(name: str) -> Optional[str]:
@@ -96,14 +111,6 @@ def resolve_visdrone_splits(input_dir: Path) -> Dict[str, Optional[Path]]:
     return resolved
 
 
-def _load_human_categories(config_path: Path, override: Optional[List[int]]) -> List[int]:
-    if override is not None:
-        return sorted(set(override))
-    if not config_path.exists():
-        raise FileNotFoundError(f"Arquivo de categorias não encontrado em {config_path}")
-    return sorted(set(load_json(config_path)))
-
-
 def _read_annotation_file(path: Path) -> List[List[int]]:
     if not path.exists():
         return []
@@ -149,7 +156,6 @@ def _make_annotation(
 
 def read_visdrone(
     dataset_dir: Path,
-    human_categories: List[int],
     logger: Optional[Logger] = None,
 ) -> Tuple[DatasetIR, Dict[str, int], List[str], bool]:
     dataset_dir = dataset_dir.expanduser().resolve()
@@ -165,15 +171,16 @@ def read_visdrone(
     discarded: Dict[str, int] = {
         "invalid_bbox_size": 0,
         "ignored_by_score": 0,
-        "non_human_category": 0,
+        "ignored_region": 0,
+        "unknown_category": 0,
         "clipped_empty": 0,
         "missing_annotation_file": 0,
     }
     warnings: List[str] = []
     is_labelled = False
-    human_class = "human"
     images_per_split: Dict[str, int] = {"train": 0, "val": 0, "test": 0}
     labels_per_split: Dict[str, int] = {"train": 0, "val": 0, "test": 0}
+    class_counts: Dict[int, int] = {idx: 0 for idx in range(len(VISDRONE_CLASS_NAMES))}
 
     image_id = 0
     ann_id = 0
@@ -213,16 +220,18 @@ def read_visdrone(
             rows = _read_annotation_file(annotation_path)
             ann_for_image = 0
             for row in rows:
-                xmin, ymin, w, h, score_or_ignored, category, _, _ = row
+                xmin, ymin, w, h, score, category, _, _ = row
                 if w <= 0 or h <= 0:
                     discarded["invalid_bbox_size"] += 1
                     continue
-                if score_or_ignored == 0:
-                    discarded["ignored_by_score"] += 1
+                if category == 0:
+                    discarded["ignored_region"] += 1
                     continue
-                # VisDrone DET: categoria 1 = pedestrian (mapeado para classe única "human")
-                if category not in human_categories:
-                    discarded["non_human_category"] += 1
+                if category not in VALID_VISDRONE_CATEGORIES:
+                    discarded["unknown_category"] += 1
+                    continue
+                if score == 0:
+                    discarded["ignored_by_score"] += 1
                     continue
 
                 xmax = xmin + w
@@ -234,23 +243,32 @@ def read_visdrone(
 
                 ann_id += 1
                 ann_for_image += 1
+                class_id = category - 1
                 annotations.append(
                     _make_annotation(
                         ann_id,
                         image_id,
-                        class_id=0,
-                        class_name=human_class,
+                        class_id=class_id,
+                        class_name=VISDRONE_CLASS_NAMES[class_id],
                         xmin=xmin_c,
                         ymin=ymin_c,
                         xmax=xmax_c,
                         ymax=ymax_c,
                     )
                 )
+                class_counts[class_id] = class_counts.get(class_id, 0) + 1
             if ann_for_image == 0 and annotations_dir.exists():
                 warnings.append(f"{image_path.name} ficou sem anotações após filtros em {split_name}")
             labels_per_split[img_record.split] = labels_per_split.get(img_record.split, 0) + ann_for_image
 
-    dataset = DatasetIR(classes=[human_class], images=images, annotations=annotations)
+    dataset = DatasetIR(classes=VISDRONE_CLASS_NAMES, images=images, annotations=annotations)
+    if logger and any(class_counts.values()):
+        logger(
+            "VisDrone classes mantidas: "
+            + ", ".join(
+                f"{VISDRONE_CLASS_NAMES[idx]}={count}" for idx, count in sorted(class_counts.items()) if count > 0
+            )
+        )
     if logger:
         logger(
             "Contagem gerada por split (imagens/labels): "
