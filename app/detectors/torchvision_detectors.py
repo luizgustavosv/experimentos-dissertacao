@@ -71,7 +71,14 @@ class TorchvisionDetector(DetectionAlgorithm):
         data = json.loads(ann_path.read_text(encoding="utf-8"))
         return len(data.get("categories", [])) + 1  # +1 para background
 
-    def infer(self, images_dir: Path, weights_path: Optional[Path], report_out: Path, logger: Optional[Logger] = None):
+    def infer(
+        self,
+        images_dir: Path,
+        weights_path: Optional[Path],
+        report_out: Path,
+        pedestrian_only: bool = False,
+        logger: Optional[Logger] = None,
+    ):
         images_dir = images_dir.expanduser().resolve()
         report_out = report_out.expanduser().resolve()
         if not images_dir.exists() or not images_dir.is_dir():
@@ -102,6 +109,8 @@ class TorchvisionDetector(DetectionAlgorithm):
             labels = output.get("labels", torch.empty(0, dtype=torch.int64)).detach().cpu()
 
             keep = scores >= 0.5
+            if pedestrian_only:
+                keep = keep & (labels == 0)
             boxes = boxes[keep]
             scores = scores[keep]
             labels = labels[keep]
@@ -148,7 +157,14 @@ class TorchvisionDetector(DetectionAlgorithm):
 
         return performance
 
-    def validate(self, images_dir: Path, report_out: Path, plots_dir: Path, logger: Optional[Logger] = None):
+    def validate(
+        self,
+        images_dir: Path,
+        report_out: Path,
+        plots_dir: Path,
+        pedestrian_only: bool = False,
+        logger: Optional[Logger] = None,
+    ):
         raise NotImplementedError("Validação não implementada neste escopo de treino.")
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):

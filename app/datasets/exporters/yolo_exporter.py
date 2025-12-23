@@ -16,11 +16,14 @@ def _annotations_by_image(dataset: DatasetIR) -> Dict[int, Iterable[AnnotationRe
 
 
 def _normalize_bbox(ann: AnnotationRecord, img: ImageRecord) -> str:
+    def _clamp(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
     img_w, img_h = img.width, img.height
-    cx = ((ann.xmin + ann.xmax) / 2) / img_w
-    cy = ((ann.ymin + ann.ymax) / 2) / img_h
-    w = (ann.xmax - ann.xmin) / img_w
-    h = (ann.ymax - ann.ymin) / img_h
+    cx = _clamp(((ann.xmin + ann.xmax) / 2) / img_w)
+    cy = _clamp(((ann.ymin + ann.ymax) / 2) / img_h)
+    w = _clamp((ann.xmax - ann.xmin) / img_w)
+    h = _clamp((ann.ymax - ann.ymin) / img_h)
     return f"{ann.class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}"
 
 
@@ -65,6 +68,7 @@ def export_yolo(dataset: DatasetIR, output_dir: Path, is_labelled: bool, logger:
         "train": "images/train",
         "val": "images/val",
         "test": "images/test",
+        "nc": len(dataset.classes),
         "names": {idx: name for idx, name in enumerate(dataset.classes)},
     }
     yaml_path = output_dir / "dataset.yaml"

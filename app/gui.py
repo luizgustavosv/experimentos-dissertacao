@@ -36,6 +36,7 @@ class DetectorApp(tk.Tk):
         }
         self.epochs_var = tk.IntVar(value=10)
         self.early_stop_var = tk.BooleanVar(value=False)
+        self.pedestrian_only_var = tk.BooleanVar(value=False)
 
         self._build_header()
         self._build_forms()
@@ -127,10 +128,12 @@ class DetectorApp(tk.Tk):
             self._add_path_selector("Pesos para inferência", "inference_weights")
             self._add_path_selector("Imagens para inferência", "images", is_dir=True)
             self._add_path_selector("Relatório PDF da inferência", "report", is_file=True, defaultextension=".pdf")
+            self._add_pedestrian_filter_selector()
         elif action == "Validar":
             self._add_path_selector("Imagens de validação", "images", is_dir=True)
             self._add_path_selector("Pasta para gráficos", "plots", is_dir=True)
             self._add_path_selector("Relatório PDF da validação", "report", is_file=True, defaultextension=".pdf")
+            self._add_pedestrian_filter_selector()
         elif action == "Normalizar dataset":
             self._add_dataset_type_selector()
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
@@ -176,6 +179,26 @@ class DetectorApp(tk.Tk):
             frame,
             text="Treinar até o modelo parar de melhorar (parada antecipada)",
             variable=self.early_stop_var,
+            onvalue=True,
+            offvalue=False,
+            bg="#12233d",
+            fg="white",
+            selectcolor="#0b172a",
+            activebackground="#12233d",
+            activeforeground="white",
+            anchor="w",
+            justify="left",
+            wraplength=760,
+        )
+        check.pack(anchor="w")
+
+    def _add_pedestrian_filter_selector(self) -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        check = tk.Checkbutton(
+            frame,
+            text="Manter apenas detecções da classe pedestrian (classe 0) em inferência/validação",
+            variable=self.pedestrian_only_var,
             onvalue=True,
             offvalue=False,
             bg="#12233d",
@@ -265,31 +288,47 @@ class DetectorApp(tk.Tk):
                 weights_raw = self.path_vars["inference_weights"].get().strip()
                 weights = Path(weights_raw) if weights_raw else None
                 report = Path(self.path_vars["report"].get())
+                pedestrian_only = bool(self.pedestrian_only_var.get())
                 prompt_logger(
                     self._build_prompt_command(
                         "inferir",
                         algorithm_key,
-                        {"imagens": images, "pesos": weights or "padrão", "relatorio": report},
+                        {
+                            "imagens": images,
+                            "pesos": weights or "padrão",
+                            "relatorio": report,
+                            "apenas_pedestrian": pedestrian_only,
+                        },
                     )
                 )
 
                 def run_action() -> OperationResult:
-                    return self.controller.execute_infer(algorithm_key, images, weights, report, prompt_logger)
+                    return self.controller.execute_infer(
+                        algorithm_key, images, weights, report, pedestrian_only, prompt_logger
+                    )
 
             elif action == "Validar":
                 images = Path(self.path_vars["images"].get())
                 plots = Path(self.path_vars["plots"].get())
                 report = Path(self.path_vars["report"].get())
+                pedestrian_only = bool(self.pedestrian_only_var.get())
                 prompt_logger(
                     self._build_prompt_command(
                         "validar",
                         algorithm_key,
-                        {"imagens": images, "graficos": plots, "relatorio": report},
+                        {
+                            "imagens": images,
+                            "graficos": plots,
+                            "relatorio": report,
+                            "apenas_pedestrian": pedestrian_only,
+                        },
                     )
                 )
 
                 def run_action() -> OperationResult:
-                    return self.controller.execute_validate(algorithm_key, images, report, plots, prompt_logger)
+                    return self.controller.execute_validate(
+                        algorithm_key, images, report, plots, pedestrian_only, prompt_logger
+                    )
 
             elif action == "Normalizar dataset":
                 dataset = Path(self.path_vars["dataset"].get())

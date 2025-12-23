@@ -51,24 +51,34 @@ def test_read_visdrone_filters_and_categories(tmp_path: Path) -> None:
     images_dir = root / "train" / "images"
     annotations_dir = root / "train" / "annotations"
     _make_image(images_dir / "000001.jpg", size=(120, 80))
+    val_images_dir = root / "val" / "images"
+    val_annotations_dir = root / "val" / "annotations"
+    _make_image(val_images_dir / "000101.jpg", size=(120, 80))
+    val_annotations_dir.mkdir(parents=True, exist_ok=True)
+    (val_annotations_dir / "000101.txt").write_text("", encoding="utf-8")
 
     lines = [
-        "10,10,20,20,1,1,0,0",  # válido
+        "10,10,20,20,1,1,0,0",  # válido pedestrian -> classe 0
+        "30,10,10,10,1,4,0,0",  # válido car -> classe 3
         "0,0,0,10,1,1,0,0",  # largura inválida
         "5,5,10,10,0,1,0,0",  # ignorado por score
-        "5,5,10,10,1,3,0,0",  # categoria não humana
+        "5,5,10,10,1,0,0,0",  # região ignorada
+        "5,5,10,10,1,11,0,0",  # categoria desconhecida
     ]
     annotations_dir.mkdir(parents=True, exist_ok=True)
     (annotations_dir / "000001.txt").write_text("\n".join(lines), encoding="utf-8")
 
-    dataset, discarded, warnings, is_labelled = read_visdrone(root, human_categories=[1, 2])
+    dataset, discarded, warnings, is_labelled = read_visdrone(root)
 
     assert is_labelled is True
     assert discarded["invalid_bbox_size"] == 1
     assert discarded["ignored_by_score"] == 1
-    assert discarded["non_human_category"] == 1
-    assert dataset.num_annotations_per_split()["train"] == 1
-    assert warnings == []
+    assert discarded["ignored_region"] == 1
+    assert discarded["unknown_category"] == 1
+    assert dataset.num_annotations_per_split()["train"] == 2
+    assert dataset.classes[0] == "pedestrian"
+    assert dataset.classes[3] == "car"
+    assert warnings == ["000101.jpg ficou sem anotações após filtros em val"]
 
 
 def _build_dataset_ir(tmp_path: Path, split: str = "train") -> DatasetIR:
@@ -109,6 +119,7 @@ def test_yolo_exporter_outputs_labels_and_yaml(tmp_path: Path) -> None:
     yaml_data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
     assert yaml_data["path"] == output_dir.resolve().as_posix()
     assert yaml_data["train"] == "images/train"
+    assert yaml_data["nc"] == 1
     assert "human" in yaml_data["names"].values()
 
 

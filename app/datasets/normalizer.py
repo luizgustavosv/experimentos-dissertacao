@@ -3,12 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from app.datasets.exporters import export_coco, export_voc, export_yolo
 from app.datasets.ir import DatasetIR
 from app.datasets.readers import read_heridal, read_visdrone
-from app.datasets.utils import ensure_dir, load_json
+from app.datasets.utils import ensure_dir
 from app.detectors.base import Logger
 from app.reporting.reports import save_normalization_report
 
@@ -48,6 +48,24 @@ def _timestamped_dir(base: Path, dataset_type: str, algorithm_key: str) -> Path:
     return base / f"{dataset_type.lower()}_{safe_algo}_{ts}"
 
 
+def _log_class_distribution(dataset_ir: DatasetIR, logger: Optional[Logger]) -> None:
+    if not logger:
+        return
+    counts: Dict[int, int] = {idx: 0 for idx in range(len(dataset_ir.classes))}
+    for ann in dataset_ir.annotations:
+        counts[ann.class_id] = counts.get(ann.class_id, 0) + 1
+    logger(
+        "Distribuição de classes: "
+        + ", ".join(
+            f"{idx} ({dataset_ir.classes[idx]}): {count}"
+            for idx, count in sorted(counts.items())
+            if count > 0
+        )
+        if any(counts.values())
+        else "Distribuição de classes: nenhuma anotação encontrada"
+    )
+
+
 def normalize_dataset(
     dataset_type: str,
     algorithm_key: str,
@@ -55,7 +73,6 @@ def normalize_dataset(
     normalized_dir: Path,
     split_ratios=(0.8, 0.1, 0.1),
     seed: int = 42,
-    visdrone_human_categories: Optional[List[int]] = None,
     logger: Optional[Logger] = None,
     target_format: Optional[str] = None,
 ) -> NormalizationResult:
@@ -73,12 +90,11 @@ def normalize_dataset(
     if dataset_type == "heridal":
         dataset_ir, discarded, warnings, is_labelled = read_heridal(dataset_dir, split_ratios=split_ratios, seed=seed, logger=logger)
     elif dataset_type == "visdrone":
-        if visdrone_human_categories is None:
-            config_path = Path(__file__).parent / "configs" / "visdrone_human_categories.json"
-            visdrone_human_categories = load_json(config_path)
-        dataset_ir, discarded, warnings, is_labelled = read_visdrone(dataset_dir, visdrone_human_categories, logger=logger)
+        dataset_ir, discarded, warnings, is_labelled = read_visdrone(dataset_dir, logger=logger)
     else:
         raise ValueError(f"Tipo de dataset não suportado: {dataset_type}")
+
+    _log_class_distribution(dataset_ir, logger)
 
     exporter_fn = {"yolo": export_yolo, "voc": export_voc, "coco": export_coco}.get(target_format)
     if exporter_fn is None:
