@@ -5,6 +5,7 @@ from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
 from app.controller import ExperimentController
+from app.logging_utils import PromptLogForwarder, capture_prompt_output
 
 
 class DetectorApp(tk.Tk):
@@ -186,49 +187,105 @@ class DetectorApp(tk.Tk):
         self.log_widget.insert("end", message + "\n")
         self.log_widget.see("end")
 
+    def _build_prompt_command(self, action: str, algorithm: str, args: dict[str, object]) -> str:
+        parts = [action.lower(), algorithm]
+        for key, value in args.items():
+            if value is None or value == "":
+                continue
+            if isinstance(value, Path):
+                path_str = str(value.expanduser())
+                if path_str in {"", "."}:
+                    continue
+                value_to_append = path_str
+            elif isinstance(value, bool):
+                value_to_append = "sim" if value else "não"
+            else:
+                value_to_append = value
+            parts.append(f"{key}={value_to_append}")
+        return "$ " + " ".join(str(part) for part in parts)
+
     def _execute_action(self) -> None:
         action = self.action_var.get()
         algorithm_key = self.algorithm_var.get()
+        prompt_logger = PromptLogForwarder(self._append_log, Path("app.log"))
         try:
-            if action == "Treinar":
-                dataset = Path(self.path_vars["dataset"].get())
-                weights = Path(self.path_vars["weights"].get())
-                pretrained_raw = self.path_vars["pretrained"].get().strip()
-                pretrained = Path(pretrained_raw) if pretrained_raw else None
-                epochs = int(self.epochs_var.get())
-                early_stop = bool(self.early_stop_var.get())
-                result = self.controller.execute_train(
-                    algorithm_key,
-                    dataset,
-                    pretrained,
-                    weights,
-                    epochs,
-                    early_stop,
-                    self._append_log,
-                )
-            elif action == "Inferir":
-                images = Path(self.path_vars["images"].get())
-                weights_raw = self.path_vars["inference_weights"].get().strip()
-                weights = Path(weights_raw) if weights_raw else None
-                report = Path(self.path_vars["report"].get())
-                result = self.controller.execute_infer(algorithm_key, images, weights, report, self._append_log)
-            elif action == "Validar":
-                images = Path(self.path_vars["images"].get())
-                plots = Path(self.path_vars["plots"].get())
-                report = Path(self.path_vars["report"].get())
-                result = self.controller.execute_validate(algorithm_key, images, report, plots, self._append_log)
-            elif action == "Normalizar dataset":
-                dataset = Path(self.path_vars["dataset"].get())
-                normalized = Path(self.path_vars["normalized"].get())
-                dataset_type = self.dataset_type_var.get().lower()
-                result = self.controller.execute_normalize(algorithm_key, dataset_type, dataset, normalized, self._append_log)
-            else:
-                raise ValueError("Ação desconhecida")
+            with capture_prompt_output(prompt_logger):
+                if action == "Treinar":
+                    dataset = Path(self.path_vars["dataset"].get())
+                    weights = Path(self.path_vars["weights"].get())
+                    pretrained_raw = self.path_vars["pretrained"].get().strip()
+                    pretrained = Path(pretrained_raw) if pretrained_raw else None
+                    epochs = int(self.epochs_var.get())
+                    early_stop = bool(self.early_stop_var.get())
+                    prompt_logger(
+                        self._build_prompt_command(
+                            "treinar",
+                            algorithm_key,
+                            {
+                                "dataset": dataset,
+                                "pesos_out": weights,
+                                "pretreinados": pretrained or "padrão",
+                                "epocas": epochs,
+                                "parada_antecipada": early_stop,
+                            },
+                        )
+                    )
+                    result = self.controller.execute_train(
+                        algorithm_key,
+                        dataset,
+                        pretrained,
+                        weights,
+                        epochs,
+                        early_stop,
+                        prompt_logger,
+                    )
+                elif action == "Inferir":
+                    images = Path(self.path_vars["images"].get())
+                    weights_raw = self.path_vars["inference_weights"].get().strip()
+                    weights = Path(weights_raw) if weights_raw else None
+                    report = Path(self.path_vars["report"].get())
+                    prompt_logger(
+                        self._build_prompt_command(
+                            "inferir",
+                            algorithm_key,
+                            {"imagens": images, "pesos": weights or "padrão", "relatorio": report},
+                        )
+                    )
+                    result = self.controller.execute_infer(algorithm_key, images, weights, report, prompt_logger)
+                elif action == "Validar":
+                    images = Path(self.path_vars["images"].get())
+                    plots = Path(self.path_vars["plots"].get())
+                    report = Path(self.path_vars["report"].get())
+                    prompt_logger(
+                        self._build_prompt_command(
+                            "validar",
+                            algorithm_key,
+                            {"imagens": images, "graficos": plots, "relatorio": report},
+                        )
+                    )
+                    result = self.controller.execute_validate(algorithm_key, images, report, plots, prompt_logger)
+                elif action == "Normalizar dataset":
+                    dataset = Path(self.path_vars["dataset"].get())
+                    normalized = Path(self.path_vars["normalized"].get())
+                    dataset_type = self.dataset_type_var.get().lower()
+                    prompt_logger(
+                        self._build_prompt_command(
+                            "normalizar",
+                            algorithm_key,
+                            {"dataset": dataset, "tipo": dataset_type, "saida": normalized},
+                        )
+                    )
+                    result = self.controller.execute_normalize(
+                        algorithm_key, dataset_type, dataset, normalized, prompt_logger
+                    )
+                else:
+                    raise ValueError("Ação desconhecida")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Erro", str(exc))
             self._append_log(f"Erro: {exc}")
             return
 
+        prompt_logger(f"$ comando finalizado → {result.message}")
         if result.inference_performance:
             perf = result.inference_performance
             self._append_log(
