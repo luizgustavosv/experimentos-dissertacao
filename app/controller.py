@@ -50,7 +50,7 @@ class ExperimentController:
     def execute_validate(
         self,
         algorithm_key: str,
-        dataset_path: Path,
+        dataset_dir: Path,
         weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
@@ -58,8 +58,8 @@ class ExperimentController:
         logger: Optional[Logger] = None,
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
-        dataset_input = dataset_path.expanduser()
-        dataset_yaml_path = dataset_input if dataset_input.suffix.lower() in {".yaml", ".yml"} else dataset_input / "dataset.yaml"
+        dataset_dir = dataset_dir.expanduser()
+        dataset_yaml_path = (dataset_dir / "dataset.yaml").resolve()
         metrics = detector.validate(
             dataset_yaml_path, weights_path, report_out, plots_dir, pedestrian_only=pedestrian_only, logger=logger
         )
