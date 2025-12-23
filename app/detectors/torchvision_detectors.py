@@ -161,6 +161,8 @@ class TorchvisionDetector(DetectionAlgorithm):
             return self._load_ssd_for_inference(weights_path, device_str, logger)
         if self.context.architecture == "Faster R-CNN":
             return self._load_faster_rcnn_for_inference(weights_path, device_str, logger)
+        if self.context.architecture == "RetinaNet":
+            return self._load_retinanet_for_inference(weights_path, device_str, logger)
         raise NotImplementedError(f"Inferência não implementada para {self.context.architecture} neste módulo.")
 
     def _load_ssd_for_inference(
@@ -258,6 +260,61 @@ class TorchvisionDetector(DetectionAlgorithm):
         if logger:
             logger("[INFER] Falha ao inferir num_classes para Faster R-CNN; usando 91 (padrão COCO)")
         return 91
+
+    def _load_retinanet_for_inference(
+        self, weights_path: Optional[Path], device_str: str, logger: Optional[Logger]
+    ) -> Tuple[torch.nn.Module, Sequence[str], Optional[Path]]:
+        from torchvision.models.detection import RetinaNet_ResNet50_FPN_Weights, retinanet_resnet50_fpn
+
+        if weights_path is None:
+            weights = RetinaNet_ResNet50_FPN_Weights.DEFAULT
+            model = retinanet_resnet50_fpn(weights=weights)
+            class_names: Sequence[str] = tuple(weights.meta.get("categories", []))
+            weights_label: Optional[Path] = Path("RetinaNet_ResNet50_FPN_Weights.DEFAULT")
+            if logger:
+                logger("[INFER] Usando pesos padrão do RetinaNet (torchvision)")
+        else:
+            weights_path = weights_path.expanduser().resolve()
+            if not weights_path.exists():
+                raise FileNotFoundError(f"Pesos não encontrados: {weights_path}")
+            state_dict = torch.load(weights_path, map_location="cpu")
+            num_classes = self._infer_retinanet_num_classes(state_dict, logger)
+            model = retinanet_resnet50_fpn(weights=None, weights_backbone=None, num_classes=num_classes)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if logger:
+                if missing:
+                    logger(f"[INFER] Aviso: camadas ausentes ao carregar pesos: {missing}")
+                if unexpected:
+                    logger(f"[INFER] Aviso: pesos inesperados ignorados: {unexpected}")
+            class_names = [str(idx) for idx in range(num_classes)]
+            weights_label = weights_path
+        model.to(device_str)
+        model.eval()
+        return model, class_names, weights_label
+
+    def _infer_retinanet_num_classes(self, state_dict: dict, logger: Optional[Logger]) -> int:
+        bias = state_dict.get("head.classification_head.cls_logits.bias")
+        if bias is not None:
+            anchors_per_location = self._retinanet_anchors_per_location()
+            if anchors_per_location > 0 and bias.numel() % anchors_per_location == 0:
+                num_classes = bias.numel() // anchors_per_location
+                if logger:
+                    logger(
+                        f"[INFER] Inferido num_classes={num_classes} a partir de head.classification_head.cls_logits.bias "
+                        f"(anchors por localização: {anchors_per_location})"
+                    )
+                return int(num_classes)
+        if logger:
+            logger("[INFER] Falha ao inferir num_classes para RetinaNet; usando 91 (padrão COCO)")
+        return 91
+
+    @staticmethod
+    def _retinanet_anchors_per_location() -> int:
+        from torchvision.models.detection import retinanet_resnet50_fpn
+
+        model = retinanet_resnet50_fpn(weights=None, weights_backbone=None, num_classes=91)
+        anchors_per_location = model.anchor_generator.num_anchors_per_location()
+        return anchors_per_location[0] if anchors_per_location else 0
 
     @staticmethod
     def _format_label(label: torch.Tensor, score: torch.Tensor, class_names: Sequence[str]) -> str:
