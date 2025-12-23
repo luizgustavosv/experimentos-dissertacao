@@ -58,8 +58,10 @@ class ExperimentController:
         logger: Optional[Logger] = None,
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
+        dataset_input = dataset_path.expanduser()
+        dataset_yaml_path = dataset_input if dataset_input.suffix.lower() in {".yaml", ".yml"} else dataset_input / "dataset.yaml"
         metrics = detector.validate(
-            dataset_path, weights_path, report_out, plots_dir, pedestrian_only=pedestrian_only, logger=logger
+            dataset_yaml_path, weights_path, report_out, plots_dir, pedestrian_only=pedestrian_only, logger=logger
         )
         return OperationResult(metrics=metrics, message="Validação concluída.")
 

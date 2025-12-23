@@ -159,7 +159,7 @@ class TorchvisionDetector(DetectionAlgorithm):
 
     def validate(
         self,
-        dataset_path: Path,
+        dataset_yaml_path: Path,
         weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
