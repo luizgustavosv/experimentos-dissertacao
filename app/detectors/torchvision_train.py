@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from torch.utils.data import DataLoader, random_split
@@ -14,7 +14,7 @@ from app.detectors.utils import coco_collate, describe_dataloader, ensure_weight
 from app.metrics import Metrics
 
 
-def _split_dataset(dataset: CocoDetectionDataset, val_ratio: float, seed: int) -> Tuple[CocoDetectionDataset, CocoDetectionDataset]:
+def _split_dataset(dataset, val_ratio: float, seed: int):
     val_size = max(1, int(len(dataset) * val_ratio))
     train_size = len(dataset) - val_size
     return random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed))
@@ -29,18 +29,24 @@ def train_torchvision_detector(
     config: TrainConfig,
     logger: Optional[Logger] = None,
     val_ratio: float = 0.1,
+    train_dataset=None,
+    val_dataset=None,
 ) -> Metrics:
     device_str = resolve_device(config.device)
     seed_everything(config.seed)
 
-    transform = transforms.Compose([transforms.ToTensor()])
-    train_ds_full = CocoDetectionDataset(dataset_dir / "images" / "train", train_ann, transforms=transform)
-    val_ds_full = CocoDetectionDataset(dataset_dir / "images" / "val", val_ann, transforms=transform)
+    if train_dataset is None or val_dataset is None:
+        transform = transforms.Compose([transforms.ToTensor()])
+        train_ds_full = CocoDetectionDataset(dataset_dir / "images" / "train", train_ann, transforms=transform)
+        val_ds_full = CocoDetectionDataset(dataset_dir / "images" / "val", val_ann, transforms=transform)
 
-    # Dividir train em train/val adicionais se desejado
-    if val_ratio > 0:
-        train_ds_full, extra_val = _split_dataset(train_ds_full, val_ratio, config.seed)
-        val_ds_full = extra_val
+        # Dividir train em train/val adicionais se desejado
+        if val_ratio > 0:
+            train_ds_full, extra_val = _split_dataset(train_ds_full, val_ratio, config.seed)
+            val_ds_full = extra_val
+    else:
+        train_ds_full = train_dataset
+        val_ds_full = val_dataset
 
     describe_dataloader(train_ds_full, logger)
 
@@ -119,4 +125,3 @@ def train_torchvision_detector(
         weights_path=weights_out,
         map_computed=False,
     )
-
