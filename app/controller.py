@@ -23,15 +23,14 @@ class ExperimentController:
     def execute_train(
         self,
         algorithm_key: str,
-        dataset_dir: Path,
+        dataset_yaml: Path,
         pretrained_weights: Optional[Path],
-        weights_out: Path,
+        output_dir: Path,
         epochs: int,
-        early_stop: bool,
         logger: Optional[Logger] = None,
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
-        metrics = detector.train(dataset_dir, pretrained_weights, weights_out, epochs, early_stop, logger)
+        metrics = detector.train(dataset_yaml, pretrained_weights, output_dir, epochs, logger)
         return OperationResult(metrics=metrics, message="Treinamento concluído.")
 
     def execute_infer(

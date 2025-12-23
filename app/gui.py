@@ -36,7 +36,6 @@ class DetectorApp(tk.Tk):
             "normalized": tk.StringVar(),
         }
         self.epochs_var = tk.IntVar(value=10)
-        self.early_stop_var = tk.BooleanVar(value=False)
         self.pedestrian_only_var = tk.BooleanVar(value=False)
 
         self._build_header()
@@ -120,11 +119,10 @@ class DetectorApp(tk.Tk):
         action = self.action_var.get()
 
         if action == "Treinar":
-            self._add_path_selector("Dataset de treino", "dataset", is_dir=True)
+            self._add_path_selector("Dataset (arquivo .yaml)", "dataset")
             self._add_path_selector("Pesos pré-treinados", "pretrained")
-            self._add_path_selector("Salvar pesos treinados", "weights", is_file=True, defaultextension=".pt")
+            self._add_path_selector("Pasta para salvar os pesos treinados", "weights", is_dir=True)
             self._add_epoch_selector()
-            self._add_early_stop_selector()
         elif action == "Inferir":
             self._add_path_selector("Pesos para inferência", "inference_weights")
             self._add_path_selector("Imagens para inferência", "images", is_dir=True)
@@ -173,26 +171,6 @@ class DetectorApp(tk.Tk):
         tk.Label(frame, text="Número de épocas", bg="#12233d", fg="white").pack(anchor="w")
         spinbox = tk.Spinbox(frame, from_=1, to=500, textvariable=self.epochs_var, width=8)
         spinbox.pack(anchor="w")
-
-    def _add_early_stop_selector(self) -> None:
-        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
-        frame.pack(fill="x", padx=10, pady=6)
-        check = tk.Checkbutton(
-            frame,
-            text="Treinar até o modelo parar de melhorar (parada antecipada)",
-            variable=self.early_stop_var,
-            onvalue=True,
-            offvalue=False,
-            bg="#12233d",
-            fg="white",
-            selectcolor="#0b172a",
-            activebackground="#12233d",
-            activeforeground="white",
-            anchor="w",
-            justify="left",
-            wraplength=760,
-        )
-        check.pack(anchor="w")
 
     def _add_pedestrian_filter_selector(self) -> None:
         frame = tk.Frame(self.dynamic_frame, bg="#12233d")
@@ -259,7 +237,6 @@ class DetectorApp(tk.Tk):
                 pretrained_raw = self.path_vars["pretrained"].get().strip()
                 pretrained = Path(pretrained_raw) if pretrained_raw else None
                 epochs = int(self.epochs_var.get())
-                early_stop = bool(self.early_stop_var.get())
                 prompt_logger(
                     self._build_prompt_command(
                         "treinar",
@@ -269,7 +246,6 @@ class DetectorApp(tk.Tk):
                             "pesos_out": weights,
                             "pretreinados": pretrained or "padrão",
                             "epocas": epochs,
-                            "parada_antecipada": early_stop,
                         },
                     )
                 )
@@ -281,7 +257,6 @@ class DetectorApp(tk.Tk):
                         pretrained,
                         weights,
                         epochs,
-                        early_stop,
                         prompt_logger,
                     )
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from ultralytics import YOLO
 
 
@@ -6,12 +7,8 @@ def train_yolo_visdrone(
     data_yaml: str,
     pretrained_weights: str,
     output_dir: str,
-    epochs: int = 50,
-    imgsz: int = 640,
-    batch: int = 16,
-    device: str = "0",
-    workers: int = 2,
-):
+    epochs: int,
+) -> None:
     data_path = Path(data_yaml).expanduser()
     weights_path = Path(pretrained_weights).expanduser()
     save_dir = Path(output_dir).expanduser()
@@ -27,11 +24,7 @@ def train_yolo_visdrone(
     model.train(
         data=str(data_path),
         epochs=epochs,
-        imgsz=imgsz,
-        batch=batch,
-        device=device,
-        workers=workers,
         project=str(save_dir),
-        name="visdrone_yolo",
+        name="yolo_visdrone",
         verbose=True,
     )

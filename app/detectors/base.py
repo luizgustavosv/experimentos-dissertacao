@@ -25,11 +25,10 @@ class DetectionAlgorithm:
         self,
         dataset_dir: Path,
         pretrained_weights: Optional[Path],
-        weights_out: Path,
+        output_dir: Path,
         epochs: int,
-        early_stop: bool,
         logger: Optional[Logger] = None,
-    ) -> Metrics:
+    ) -> Optional[Metrics]:
         raise NotImplementedError
 
     def infer(
