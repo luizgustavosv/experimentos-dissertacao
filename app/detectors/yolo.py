@@ -1,28 +1,14 @@
 from __future__ import annotations
 
-import os
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
-
-import yaml
 
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.utils import copy_ultralytics_checkpoint, resolve_device, seed_everything, validate_yolo_dataset
 from app.metrics import InferencePerformance, Metrics
 from app.reporting.reports import ReportBuilder
-
-
-@contextmanager
-def _pushd(directory: Path):
-    previous_cwd = Path.cwd()
-    os.chdir(directory)
-    try:
-        yield
-    finally:
-        os.chdir(previous_cwd)
 
 
 class YoloDetector(DetectionAlgorithm):
@@ -176,70 +162,27 @@ class YoloDetector(DetectionAlgorithm):
         report_out = report_out.expanduser().resolve()
         plots_dir = plots_dir.expanduser().resolve()
 
-        yaml_text = dataset_yaml_path.read_text(encoding="utf-8")
-        missing_keys = [key for key in ("path:", "train:", "val:") if key not in yaml_text]
-        if missing_keys:
-            raise ValueError(
-                f"dataset.yaml {dataset_yaml_path} não contém as chaves esperadas: {', '.join(missing_keys)}"
-            )
-
-        cfg = yaml.safe_load(yaml_text) or {}
-        try:
-            train_value = cfg["train"]
-            val_value = cfg["val"]
-        except KeyError as exc:
-            raise KeyError(f"Chave obrigatória ausente em {dataset_yaml_path}: {exc}") from exc
-
-        root = Path(str(cfg.get("path", ""))).expanduser()
-        if not root.is_absolute():
-            root = (dataset_yaml_path.parent / root).resolve()
-        train_dir = (root / str(train_value)).resolve()
-        val_dir = (root / str(val_value)).resolve()
-
-        def _list_dir(path: Path) -> List[str]:
-            if path.exists() and path.is_dir():
-                return sorted(entry.name for entry in path.iterdir())
-            return []
-
-        if not train_dir.exists() or not val_dir.exists():
-            root_listing = _list_dir(root)
-            images_listing = _list_dir(root / "images")
-            raise FileNotFoundError(
-                "Pastas de treino/validação não encontradas ou inacessíveis.\n"
-                f"dataset_yaml_path={dataset_yaml_path}\n"
-                f"cfg.path={repr(cfg.get('path', ''))}\n"
-                f"root={root}\n"
-                f"train_dir={repr(train_dir)}\n"
-                f"val_dir={repr(val_dir)}\n"
-                f"root_contents={root_listing}\n"
-                f"root_images_contents={images_listing}\n"
-            )
-
         weights_resolved = weights_path.expanduser().resolve() if weights_path else Path("yolov8n.pt")
         if weights_path is not None and not weights_resolved.exists():
             raise FileNotFoundError(f"Pesos não encontrados: {weights_resolved}")
 
-        base_weights = weights_resolved
         device_str = resolve_device(self.config.device)
         if logger:
-            logger(f"[VAL] {self.context.name} validando {dataset_yaml_path} em {device_str} usando {base_weights}")
+            logger(f"[VAL] {self.context.name} validando {dataset_yaml_path} em {device_str} usando {weights_resolved}")
             if pedestrian_only:
                 logger("[VAL] Filtrando apenas classe pedestrian (0) durante a validação")
 
-        model = YOLO(base_weights)
-        with _pushd(dataset_yaml_path.parent):
-            results = model.val(
-                data=str(dataset_yaml_path),
-                project=str(report_out.parent),
-                name=report_out.stem,
-                save_json=True,
-                plots=True,
-            )
-        if logger:
-            logger(f"[VAL] Validação concluída para {dataset_yaml_path}")
+        model = YOLO(weights_resolved)
+        results = model.val(
+            data=str(dataset_yaml_path),
+            project=str(plots_dir),
+            name=report_out.stem,
+            save_json=True,
+            plots=True,
+            classes=[0] if pedestrian_only else None,
+        )
 
         run_dir = Path(getattr(results, "save_dir", plots_dir / report_out.stem))
-        run_dir.mkdir(parents=True, exist_ok=True)
         metrics = self._build_metrics_from_results(results, device_str, weights_resolved)
 
         report_builder = ReportBuilder(self.context.name)
@@ -258,10 +201,8 @@ class YoloDetector(DetectionAlgorithm):
             logger(
                 f"[VAL] Precisão: {metrics.precision:.3f} | Recall: {metrics.recall:.3f} | mAP@0.50: {metrics.map50:.3f} | mAP@0.50:0.95: {metrics.map50_95:.3f}"
             )
-        if logger:
             logger(f"[VAL] Gráficos salvos em {run_dir}")
             logger(f"[VAL] Relatório salvo em {report_out}")
-            logger(f"[VAL] cwd final: {Path.cwd()}")
 
         return metrics
 
