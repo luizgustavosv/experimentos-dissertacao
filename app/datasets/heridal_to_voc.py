@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import random
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 import xml.etree.ElementTree as ET
 
 from app.detectors.base import Logger
@@ -15,9 +16,18 @@ from app.detectors.base import Logger
 HUMAN_CLASS_NAME = "human"
 
 
+def _list_train_images(train_dir: Path) -> Set[str]:
+    patterns = ["*.jpg", "*.JPG", "*.jpeg", "*.png"]
+    disk_images: Set[str] = set()
+    for pattern in patterns:
+        for path in train_dir.glob(pattern):
+            disk_images.add(path.name)
+    return disk_images
+
+
 def parse_heridal_csv(
     dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None
-) -> Tuple[Dict[str, dict], int, int, List[str]]:
+) -> Tuple[Dict[str, dict], int, int, List[str], dict]:
     dataset_dir = dataset_dir.expanduser().resolve()
     normalized_dir = normalized_dir.expanduser().resolve()
     train_dir = dataset_dir / "train"
@@ -29,34 +39,78 @@ def parse_heridal_csv(
     if not annotations_path.exists():
         raise FileNotFoundError(f"annotations.csv não encontrado em {annotations_path}")
 
+    disk_images = _list_train_images(train_dir)
+    total_images_on_disk = len(disk_images)
+    if logger:
+        logger(f"[SSD][NORM] Imagens no disco (train): {total_images_on_disk}")
+
     images: Dict[str, dict] = {}
     total_bboxes = 0
     discarded_bboxes = 0
     warnings: List[str] = []
+    unique_in_csv: Set[str] = set()
+    missing_on_disk: Set[str] = set()
 
     with annotations_path.open("r", encoding="utf-8") as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
-            filename = row.get("filename", "").strip()
+            raw_filename = row.get("filename", "")
+            filename = raw_filename.strip()
             if not filename:
                 discarded_bboxes += 1
                 warnings.append("Linha no CSV sem filename; anotação descartada.")
                 continue
-            image_path = train_dir / filename
-            if not image_path.exists():
+
+            filename = filename.replace("\\", "/")
+            basename = Path(filename).name
+            unique_in_csv.add(basename)
+            expected_path = train_dir / basename
+            if basename not in disk_images:
                 discarded_bboxes += 1
-                msg = f"Imagem ausente referenciada no CSV: {filename}"
+                missing_on_disk.add(basename)
+                msg = f"Imagem ausente referenciada no CSV: {basename}"
                 warnings.append(msg)
                 if logger:
                     logger(f"[SSD][NORM][WARN] {msg}")
                 continue
 
-            width = int(row["width"])
-            height = int(row["height"])
-            xmin = int(row["xmin"])
-            ymin = int(row["ymin"])
-            xmax = int(row["xmax"])
-            ymax = int(row["ymax"])
+            try:
+                width = int(row["width"])
+                height = int(row["height"])
+                xmin = int(row["xmin"])
+                ymin = int(row["ymin"])
+                xmax = int(row["xmax"])
+                ymax = int(row["ymax"])
+            except (TypeError, ValueError, KeyError) as exc:
+                discarded_bboxes += 1
+                msg = f"Falha ao ler campos numéricos para {basename}: {exc}"
+                warnings.append(msg)
+                if logger:
+                    logger(f"[SSD][NORM][WARN] {msg}")
+                images.setdefault(
+                    basename,
+                    {
+                        "path": expected_path,
+                        "width": None,
+                        "height": None,
+                        "bboxes": [],
+                    },
+                )
+                continue
+
+            image_data = images.setdefault(
+                basename,
+                {
+                    "path": expected_path,
+                    "width": width,
+                    "height": height,
+                    "bboxes": [],
+                },
+            )
+            if image_data["width"] is None:
+                image_data["width"] = width
+            if image_data["height"] is None:
+                image_data["height"] = height
 
             xmin = max(0, min(xmin, width - 1))
             ymin = max(0, min(ymin, height - 1))
@@ -65,30 +119,33 @@ def parse_heridal_csv(
 
             if xmin >= xmax or ymin >= ymax:
                 discarded_bboxes += 1
-                msg = f"BBox inválido para {filename}: ({xmin}, {ymin}, {xmax}, {ymax}); descartado."
+                msg = f"BBox inválido para {basename}: ({xmin}, {ymin}, {xmax}, {ymax}); descartado."
                 warnings.append(msg)
                 if logger:
                     logger(f"[SSD][NORM][WARN] {msg}")
                 continue
 
-            image_data = images.setdefault(
-                filename,
-                {
-                    "path": image_path,
-                    "width": width,
-                    "height": height,
-                    "bboxes": [],
-                },
-            )
             image_data["bboxes"].append((xmin, ymin, xmax, ymax))
             total_bboxes += 1
 
+    skipped_no_valid_bbox = {name for name, data in images.items() if not data["bboxes"]}
+
     if logger:
-        logger(f"[SSD][NORM] Imagens únicas: {len(images)}")
+        logger(f"[SSD][NORM] Imagens únicas no CSV: {len(unique_in_csv)}")
+        logger(f"[SSD][NORM] Imagens encontradas no disco: {len(images)}")
+        logger(f"[SSD][NORM] Imagens ausentes no disco: {len(missing_on_disk)}")
+        logger(f"[SSD][NORM] Imagens com zero bboxes válidas: {len(skipped_no_valid_bbox)}")
         logger(f"[SSD][NORM] BBoxes válidos: {total_bboxes}")
         logger(f"[SSD][NORM] BBoxes descartados: {discarded_bboxes}")
 
-    return images, total_bboxes, discarded_bboxes, warnings
+    audit_data = {
+        "total_images_on_disk": total_images_on_disk,
+        "unique_in_csv": unique_in_csv,
+        "missing_on_disk": missing_on_disk,
+        "skipped_no_valid_bbox": skipped_no_valid_bbox,
+    }
+
+    return images, total_bboxes, discarded_bboxes, warnings, audit_data
 
 
 def make_split(
@@ -163,9 +220,13 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
     dataset_dir = dataset_dir.expanduser().resolve()
     normalized_dir = normalized_dir.expanduser().resolve()
 
-    images, total_bboxes, discarded_bboxes, warnings = parse_heridal_csv(
-        dataset_dir, normalized_dir, logger=logger
-    )
+    (
+        images,
+        total_bboxes,
+        discarded_bboxes,
+        warnings,
+        audit_data,
+    ) = parse_heridal_csv(dataset_dir, normalized_dir, logger=logger)
     if not images:
         raise ValueError("Nenhuma imagem válida encontrada no CSV do HERIDAL.")
 
@@ -186,19 +247,43 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
     imagesets_root.mkdir(parents=True, exist_ok=True)
 
     images_per_split: Dict[str, List[str]] = {"train": [], "val": [], "test": []}
+    collisions: Dict[str, Set[str]] = {}
+    map_stem_to_basename: Dict[str, str] = {}
+    used_output_stems: Set[str] = set()
 
-    for filename, data in images.items():
-        split = splits.get(filename, "train")
-        dest_image = image_root / split / filename
+    for basename, data in images.items():
+        split = splits.get(basename, "train")
+        stem = Path(basename).stem
+        output_stem = stem
+        if stem in map_stem_to_basename and map_stem_to_basename[stem] != basename:
+            collisions.setdefault(stem, set()).update({map_stem_to_basename[stem], basename})
+            hash_suffix = hashlib.md5(basename.encode("utf-8")).hexdigest()[:8]
+            output_stem = f"{stem}_{hash_suffix}"
+            if logger:
+                logger(f"[SSD][NORM][WARN] Colisão de stem '{stem}' entre '{map_stem_to_basename[stem]}' e '{basename}'. Renomeando para '{output_stem}'.")
+        map_stem_to_basename.setdefault(stem, basename)
+        if output_stem in used_output_stems:
+            extra_hash = hashlib.md5(f"{basename}-{output_stem}".encode("utf-8")).hexdigest()[:8]
+            output_stem = f"{output_stem}_{extra_hash}"
+            if logger:
+                logger(f"[SSD][NORM][WARN] Stem resultante duplicado; ajustado para '{output_stem}'.")
+        used_output_stems.add(output_stem)
+
+        output_filename = f"{output_stem}{Path(basename).suffix}"
+        dest_image = image_root / split / output_filename
         shutil.copy2(data["path"], dest_image)
+        width = data.get("width") or 0
+        height = data.get("height") or 0
         write_voc_xml(
             dest_image,
-            data["width"],
-            data["height"],
+            width,
+            height,
             data["bboxes"],
-            ann_root / split / f"{Path(filename).stem}.xml",
+            ann_root / split / f"{output_stem}.xml",
         )
-        images_per_split.setdefault(split, []).append(filename)
+        if logger and not data["bboxes"]:
+            logger(f"[SSD][NORM][WARN] XML gerado sem bboxes válidas para {basename}.")
+        images_per_split.setdefault(split, []).append(output_filename)
 
     write_imagesets(images_per_split, imagesets_root)
 
@@ -215,6 +300,42 @@ def normalize_heridal_to_voc(dataset_dir: Path, normalized_dir: Path, logger: Op
         "avisos": warnings,
     }
     (normalized_dir / "dataset.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    skipped_no_valid_bbox = audit_data.get("skipped_no_valid_bbox", set())
+    missing_on_disk = audit_data.get("missing_on_disk", set())
+    unique_in_csv = audit_data.get("unique_in_csv", set())
+    total_images_on_disk = audit_data.get("total_images_on_disk", 0)
+    summary_log = [
+        f"[SSD][NORM] total_images_on_disk: {total_images_on_disk}",
+        f"[SSD][NORM] count_unique_in_csv: {len(unique_in_csv)}",
+        f"[SSD][NORM] count_found_on_disk: {len(images)}",
+        f"[SSD][NORM] count_missing_on_disk: {len(missing_on_disk)}",
+        f"[SSD][NORM] count_images_with_zero_valid_boxes: {len(skipped_no_valid_bbox)}",
+        f"[SSD][NORM] count_collisions: {len(collisions)}",
+    ]
+    if logger:
+        for msg in summary_log:
+            logger(msg)
+
+    normalization_report = {
+        "summary": {
+            "total_images_on_disk": total_images_on_disk,
+            "count_unique_in_csv": len(unique_in_csv),
+            "count_found_on_disk": len(images),
+            "count_missing_on_disk": len(missing_on_disk),
+            "count_images_with_zero_valid_boxes": len(skipped_no_valid_bbox),
+            "count_collisions": len(collisions),
+            "bboxes_total": total_bboxes,
+            "bboxes_descartados": discarded_bboxes,
+        },
+        "missing_on_disk_sample": sorted(list(missing_on_disk))[:200],
+        "collisions_sample": [
+            {"stem": stem, "basenames": sorted(list(names))}
+            for stem, names in list(collisions.items())[:200]
+        ],
+    }
+    report_path = normalized_dir / "normalization_report.json"
+    report_path.write_text(json.dumps(normalization_report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if logger:
         logger(f"[SSD][NORM] Normalização concluída em {normalized_dir}")
