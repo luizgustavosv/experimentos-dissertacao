@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Sequence, Tuple
 
+from PIL import Image
 import torch
+from torchvision import transforms
+from torchvision.utils import draw_bounding_boxes
 
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.torchvision_train import train_torchvision_detector
 from app.detectors.utils import ensure_weights_size, resolve_device, validate_coco_dataset
 from app.metrics import Metrics
+from app.metrics import InferencePerformance
+from app.reporting.reports import ReportBuilder
 
 
 class TorchvisionDetector(DetectionAlgorithm):
@@ -65,8 +71,81 @@ class TorchvisionDetector(DetectionAlgorithm):
         data = json.loads(ann_path.read_text(encoding="utf-8"))
         return len(data.get("categories", [])) + 1  # +1 para background
 
-    def infer(self, images_dir: Path, weights_path: Path, report_out: Path, logger: Optional[Logger] = None):
-        raise NotImplementedError("Inferência não implementada neste escopo de treino.")
+    def infer(self, images_dir: Path, weights_path: Optional[Path], report_out: Path, logger: Optional[Logger] = None):
+        images_dir = images_dir.expanduser().resolve()
+        report_out = report_out.expanduser().resolve()
+        if not images_dir.exists() or not images_dir.is_dir():
+            raise FileNotFoundError(f"Pasta de imagens inexistente: {images_dir}")
+
+        image_paths = self._list_images(images_dir)
+        if not image_paths:
+            raise ValueError(f"Nenhuma imagem encontrada em {images_dir}")
+
+        device_str = resolve_device(self.config.device)
+        model, class_names, weights_label = self._load_model_for_inference(weights_path, device_str, logger)
+
+        prediction_root = report_out.parent / "predictions"
+        save_dir = prediction_root / report_out.stem
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        transform = transforms.ToTensor()
+        previews: List[Path] = []
+        start = time.perf_counter()
+        for image_path in image_paths:
+            image = Image.open(image_path).convert("RGB")
+            tensor = transform(image)
+            with torch.no_grad():
+                outputs = model([tensor.to(device_str)])
+            output = outputs[0] if outputs else {}
+            boxes = output.get("boxes", torch.empty((0, 4))).detach().cpu()
+            scores = output.get("scores", torch.empty(0)).detach().cpu()
+            labels = output.get("labels", torch.empty(0, dtype=torch.int64)).detach().cpu()
+
+            keep = scores >= 0.5
+            boxes = boxes[keep]
+            scores = scores[keep]
+            labels = labels[keep]
+
+            image_uint8 = (tensor * 255).to(torch.uint8)
+            if boxes.numel() > 0:
+                label_texts = [self._format_label(l, s, class_names) for l, s in zip(labels, scores)]
+                drawn = draw_bounding_boxes(image_uint8, boxes, labels=label_texts, colors="red", width=2)
+            else:
+                drawn = image_uint8
+
+            save_path = save_dir / image_path.name
+            transforms.ToPILImage()(drawn).save(save_path)
+            previews.append(save_path)
+            if logger:
+                logger(f"[INFER] {image_path.name}: {len(boxes)} detecções acima de 0.5")
+
+        elapsed = time.perf_counter() - start
+        total_images = len(image_paths)
+        images_per_second = total_images / elapsed if elapsed > 0 else 0.0
+        milliseconds_per_image = (elapsed / total_images * 1000) if total_images else 0.0
+        performance = InferencePerformance(
+            images_per_second=images_per_second,
+            milliseconds_per_image=milliseconds_per_image,
+        )
+
+        report_builder = ReportBuilder(self.context.name)
+        report_builder.save_report(
+            report_path=report_out,
+            metrics=None,
+            operation="Inferência",
+            source_dir=images_dir,
+            inference_performance=performance,
+            detection_previews=previews,
+            weights_path=weights_label,
+        )
+
+        if logger:
+            logger(
+                f"[INFER] Latência: {performance.images_per_second:.2f} img/s ({performance.milliseconds_per_image:.2f} ms/imagem)"
+            )
+            logger(f"[INFER] Relatório salvo em {report_out}")
+
+        return performance
 
     def validate(self, images_dir: Path, report_out: Path, plots_dir: Path, logger: Optional[Logger] = None):
         raise NotImplementedError("Validação não implementada neste escopo de treino.")
@@ -74,3 +153,70 @@ class TorchvisionDetector(DetectionAlgorithm):
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):
         raise NotImplementedError("Normalização delegada ao módulo existente.")
 
+    def _load_model_for_inference(
+        self, weights_path: Optional[Path], device_str: str, logger: Optional[Logger]
+    ) -> Tuple[torch.nn.Module, Sequence[str], Optional[Path]]:
+        if self.context.architecture != "SSD":
+            raise NotImplementedError("Inferência implementada apenas para SSD neste módulo.")
+
+        from torchvision.models.detection import SSD300_VGG16_Weights, ssd300_vgg16
+
+        if weights_path is None:
+            weights = SSD300_VGG16_Weights.DEFAULT
+            model = ssd300_vgg16(weights=weights)
+            class_names: Sequence[str] = tuple(weights.meta.get("categories", []))
+            weights_label: Optional[Path] = Path("SSD300_VGG16_Weights.DEFAULT")
+            if logger:
+                logger("[INFER] Usando pesos padrão do SSD (torchvision)")
+        else:
+            weights_path = weights_path.expanduser().resolve()
+            if not weights_path.exists():
+                raise FileNotFoundError(f"Pesos não encontrados: {weights_path}")
+            state_dict = torch.load(weights_path, map_location="cpu")
+            num_classes = self._infer_ssd_num_classes(state_dict, logger)
+            model = ssd300_vgg16(weights=None, weights_backbone=None, num_classes=num_classes)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if logger:
+                if missing:
+                    logger(f"[INFER] Aviso: camadas ausentes ao carregar pesos: {missing}")
+                if unexpected:
+                    logger(f"[INFER] Aviso: pesos inesperados ignorados: {unexpected}")
+            class_names = [str(idx) for idx in range(num_classes)]
+            weights_label = weights_path
+        model.to(device_str)
+        model.eval()
+        return model, class_names, weights_label
+
+    def _infer_ssd_num_classes(self, state_dict: dict, logger: Optional[Logger]) -> int:
+        priors = self._ssd_priors_per_location()
+        for idx, prior in enumerate(priors):
+            key = f"head.classification_head.module_list.{idx}.bias"
+            if key not in state_dict:
+                continue
+            bias_len = state_dict[key].numel()
+            if bias_len % prior == 0:
+                num_classes = bias_len // prior
+                if logger:
+                    logger(f"[INFER] Inferido num_classes={num_classes} a partir dos pesos (prior={prior})")
+                return int(num_classes)
+        if logger:
+            logger("[INFER] Falha ao inferir num_classes; usando 91 (padrão COCO)")
+        return 91
+
+    @staticmethod
+    def _ssd_priors_per_location() -> Sequence[int]:
+        from torchvision.models.detection import ssd300_vgg16
+
+        model = ssd300_vgg16(weights=None, weights_backbone=None, num_classes=91)
+        return model.anchor_generator.num_anchors_per_location()
+
+    @staticmethod
+    def _format_label(label: torch.Tensor, score: torch.Tensor, class_names: Sequence[str]) -> str:
+        idx = int(label.item())
+        name = class_names[idx] if idx < len(class_names) else str(idx)
+        return f"{name}: {score:.2f}"
+
+    @staticmethod
+    def _list_images(root: Path) -> List[Path]:
+        extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+        return sorted([p for p in root.iterdir() if p.suffix.lower() in extensions and p.is_file()])

@@ -38,7 +38,7 @@ class ExperimentController:
         self,
         algorithm_key: str,
         images_dir: Path,
-        weights_path: Path,
+        weights_path: Optional[Path],
         report_out: Path,
         logger: Optional[Logger] = None,
     ) -> OperationResult:

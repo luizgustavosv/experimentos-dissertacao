@@ -65,12 +65,15 @@ class YoloDetector(DetectionAlgorithm):
             map_computed=False,
         )
 
-    def infer(self, images_dir: Path, weights_path: Path, report_out: Path, logger: Optional[Logger] = None):
+    def infer(self, images_dir: Path, weights_path: Optional[Path], report_out: Path, logger: Optional[Logger] = None):
         from ultralytics import YOLO  # import tardio para evitar dependências pesadas em import
 
         images_dir = images_dir.expanduser().resolve()
-        weights_path = weights_path.expanduser().resolve()
         report_out = report_out.expanduser().resolve()
+
+        if weights_path is None:
+            raise FileNotFoundError("Pesos obrigatórios para inferência com YOLO não foram informados.")
+        weights_path = weights_path.expanduser().resolve()
 
         if not images_dir.exists() or not images_dir.is_dir():
             raise FileNotFoundError(f"Pasta de imagens inexistente: {images_dir}")
