@@ -34,17 +34,16 @@ class SSDDetector(TorchvisionDetector):
         from torchvision import transforms
 
         dataset_root, class_names, train_ids, val_ids = validate_voc_dataset(dataset_dir)
-        class_to_idx = {name: idx + 1 for idx, name in enumerate(class_names)}
+        class_to_idx = {"human": 1}
         device_str = resolve_device(self.config.device)
-        num_classes = 2 if len(class_names) == 1 else len(class_names) + 1  # +1 para background
+        num_classes = 2
 
         if logger:
             logger(f"[TRAIN] {self.context.name} em {device_str} com {num_classes} classes (Pascal VOC)")
             logger(f"[DATA] Raiz do dataset VOC: {dataset_root}")
             logger(f"[DATA] Splits: train={len(train_ids)}, val={len(val_ids)}")
-            logger(f"[DATA] Classes: {', '.join(class_names)}")
-            if num_classes == 2:
-                logger("[SSD] num_classes_experiment=2 (background+human)")
+            logger(f"[DATA] Classes detectadas no VOC: {', '.join(class_names)}")
+            logger("[SSD] num_classes_experiment=2 (background+human)")
 
         transform = transforms.Compose([transforms.ToTensor()])
         train_dataset = PascalVOCDataset(dataset_root, train_ids, class_to_idx, transforms=transform)
@@ -172,14 +171,16 @@ class SSDDetector(TorchvisionDetector):
 
         mode, checkpoint_path = self._resolve_ssd_pretrained_mode(pretrained_weights)
 
-        weights: Optional[SSD300_VGG16_Weights] = None
         weights_backbone: Optional[VGG16_Weights] = None
         state_dict: Optional[dict] = None
         checkpoint_num_classes: Optional[int] = None
         checkpoint_label = "<none>"
 
         if mode == "ssd_coco":
-            weights = SSD300_VGG16_Weights.DEFAULT
+            weights_enum = SSD300_VGG16_Weights.DEFAULT
+            state_dict = weights_enum.get_state_dict(progress=True)
+            checkpoint_num_classes = len(weights_enum.meta.get("categories", []))
+            weights_backbone = VGG16_Weights.DEFAULT
             checkpoint_label = "SSD300_VGG16_Weights.DEFAULT"
         elif mode == "backbone_imagenet":
             weights_backbone = VGG16_Weights.DEFAULT
@@ -190,14 +191,13 @@ class SSDDetector(TorchvisionDetector):
             raise ValueError(f"Modo de pré-treino SSD desconhecido: {mode}")
 
         if logger:
-            logger(f"[SSD][INIT] mode={mode} weights={weights} weights_backbone={weights_backbone}")
+            logger(f"[SSD][INIT] mode={mode} weights_backbone={weights_backbone}")
             logger(
-                f"[SSD][INIT] weights_type={type(weights).__name__ if weights is not None else 'None'} | "
-                f"weights_backbone_type={type(weights_backbone).__name__ if weights_backbone is not None else 'None'}"
+                f"[SSD][INIT] weights_backbone_type={type(weights_backbone).__name__ if weights_backbone is not None else 'None'}"
             )
 
-        constructor_num_classes = num_classes if weights is None else None
-        model = ssd300_vgg16(weights=weights, weights_backbone=weights_backbone, num_classes=constructor_num_classes)
+        constructor_num_classes = num_classes
+        model = ssd300_vgg16(weights=None, weights_backbone=weights_backbone, num_classes=constructor_num_classes)
 
         if logger:
             logger(f"[SSD][WEIGHTS] checkpoint_path={checkpoint_label}")
