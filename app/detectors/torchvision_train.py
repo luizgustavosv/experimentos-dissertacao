@@ -95,13 +95,19 @@ def _normalize_losses(loss_out: Any, device: torch.device) -> Tuple[torch.Tensor
         if torch.is_tensor(obj):
             if obj.device != device:
                 obj = obj.to(device)
+            if obj.numel() == 0:
+                reduced = torch.tensor(0.0, device=device)
+            elif obj.dim() == 0:
+                reduced = obj
+            else:
+                reduced = obj.mean()
             name = prefix[:-1] if prefix.endswith(".") else prefix
             if name:
                 try:
-                    loss_items[name] = float(obj.detach().cpu())
+                    loss_items[name] = float(reduced.detach().cpu())
                 except Exception:
                     logger.debug("Falha ao registrar loss_item para %s", name)
-            return obj
+            return reduced
 
         if isinstance(obj, (int, float)):
             name = prefix[:-1] if prefix.endswith(".") else prefix
@@ -120,6 +126,9 @@ def _normalize_losses(loss_out: Any, device: torch.device) -> Tuple[torch.Tensor
     except Exception:
         logger.exception("_normalize_losses falhou; retornando 0.0")
         return torch.tensor(0.0, device=device), {}
+
+    if loss_total.dim() > 0:
+        loss_total = loss_total.mean()
 
     return loss_total, loss_items
 
@@ -477,10 +486,18 @@ def train_torchvision_detector(
         watchdog_thread.join(timeout=1)
 
         weights_out = weights_out.expanduser().resolve()
-        weights_out.parent.mkdir(parents=True, exist_ok=True)
-        logging_logger.info("Salvando pesos em %s", weights_out)
-        torch.save(model.state_dict(), weights_out)
-        ensure_weights_size(weights_out)
+        out = weights_out
+        if out.suffix.lower() not in (".pth", ".pt"):
+            out.mkdir(parents=True, exist_ok=True)
+            out = out / "last.pth"
+        else:
+            out.parent.mkdir(parents=True, exist_ok=True)
+        out = out.with_suffix(".pth")
+
+        logging_logger.info("Salvando pesos em %s", out)
+        torch.save(model.state_dict(), str(out))
+        ensure_weights_size(out)
+        weights_out = out
         logging_logger.info("Treinamento finalizado com sucesso.")
 
         return Metrics(
