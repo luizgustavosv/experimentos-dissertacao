@@ -9,7 +9,7 @@ from typing import Optional
 class TrainConfig:
     epochs: int = 10
     batch_size: int = 2
-    lr: float = 0.005
+    lr: float = 0.001
     device: Optional[str] = None
     num_workers: int = 2
     imgsz: int = 640
