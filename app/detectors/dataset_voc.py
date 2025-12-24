@@ -35,10 +35,14 @@ class PascalVOCDataset(Dataset):
 
         image = Image.open(image_path).convert("RGB")
         width, height = image.size
-        boxes, labels, _ = self._parse_annotation(annotation_path)
+        boxes_list, labels_list, _ = self._parse_annotation(annotation_path)
 
-        boxes_tensor = torch.as_tensor(boxes, dtype=torch.float32)
-        labels_tensor = torch.as_tensor(labels, dtype=torch.int64)
+        if len(boxes_list) == 0:
+            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            labels_tensor = torch.zeros((0,), dtype=torch.int64)
+        else:
+            boxes_tensor = torch.as_tensor(boxes_list, dtype=torch.float32)
+            labels_tensor = torch.as_tensor(labels_list, dtype=torch.int64)
 
         if boxes_tensor.numel() > 0 and width > 0 and height > 0:
             boxes_tensor = boxes_tensor.clone()
@@ -70,7 +74,7 @@ class PascalVOCDataset(Dataset):
             heights = boxes_tensor[:, 3] - boxes_tensor[:, 1]
             areas_tensor = widths * heights
 
-        if boxes_tensor.shape[0] == 0 and boxes:
+        if boxes_tensor.shape[0] == 0 and len(boxes_list) > 0:
             logging.warning("Todas as boxes foram descartadas por serem inválidas. id=%s path=%s", image_id, image_path)
 
         target: Dict[str, Any] = {
@@ -132,13 +136,4 @@ class PascalVOCDataset(Dataset):
             labels.append(1)  # background=0, person=1
             areas.append(max(0.0, (xmax - xmin) * (ymax - ymin)))
 
-        if not boxes:
-            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
-            labels_tensor = torch.zeros((0,), dtype=torch.int64)
-            areas_tensor = torch.zeros((0,), dtype=torch.float32)
-            return boxes_tensor, labels_tensor, areas_tensor
-
-        boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
-        labels_tensor = torch.tensor(labels, dtype=torch.int64)
-        areas_tensor = torch.tensor(areas, dtype=torch.float32)
-        return boxes_tensor, labels_tensor, areas_tensor
+        return boxes, labels, areas
