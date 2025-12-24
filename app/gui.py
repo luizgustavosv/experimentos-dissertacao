@@ -26,6 +26,7 @@ class DetectorApp(tk.Tk):
         self.dataset_type_var = tk.StringVar(value="HERIDAL")
         self.path_vars = {
             "dataset": tk.StringVar(),
+            "annotations": tk.StringVar(),
             "weights": tk.StringVar(),
             "pretrained": tk.StringVar(),
             "inference_weights": tk.StringVar(),
@@ -117,9 +118,20 @@ class DetectorApp(tk.Tk):
     def _render_fields(self) -> None:
         self._clear_dynamic()
         action = self.action_var.get()
+        algorithm = self.algorithm_var.get()
 
         if action == "Treinar":
-            self._add_path_selector("Dataset (arquivo .yaml)", "dataset")
+            if algorithm == "YOLO":
+                self._add_path_selector("Dataset (arquivo .yaml)", "dataset", filetypes=[("YAML", "*.yaml")])
+            elif algorithm == "SSD":
+                self._add_path_selector("Pasta do dataset Pascal VOC", "dataset", is_dir=True)
+            elif algorithm in {"RetinaNet", "Faster R-CNN"}:
+                self._add_path_selector("Anotações COCO (.json)", "annotations", filetypes=[("COCO JSON", "*.json")])
+                self._add_path_selector(
+                    "Pasta de imagens COCO (deve conter train/ e val/)", "images", is_dir=True
+                )
+            else:
+                self._add_path_selector("Dataset", "dataset")
             self._add_path_selector("Pesos pré-treinados", "pretrained")
             self._add_path_selector("Pasta para salvar os pesos treinados", "weights", is_dir=True)
             self._add_epoch_selector()
@@ -139,7 +151,15 @@ class DetectorApp(tk.Tk):
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
             self._add_path_selector("Destino do dataset normalizado", "normalized", is_dir=True)
 
-    def _add_path_selector(self, label: str, key: str, is_dir: bool = False, is_file: bool = False, defaultextension: str = "") -> None:
+    def _add_path_selector(
+        self,
+        label: str,
+        key: str,
+        is_dir: bool = False,
+        is_file: bool = False,
+        defaultextension: str = "",
+        filetypes: Optional[list[tuple[str, str]]] = None,
+    ) -> None:
         frame = tk.Frame(self.dynamic_frame, bg="#12233d")
         frame.pack(fill="x", padx=10, pady=6)
         tk.Label(frame, text=label, bg="#12233d", fg="white").pack(anchor="w")
@@ -152,7 +172,7 @@ class DetectorApp(tk.Tk):
             elif is_file:
                 path = filedialog.asksaveasfilename(defaultextension=defaultextension)
             else:
-                path = filedialog.askopenfilename()
+                path = filedialog.askopenfilename(filetypes=filetypes)
             if path:
                 self.path_vars[key].set(path)
 
@@ -232,20 +252,37 @@ class DetectorApp(tk.Tk):
 
         try:
             if action == "Treinar":
-                dataset = Path(self.path_vars["dataset"].get())
                 weights = Path(self.path_vars["weights"].get())
                 pretrained_raw = self.path_vars["pretrained"].get().strip()
                 pretrained = Path(pretrained_raw) if pretrained_raw else None
                 epochs = int(self.epochs_var.get())
+
+                if algorithm_key == "YOLO":
+                    dataset_arg = Path(self.path_vars["dataset"].get())
+                    prompt_dataset = dataset_arg
+                    exec_kwargs = {"dataset_path": dataset_arg}
+                elif algorithm_key == "SSD":
+                    dataset_arg = Path(self.path_vars["dataset"].get())
+                    prompt_dataset = dataset_arg
+                    exec_kwargs = {"dataset_path": dataset_arg}
+                elif algorithm_key in {"RetinaNet", "Faster R-CNN"}:
+                    annotations = Path(self.path_vars["annotations"].get())
+                    images = Path(self.path_vars["images"].get())
+                    prompt_dataset = annotations
+                    exec_kwargs = {"dataset_path": annotations, "images_dir": images, "annotations_path": annotations}
+                else:
+                    raise ValueError(f"Algoritmo desconhecido para treinamento: {algorithm_key}")
+
                 prompt_logger(
                     self._build_prompt_command(
                         "treinar",
                         algorithm_key,
                         {
-                            "dataset": dataset,
+                            "dataset": prompt_dataset,
                             "pesos_out": weights,
                             "pretreinados": pretrained or "padrão",
                             "epocas": epochs,
+                            **({"imagens": exec_kwargs.get("images_dir")} if exec_kwargs.get("images_dir") else {}),
                         },
                     )
                 )
@@ -253,11 +290,11 @@ class DetectorApp(tk.Tk):
                 def run_action() -> OperationResult:
                     return self.controller.execute_train(
                         algorithm_key,
-                        dataset,
-                        pretrained,
-                        weights,
-                        epochs,
-                        prompt_logger,
+                        pretrained_weights=pretrained,
+                        output_dir=weights,
+                        epochs=epochs,
+                        logger=prompt_logger,
+                        **exec_kwargs,
                     )
 
             elif action == "Inferir":

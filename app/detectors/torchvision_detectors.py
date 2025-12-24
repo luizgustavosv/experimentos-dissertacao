@@ -31,8 +31,11 @@ class TorchvisionDetector(DetectionAlgorithm):
         output_dir: Path,
         epochs: int,
         logger: Optional[Logger] = None,
+        train_ann: Optional[Path] = None,
+        val_ann: Optional[Path] = None,
     ) -> Metrics:
-        train_ann, val_ann = validate_coco_dataset(dataset_dir)
+        if train_ann is None or val_ann is None:
+            train_ann, val_ann = validate_coco_dataset(dataset_dir)
         device_str = resolve_device(self.config.device)
         num_classes = self._infer_num_classes(train_ann)
         if logger:

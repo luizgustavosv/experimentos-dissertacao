@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -23,14 +24,47 @@ class ExperimentController:
     def execute_train(
         self,
         algorithm_key: str,
-        dataset_yaml: Path,
+        dataset_path: Path,
         pretrained_weights: Optional[Path],
         output_dir: Path,
         epochs: int,
         logger: Optional[Logger] = None,
+        images_dir: Optional[Path] = None,
+        annotations_path: Optional[Path] = None,
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
-        metrics = detector.train(dataset_yaml, pretrained_weights, output_dir, epochs, logger)
+        metrics: Optional[Metrics]
+
+        if algorithm_key == "YOLO":
+            dataset_yaml = dataset_path.expanduser().resolve()
+            if dataset_yaml.suffix.lower() != ".yaml":
+                raise ValueError("YOLO exige um arquivo .yaml de dataset.")
+            if not dataset_yaml.is_file():
+                raise FileNotFoundError(f"Arquivo YAML não encontrado: {dataset_yaml}")
+            metrics = detector.train(dataset_yaml, pretrained_weights, output_dir, epochs, logger)
+
+        elif algorithm_key == "SSD":
+            voc_root = self._validate_voc_root(dataset_path)
+            metrics = detector.train(voc_root, pretrained_weights, output_dir, epochs, logger)
+
+        elif algorithm_key in {"RetinaNet", "Faster R-CNN"}:
+            coco_ann = self._validate_coco_annotation_path(annotations_path or dataset_path)
+            images_root = self._validate_coco_images_root(images_dir)
+            val_ann = self._resolve_coco_val_annotation(coco_ann, images_root)
+            dataset_root = images_root.parent if images_root.name.lower() == "images" else images_root
+            metrics = detector.train(
+                dataset_root,
+                pretrained_weights,
+                output_dir,
+                epochs,
+                logger,
+                train_ann=coco_ann,
+                val_ann=val_ann,
+            )
+
+        else:
+            raise ValueError(f"Algoritmo desconhecido: {algorithm_key}")
+
         return OperationResult(metrics=metrics, message="Treinamento concluído.")
 
     def execute_infer(
@@ -80,3 +114,66 @@ class ExperimentController:
         if algorithm_key not in self.detectors:
             raise KeyError(f"Algoritmo desconhecido: {algorithm_key}")
         return self.detectors[algorithm_key]
+
+    def _validate_voc_root(self, dataset_path: Path) -> Path:
+        dataset_path = dataset_path.expanduser().resolve()
+        if not dataset_path.exists():
+            raise FileNotFoundError(f"Pasta do dataset não encontrada: {dataset_path}")
+
+        candidates = [
+            dataset_path,
+            dataset_path / "VOC2007",
+            dataset_path / "VOCdevkit" / "VOC2007",
+        ]
+        voc_root = next(
+            (candidate for candidate in candidates if (candidate / "JPEGImages").exists() and (candidate / "Annotations").exists()),
+            None,
+        )
+        if voc_root is None:
+            raise FileNotFoundError(
+                "Estrutura Pascal VOC inválida. São necessárias as pastas 'JPEGImages' e 'Annotations' no diretório informado."
+            )
+        return voc_root
+
+    def _validate_coco_annotation_path(self, annotations_path: Path) -> Path:
+        annotations_path = annotations_path.expanduser().resolve()
+        if annotations_path.suffix.lower() != ".json":
+            raise ValueError("Anotações COCO devem ser fornecidas em um arquivo .json.")
+        if not annotations_path.is_file():
+            raise FileNotFoundError(f"Arquivo de anotações COCO não encontrado: {annotations_path}")
+        content = json.loads(annotations_path.read_text(encoding="utf-8"))
+        required_keys = {"images", "annotations", "categories"}
+        if not required_keys.issubset(content.keys()):
+            raise ValueError(
+                f"Arquivo COCO inválido. Esperado conter as chaves {', '.join(sorted(required_keys))}."
+            )
+        return annotations_path
+
+    def _validate_coco_images_root(self, images_dir: Optional[Path]) -> Path:
+        if images_dir is None:
+            raise ValueError("Informe o diretório de imagens para o dataset COCO.")
+        images_root = images_dir.expanduser().resolve()
+        if not images_root.exists() or not images_root.is_dir():
+            raise FileNotFoundError(f"Diretório de imagens inexistente: {images_root}")
+        train_dir = images_root / "train"
+        val_dir = images_root / "val"
+        if not train_dir.exists() or not val_dir.exists():
+            raise FileNotFoundError("Estrutura COCO incompleta: pastas train/ e val/ são obrigatórias dentro do diretório de imagens.")
+        return images_root
+
+    def _resolve_coco_val_annotation(self, train_ann: Path, images_root: Path) -> Path:
+        candidates = []
+        name_lower = train_ann.name.lower()
+        if "train" in name_lower:
+            candidates.append(train_ann.with_name(train_ann.name.replace("train", "val")))
+        candidates.append(train_ann.parent / "instances_val.json")
+        dataset_root = images_root.parent if images_root.name.lower() == "images" else images_root
+        candidates.append(dataset_root / "annotations" / "instances_val.json")
+        candidates.append(dataset_root / "val.json")
+
+        for candidate in candidates:
+            if candidate.exists():
+                return self._validate_coco_annotation_path(candidate)
+        raise FileNotFoundError(
+            "Arquivo de validação COCO não encontrado. Esperado algo como 'instances_val.json' ao lado do JSON de treino."
+        )
