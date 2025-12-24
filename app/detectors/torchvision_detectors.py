@@ -217,7 +217,7 @@ class TorchvisionDetector(DetectionAlgorithm):
                     logger(f"[INFER] Aviso: camadas ausentes ao carregar pesos: {missing}")
                 if unexpected:
                     logger(f"[INFER] Aviso: pesos inesperados ignorados: {unexpected}")
-            class_names = [str(idx) for idx in range(num_classes)]
+            class_names = ["background", "human"] if num_classes == 2 else [str(idx) for idx in range(num_classes)]
             weights_label = weights_path
         model.to(device_str)
         model.eval()
