@@ -21,10 +21,6 @@ class PascalVOCDataset(Dataset):
         self.annotations_dir = self.dataset_root / "Annotations"
         self.image_ids = [img_id.strip() for img_id in image_ids if img_id.strip()]
         self.class_to_idx = {name: int(idx) for name, idx in dict(class_to_idx).items()}
-        if self.class_to_idx.get("human") != 1:
-            raise ValueError("Mapeamento de classes inválido: 'human' deve estar mapeada para o índice 1 (background=0)")
-        if any(idx <= 0 for idx in self.class_to_idx.values()):
-            raise ValueError("Mapeamento de classes inválido: labels devem ser positivos (background=0 é reservado)")
         self.transforms = transforms
 
     def __len__(self) -> int:  # pragma: no cover - trivial
@@ -113,8 +109,11 @@ class PascalVOCDataset(Dataset):
             name = obj.findtext("name")
             if name is None:
                 continue
-            if name not in self.class_to_idx:
-                raise ValueError(f"Classe '{name}' não encontrada no mapeamento de classes.")
+
+            class_name = name.lower().strip()
+            if class_name not in ("pedestrian", "human"):
+                continue
+
             bndbox = obj.find("bndbox")
             if bndbox is None:
                 continue
@@ -125,8 +124,21 @@ class PascalVOCDataset(Dataset):
                 ymax = float(bndbox.findtext("ymax"))
             except (TypeError, ValueError):
                 continue
+
+            if xmax <= xmin or ymax <= ymin:
+                continue
+
             boxes.append([xmin, ymin, xmax, ymax])
-            labels.append(self.class_to_idx[name])
+            labels.append(1)  # background=0, person=1
             areas.append(max(0.0, (xmax - xmin) * (ymax - ymin)))
 
-        return boxes, labels, areas
+        if not boxes:
+            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            labels_tensor = torch.zeros((0,), dtype=torch.int64)
+            areas_tensor = torch.zeros((0,), dtype=torch.float32)
+            return boxes_tensor, labels_tensor, areas_tensor
+
+        boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
+        labels_tensor = torch.tensor(labels, dtype=torch.int64)
+        areas_tensor = torch.tensor(areas, dtype=torch.float32)
+        return boxes_tensor, labels_tensor, areas_tensor
