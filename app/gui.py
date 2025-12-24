@@ -11,6 +11,14 @@ from app.controller import ExperimentController, OperationResult
 from app.logging_utils import PromptLogForwarder, capture_prompt_output
 
 
+def get_weights_filetypes(algo: str) -> list[tuple[str, str]]:
+    if algo == "YOLO":
+        return [("YOLO weights (*.pt)", "*.pt"), ("All files", "*.*")]
+    if algo in ("SSD", "RetinaNet", "Faster R-CNN"):
+        return [("PyTorch weights (*.pth, *.pt)", "*.pth *.pt"), ("All files", "*.*")]
+    return [("All files", "*.*")]
+
+
 class DetectorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -132,7 +140,9 @@ class DetectorApp(tk.Tk):
                 )
             else:
                 self._add_path_selector("Dataset", "dataset")
-            self._add_path_selector("Pesos pré-treinados", "pretrained")
+            self._add_path_selector(
+                "Pesos pré-treinados", "pretrained", filetypes=get_weights_filetypes(algorithm)
+            )
             self._add_path_selector("Pasta para salvar os pesos treinados", "weights", is_dir=True)
             self._add_epoch_selector()
         elif action == "Inferir":
@@ -172,7 +182,10 @@ class DetectorApp(tk.Tk):
             elif is_file:
                 path = filedialog.asksaveasfilename(defaultextension=defaultextension)
             else:
-                path = filedialog.askopenfilename(filetypes=filetypes)
+                if filetypes:
+                    path = filedialog.askopenfilename(filetypes=filetypes)
+                else:
+                    path = filedialog.askopenfilename()
             if path:
                 self.path_vars[key].set(path)
 
@@ -256,6 +269,10 @@ class DetectorApp(tk.Tk):
                 pretrained_raw = self.path_vars["pretrained"].get().strip()
                 pretrained = Path(pretrained_raw) if pretrained_raw else None
                 epochs = int(self.epochs_var.get())
+
+                if pretrained and not pretrained.exists():
+                    messagebox.showerror("Erro", "O arquivo de pesos pré-treinados não existe.")
+                    return
 
                 if algorithm_key == "YOLO":
                     dataset_arg = Path(self.path_vars["dataset"].get())
