@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import faulthandler
+import json
 import logging
 import signal
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple
 
 import torch
+from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 
@@ -200,11 +203,166 @@ def _configure_logging(
     return logger, log_path
 
 
+def _infer_num_classes_from_model(model: torch.nn.Module) -> Optional[int]:
+    candidates = [
+        getattr(model, "num_classes", None),
+        getattr(model, "nc", None),
+    ]
+    head = getattr(model, "head", None)
+    if head is not None:
+        candidates.append(getattr(head, "num_classes", None))
+        classification_head = getattr(head, "classification_head", None)
+        if classification_head is not None:
+            candidates.append(getattr(classification_head, "num_classes", None))
+    for cand in candidates:
+        if isinstance(cand, int) and cand > 0:
+            return cand
+    return None
+
+
+def _validate_targets_batch(
+    targets: list[dict[str, torch.Tensor]],
+    *,
+    num_classes: Optional[int],
+    image_sizes: Iterable[tuple[int, int]],
+    logger: logging.Logger,
+) -> None:
+    sizes = list(image_sizes)
+    for idx, target in enumerate(targets):
+        if not isinstance(target, dict):
+            raise TypeError(f"Target no índice {idx} não é um dicionário: {type(target).__name__}")
+
+        if "boxes" not in target or "labels" not in target:
+            raise ValueError(f"Target no índice {idx} deve conter 'boxes' e 'labels'")
+
+        boxes = target["boxes"]
+        labels = target["labels"]
+
+        if not torch.is_tensor(boxes):
+            raise TypeError(f"Target boxes no índice {idx} não é tensor")
+        if not torch.is_tensor(labels):
+            raise TypeError(f"Target labels no índice {idx} não é tensor")
+
+        if boxes.dim() != 2 or boxes.size(1) != 4:
+            raise ValueError(f"Boxes no índice {idx} devem ter shape [N,4], recebido {tuple(boxes.shape)}")
+        if not torch.isfinite(boxes).all():
+            raise ValueError(f"Boxes não finitos no índice {idx}")
+
+        if labels.dim() != 1:
+            raise ValueError(f"Labels no índice {idx} devem ser 1D, recebido {tuple(labels.shape)}")
+        if boxes.size(0) != labels.numel():
+            raise ValueError(f"Mismatch boxes/labels no índice {idx}: {boxes.size(0)} vs {labels.numel()}")
+        if labels.dtype != torch.int64:
+            raise TypeError(f"Labels no índice {idx} devem ser int64, recebido {labels.dtype}")
+
+        if boxes.numel() == 0:
+            if boxes.shape != (0, 4):
+                target["boxes"] = boxes.reshape(0, 4)
+            if labels.shape != (0,):
+                target["labels"] = labels.reshape(0)
+            continue
+
+        h, w = sizes[idx] if idx < len(sizes) else (None, None)
+        if h is not None and w is not None:
+            clamped_boxes = boxes.clone()
+            clamped_boxes[:, 0::2] = clamped_boxes[:, 0::2].clamp(0, w)
+            clamped_boxes[:, 1::2] = clamped_boxes[:, 1::2].clamp(0, h)
+            target["boxes"] = clamped_boxes
+            boxes = clamped_boxes
+
+        x_min, y_min, x_max, y_max = boxes.unbind(dim=1)
+        if not (x_max > x_min).all():
+            raise ValueError(f"xmax <= xmin encontrado no índice {idx}")
+        if not (y_max > y_min).all():
+            raise ValueError(f"ymax <= ymin encontrado no índice {idx}")
+
+        if num_classes is not None and num_classes > 0:
+            if (labels < 1).any():
+                raise ValueError(f"Labels fora do intervalo no índice {idx}: mínimo {int(labels.min())}")
+            if (labels >= num_classes).any():
+                raise ValueError(
+                    f"Labels fora do intervalo no índice {idx}: máximo {int(labels.max())} >= num_classes ({num_classes})"
+                )
+        else:
+            if (labels < 1).any():
+                raise ValueError(f"Labels devem ser >=1 quando num_classes é desconhecido (índice {idx})")
+
+        if not torch.isfinite(labels.float()).all():
+            raise ValueError(f"Labels não finitos no índice {idx}")
+
+        if boxes.dtype != torch.float32:
+            logger.debug("Convertendo boxes para float32 no índice %d", idx)
+            target["boxes"] = boxes.float()
+
+
+def _collect_batch_identifiers(
+    targets: list[dict[str, torch.Tensor]], dataset: Optional[Any]
+) -> tuple[list[int], list[str]]:
+    image_ids: list[int] = []
+    file_paths: list[str] = []
+
+    for tgt in targets:
+        img_id = tgt.get("image_id") if isinstance(tgt, dict) else None
+        if torch.is_tensor(img_id):
+            try:
+                image_ids.extend(int(v) for v in img_id.detach().cpu().flatten().tolist())
+            except Exception:
+                continue
+
+    if dataset is None or not image_ids:
+        return image_ids, file_paths
+
+    try:
+        if hasattr(dataset, "images_dir") and hasattr(dataset, "images"):
+            mapping = {int(img.get("id")): img.get("file_name") for img in getattr(dataset, "images", []) if isinstance(img, dict)}
+            images_dir = Path(getattr(dataset, "images_dir"))
+            for img_id in image_ids:
+                fname = mapping.get(int(img_id))
+                if fname:
+                    file_paths.append(str(images_dir / Path(fname).name))
+        elif hasattr(dataset, "images_dir") and hasattr(dataset, "image_ids"):
+            resolver = getattr(dataset, "_resolve_image_path", None)
+            images_dir = Path(getattr(dataset, "images_dir"))
+            id_list = list(getattr(dataset, "image_ids"))
+            for img_id in image_ids:
+                if 0 <= img_id < len(id_list):
+                    image_key = id_list[img_id]
+                    if callable(resolver):
+                        file_paths.append(str(resolver(image_key)))
+                    else:
+                        file_paths.append(str(images_dir / image_key))
+    except Exception:
+        pass
+
+    return image_ids, file_paths
+
+
+@contextmanager
+def _watchdog_paused(last_progress: list[float], pause_event: Optional[threading.Event]):
+    try:
+        if pause_event:
+            last_progress[0] = time.monotonic()
+            pause_event.set()
+        yield
+    finally:
+        if pause_event:
+            last_progress[0] = time.monotonic()
+            pause_event.clear()
+
+
 def _start_watchdog(
-    log_path: Path, last_progress: list[float], stop_event: threading.Event, logger: logging.Logger, safe_stderr=None, timeout: int = 300
+    log_path: Path,
+    last_progress: list[float],
+    stop_event: threading.Event,
+    logger: logging.Logger,
+    safe_stderr=None,
+    timeout: int = 300,
+    pause_event: Optional[threading.Event] = None,
 ):
     def _watch() -> None:  # pragma: no cover - monitoramento em tempo real
         while not stop_event.wait(5):
+            if pause_event and pause_event.is_set():
+                continue
             if time.monotonic() - last_progress[0] > timeout:
                 logger.warning("[WATCHDOG] Nenhum progresso de batch há mais de %s segundos.", timeout)
                 with log_path.open("a", encoding="utf-8") as fh:
@@ -264,7 +422,9 @@ def train_torchvision_detector(
     logging_logger.info("Checkpoints serão salvos em: %s", ckpt_dir)
 
     watchdog_stop: Optional[threading.Event] = None
+    watchdog_pause: Optional[threading.Event] = None
     watchdog_thread: Optional[threading.Thread] = None
+    last_progress = [time.monotonic()]
     epoch = 0
     optimizer: Optional[torch.optim.Optimizer] = None
     try:
@@ -338,9 +498,18 @@ def train_torchvision_detector(
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.lr_step_size, gamma=config.lr_gamma)
         logging_logger.info("Starting training...")
 
+        num_classes = _infer_num_classes_from_model(model)
+        if num_classes is None:
+            logging_logger.debug("Não foi possível inferir num_classes do modelo; validação usará apenas limites mínimos.")
+        else:
+            logging_logger.info("num_classes inferido: %s", num_classes)
+
         last_progress = [time.monotonic()]
         watchdog_stop = threading.Event()
-        watchdog_thread = _start_watchdog(log_path, last_progress, watchdog_stop, logging_logger, safe_stderr=safe_stderr)
+        watchdog_pause = threading.Event()
+        watchdog_thread = _start_watchdog(
+            log_path, last_progress, watchdog_stop, logging_logger, safe_stderr=safe_stderr, pause_event=watchdog_pause
+        )
 
         last_loss = None
         logged_loss_structure = False
@@ -371,6 +540,9 @@ def train_torchvision_detector(
                 images = [img.to(device_str) for img in images]
                 targets = [{k: v.to(device_str) for k, v in t.items()} for t in targets]
 
+                image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
+                _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
+
                 loss_out = model(images, targets)
                 if not logged_loss_structure:
                     try:
@@ -388,8 +560,32 @@ def train_torchvision_detector(
                 if loss_items:
                     logging_logger.debug(f"Loss components: {loss_items}")
 
+                if not torch.isfinite(losses):
+                    image_ids, file_paths = _collect_batch_identifiers(targets, train_loader.dataset)
+                    logging_logger.error(
+                        "Loss não finito detectado. epoch=%s step=%s image_ids=%s paths=%s",
+                        epoch,
+                        step,
+                        image_ids,
+                        file_paths if file_paths else "<indisponível>",
+                    )
+                    bad_batch = {
+                        "epoch": epoch,
+                        "step": step,
+                        "image_ids": image_ids,
+                        "paths": file_paths,
+                    }
+                    try:
+                        bad_path = ckpt_dir / "bad_batch.json"
+                        bad_path.write_text(json.dumps(bad_batch, indent=2, ensure_ascii=False), encoding="utf-8")
+                        logging_logger.error("Batch problemático salvo em %s", bad_path)
+                    except Exception:
+                        logging_logger.exception("Falha ao salvar bad_batch.json")
+                    raise RuntimeError("Non-finite loss")
+
                 optimizer.zero_grad()
                 losses.backward()
+                clip_grad_norm_(params, max_norm=1.0)
                 optimizer.step()
 
                 running_loss += losses.item()
@@ -453,34 +649,61 @@ def train_torchvision_detector(
 
             model.eval()
             val_loss = 0.0
-            with torch.no_grad():
-                for images, targets in val_loader:
-                    images = [img.to(device_str) for img in images]
-                    targets = [{k: v.to(device_str) for k, v in t.items()} for t in targets]
-                    loss_out = model(images, targets)
-                    try:
-                        losses, loss_items = _normalize_losses(loss_out, device)
-                    except Exception:
-                        logging_logger.exception("Falha ao normalizar losses no val; usando 0.0 para continuar.")
-                        losses = torch.tensor(0.0, device=device)
-                        loss_items = {}
-                    if loss_items:
-                        logging_logger.debug(f"Loss components: {loss_items}")
-                    val_loss += losses.item()
+            with _watchdog_paused(last_progress, watchdog_pause):
+                with torch.no_grad():
+                    for vstep, (images, targets) in enumerate(val_loader, start=1):
+                        images = [img.to(device_str) for img in images]
+                        targets = [{k: v.to(device_str) for k, v in t.items()} for t in targets]
+                        image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
+                        _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
+                        loss_out = model(images, targets)
+                        try:
+                            losses, loss_items = _normalize_losses(loss_out, device)
+                        except Exception:
+                            logging_logger.exception("Falha ao normalizar losses no val; usando 0.0 para continuar.")
+                            losses = torch.tensor(0.0, device=device)
+                            loss_items = {}
+                        if not torch.isfinite(losses):
+                            image_ids, file_paths = _collect_batch_identifiers(targets, val_loader.dataset)
+                            logging_logger.error(
+                                "Loss não finito detectado no val. epoch=%s step=%s image_ids=%s paths=%s",
+                                epoch,
+                                vstep,
+                                image_ids,
+                                file_paths if file_paths else "<indisponível>",
+                            )
+                            bad_batch = {
+                                "epoch": epoch,
+                                "step": vstep,
+                                "phase": "val",
+                                "image_ids": image_ids,
+                                "paths": file_paths,
+                            }
+                            try:
+                                bad_path = ckpt_dir / "bad_batch.json"
+                                bad_path.write_text(json.dumps(bad_batch, indent=2, ensure_ascii=False), encoding="utf-8")
+                                logging_logger.error("Batch problemático de validação salvo em %s", bad_path)
+                            except Exception:
+                                logging_logger.exception("Falha ao salvar bad_batch.json de validação")
+                            raise RuntimeError("Non-finite loss")
+                        if loss_items:
+                            logging_logger.debug(f"Loss components: {loss_items}")
+                        val_loss += losses.item()
             val_loss = val_loss / max(1, len(val_loader))
             logging_logger.info(f"[VAL] Época {epoch} | loss={val_loss:.4f}")
 
-            epoch_ckpt = ckpt_dir / f"epoch_{epoch:03d}.pth"
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict() if optimizer else None,
-                    "loss": float(avg_loss),
-                },
-                epoch_ckpt,
-            )
-            logging_logger.info("Checkpoint da época %d salvo em %s", epoch, epoch_ckpt)
+            with _watchdog_paused(last_progress, watchdog_pause):
+                epoch_ckpt = ckpt_dir / f"epoch_{epoch:03d}.pth"
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict() if optimizer else None,
+                        "loss": float(avg_loss),
+                    },
+                    epoch_ckpt,
+                )
+                logging_logger.info("Checkpoint da época %d salvo em %s", epoch, epoch_ckpt)
 
         watchdog_stop.set()
         watchdog_thread.join(timeout=1)
@@ -494,11 +717,12 @@ def train_torchvision_detector(
             out.parent.mkdir(parents=True, exist_ok=True)
         out = out.with_suffix(".pth")
 
-        logging_logger.info("Salvando pesos em %s", out)
-        torch.save(model.state_dict(), str(out))
-        ensure_weights_size(out)
-        weights_out = out
-        logging_logger.info("Treinamento finalizado com sucesso.")
+        with _watchdog_paused(last_progress, watchdog_pause):
+            logging_logger.info("Salvando pesos em %s", out)
+            torch.save(model.state_dict(), str(out))
+            ensure_weights_size(out)
+            weights_out = out
+            logging_logger.info("Treinamento finalizado com sucesso.")
 
         return Metrics(
             precision=0.0,
@@ -517,17 +741,18 @@ def train_torchvision_detector(
         raise
     finally:
         try:
-            final_epoch = epoch if epoch else 0
-            last_ckpt = ckpt_dir / "last.pth"
-            torch.save(
-                {
-                    "epoch": final_epoch,
-                    "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict() if optimizer else None,
-                },
-                last_ckpt,
-            )
-            logging_logger.info("Checkpoint final salvo em %s", last_ckpt)
+            with _watchdog_paused(last_progress, watchdog_pause):
+                final_epoch = epoch if epoch else 0
+                last_ckpt = ckpt_dir / "last.pth"
+                torch.save(
+                    {
+                        "epoch": final_epoch,
+                        "model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict() if optimizer else None,
+                    },
+                    last_ckpt,
+                )
+                logging_logger.info("Checkpoint final salvo em %s", last_ckpt)
         except Exception:
             logging_logger.exception("Falha ao salvar checkpoint final.")
         if watchdog_stop:
