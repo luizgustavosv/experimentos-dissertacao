@@ -308,6 +308,13 @@ def _collect_batch_identifiers(
                 image_ids.extend(int(v) for v in img_id.detach().cpu().flatten().tolist())
             except Exception:
                 continue
+        if isinstance(tgt, dict) and "img_path" in tgt:
+            img_path = tgt.get("img_path")
+            if isinstance(img_path, (str, Path)):
+                try:
+                    file_paths.append(str(Path(img_path)))
+                except Exception:
+                    file_paths.append(str(img_path))
 
     if dataset is None or not image_ids:
         return image_ids, file_paths
@@ -335,6 +342,32 @@ def _collect_batch_identifiers(
         pass
 
     return image_ids, file_paths
+
+
+def _summarize_targets_for_logging(targets: list[dict[str, torch.Tensor]]) -> list[dict[str, Any]]:
+    summary: list[dict[str, Any]] = []
+    for tgt in targets:
+        if not isinstance(tgt, dict):
+            continue
+        entry: dict[str, Any] = {}
+        img_path = tgt.get("img_path")
+        if isinstance(img_path, (str, Path)):
+            entry["img_path"] = str(img_path)
+        boxes = tgt.get("boxes")
+        if torch.is_tensor(boxes):
+            try:
+                entry["boxes"] = boxes.detach().cpu().tolist()
+            except Exception:
+                entry["boxes"] = "<unavailable>"
+        labels = tgt.get("labels")
+        if torch.is_tensor(labels):
+            try:
+                entry["labels"] = labels.detach().cpu().tolist()
+            except Exception:
+                entry["labels"] = "<unavailable>"
+        if entry:
+            summary.append(entry)
+    return summary
 
 
 @contextmanager
@@ -538,7 +571,10 @@ def train_torchvision_detector(
             for step, (images, targets) in enumerate(train_loader, start=1):
                 batch_start = time.perf_counter()
                 images = [img.to(device_str) for img in images]
-                targets = [{k: v.to(device_str) for k, v in t.items()} for t in targets]
+                targets = [
+                    {k: (v.to(device_str) if torch.is_tensor(v) else v) for k, v in t.items()}
+                    for t in targets
+                ]
 
                 image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
                 _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
@@ -562,11 +598,11 @@ def train_torchvision_detector(
 
                 if not torch.isfinite(losses):
                     image_ids, file_paths = _collect_batch_identifiers(targets, train_loader.dataset)
+                    target_dump = _summarize_targets_for_logging(targets)
                     logging_logger.error(
-                        "Loss não finito detectado. epoch=%s step=%s image_ids=%s paths=%s",
+                        "Loss não finito detectado. epoch=%s step=%s paths=%s",
                         epoch,
                         step,
-                        image_ids,
                         file_paths if file_paths else "<indisponível>",
                     )
                     bad_batch = {
@@ -574,14 +610,27 @@ def train_torchvision_detector(
                         "step": step,
                         "image_ids": image_ids,
                         "paths": file_paths,
+                        "targets": target_dump,
                     }
                     try:
-                        bad_path = ckpt_dir / "bad_batch.json"
-                        bad_path.write_text(json.dumps(bad_batch, indent=2, ensure_ascii=False), encoding="utf-8")
-                        logging_logger.error("Batch problemático salvo em %s", bad_path)
+                        bad_path_json = ckpt_dir / "bad_batch.json"
+                        bad_path_txt = ckpt_dir / "bad_batch.txt"
+                        bad_path_json.write_text(json.dumps(bad_batch, indent=2, ensure_ascii=False), encoding="utf-8")
+                        lines = [
+                            f"epoch={epoch}",
+                            f"step={step}",
+                            f"paths={file_paths if file_paths else '<indisponível>'}",
+                        ]
+                        for entry in target_dump:
+                            lines.append("")
+                            lines.append(f"img_path: {entry.get('img_path', '<desconhecido>')}")
+                            lines.append(f"boxes: {entry.get('boxes', '<sem boxes>')}")
+                            lines.append(f"labels: {entry.get('labels', '<sem labels>')}")
+                        bad_path_txt.write_text("\n".join(lines), encoding="utf-8")
+                        logging_logger.error("Batch problemático salvo em %s e %s", bad_path_json, bad_path_txt)
                     except Exception:
-                        logging_logger.exception("Falha ao salvar bad_batch.json")
-                    raise RuntimeError("Non-finite loss")
+                        logging_logger.exception("Falha ao salvar informações do bad batch")
+                    raise RuntimeError("Non-finite loss detected")
 
                 optimizer.zero_grad()
                 losses.backward()
@@ -653,7 +702,10 @@ def train_torchvision_detector(
                 with torch.no_grad():
                     for vstep, (images, targets) in enumerate(val_loader, start=1):
                         images = [img.to(device_str) for img in images]
-                        targets = [{k: v.to(device_str) for k, v in t.items()} for t in targets]
+                        targets = [
+                            {k: (v.to(device_str) if torch.is_tensor(v) else v) for k, v in t.items()}
+                            for t in targets
+                        ]
                         image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
                         _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
                         loss_out = model(images, targets)
@@ -665,11 +717,11 @@ def train_torchvision_detector(
                             loss_items = {}
                         if not torch.isfinite(losses):
                             image_ids, file_paths = _collect_batch_identifiers(targets, val_loader.dataset)
+                            target_dump = _summarize_targets_for_logging(targets)
                             logging_logger.error(
-                                "Loss não finito detectado no val. epoch=%s step=%s image_ids=%s paths=%s",
+                                "Loss não finito detectado no val. epoch=%s step=%s paths=%s",
                                 epoch,
                                 vstep,
-                                image_ids,
                                 file_paths if file_paths else "<indisponível>",
                             )
                             bad_batch = {
@@ -678,14 +730,29 @@ def train_torchvision_detector(
                                 "phase": "val",
                                 "image_ids": image_ids,
                                 "paths": file_paths,
+                                "targets": target_dump,
                             }
                             try:
-                                bad_path = ckpt_dir / "bad_batch.json"
-                                bad_path.write_text(json.dumps(bad_batch, indent=2, ensure_ascii=False), encoding="utf-8")
-                                logging_logger.error("Batch problemático de validação salvo em %s", bad_path)
+                                bad_path_json = ckpt_dir / "bad_batch.json"
+                                bad_path_txt = ckpt_dir / "bad_batch.txt"
+                                bad_path_json.write_text(json.dumps(bad_batch, indent=2, ensure_ascii=False), encoding="utf-8")
+                                lines = [
+                                    f"epoch={epoch}",
+                                    f"step={vstep}",
+                                    f"paths={file_paths if file_paths else '<indisponível>'}",
+                                ]
+                                for entry in target_dump:
+                                    lines.append("")
+                                    lines.append(f"img_path: {entry.get('img_path', '<desconhecido>')}")
+                                    lines.append(f"boxes: {entry.get('boxes', '<sem boxes>')}")
+                                    lines.append(f"labels: {entry.get('labels', '<sem labels>')}")
+                                bad_path_txt.write_text("\n".join(lines), encoding="utf-8")
+                                logging_logger.error(
+                                    "Batch problemático de validação salvo em %s e %s", bad_path_json, bad_path_txt
+                                )
                             except Exception:
-                                logging_logger.exception("Falha ao salvar bad_batch.json de validação")
-                            raise RuntimeError("Non-finite loss")
+                                logging_logger.exception("Falha ao salvar informações do bad batch de validação")
+                            raise RuntimeError("Non-finite loss detected")
                         if loss_items:
                             logging_logger.debug(f"Loss components: {loss_items}")
                         val_loss += losses.item()

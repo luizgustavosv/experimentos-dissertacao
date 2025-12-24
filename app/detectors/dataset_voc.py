@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence, Tuple
@@ -19,7 +20,11 @@ class PascalVOCDataset(Dataset):
         self.images_dir = self.dataset_root / "JPEGImages"
         self.annotations_dir = self.dataset_root / "Annotations"
         self.image_ids = [img_id.strip() for img_id in image_ids if img_id.strip()]
-        self.class_to_idx = dict(class_to_idx)
+        self.class_to_idx = {name: int(idx) for name, idx in dict(class_to_idx).items()}
+        if self.class_to_idx.get("human") != 1:
+            raise ValueError("Mapeamento de classes inválido: 'human' deve estar mapeada para o índice 1 (background=0)")
+        if any(idx <= 0 for idx in self.class_to_idx.values()):
+            raise ValueError("Mapeamento de classes inválido: labels devem ser positivos (background=0 é reservado)")
         self.transforms = transforms
 
     def __len__(self) -> int:  # pragma: no cover - trivial
@@ -33,21 +38,53 @@ class PascalVOCDataset(Dataset):
             raise FileNotFoundError(f"Anotação VOC não encontrada: {annotation_path}")
 
         image = Image.open(image_path).convert("RGB")
-        boxes, labels, areas = self._parse_annotation(annotation_path)
+        width, height = image.size
+        boxes, labels, _ = self._parse_annotation(annotation_path)
+
+        boxes_tensor = torch.as_tensor(boxes, dtype=torch.float32)
+        labels_tensor = torch.as_tensor(labels, dtype=torch.int64)
+
+        if boxes_tensor.numel() > 0 and width > 0 and height > 0:
+            boxes_tensor = boxes_tensor.clone()
+            boxes_tensor[:, 0::2] = boxes_tensor[:, 0::2].clamp(0, width - 1)
+            boxes_tensor[:, 1::2] = boxes_tensor[:, 1::2].clamp(0, height - 1)
+
+        valid = torch.ones(boxes_tensor.shape[0], dtype=torch.bool)
+        if boxes_tensor.numel() > 0:
+            finite_mask = torch.isfinite(boxes_tensor).all(dim=1)
+            valid &= finite_mask
+            widths = boxes_tensor[:, 2] - boxes_tensor[:, 0]
+            heights = boxes_tensor[:, 3] - boxes_tensor[:, 1]
+            spatial_valid = (widths > 0) & (heights > 0)
+            valid &= spatial_valid
+
+        label_mask = torch.isfinite(labels_tensor.float()) & (labels_tensor > 0)
+        valid &= label_mask
+
+        if valid.any():
+            boxes_tensor = boxes_tensor[valid]
+            labels_tensor = labels_tensor[valid]
+        else:
+            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            labels_tensor = torch.zeros((0,), dtype=torch.int64)
+
+        areas_tensor = torch.zeros((boxes_tensor.shape[0],), dtype=torch.float32)
+        if boxes_tensor.numel() > 0:
+            widths = boxes_tensor[:, 2] - boxes_tensor[:, 0]
+            heights = boxes_tensor[:, 3] - boxes_tensor[:, 1]
+            areas_tensor = widths * heights
+
+        if boxes_tensor.shape[0] == 0 and boxes:
+            logging.warning("Todas as boxes foram descartadas por serem inválidas. id=%s path=%s", image_id, image_path)
 
         target: Dict[str, Any] = {
-            "boxes": torch.tensor(boxes, dtype=torch.float32),
-            "labels": torch.tensor(labels, dtype=torch.int64),
+            "boxes": boxes_tensor,
+            "labels": labels_tensor,
             "image_id": torch.tensor([idx]),
-            "area": torch.tensor(areas, dtype=torch.float32),
-            "iscrowd": torch.zeros(len(boxes), dtype=torch.int64),
+            "area": areas_tensor,
+            "iscrowd": torch.zeros(boxes_tensor.shape[0], dtype=torch.int64),
+            "img_path": str(image_path),
         }
-
-        if not boxes:
-            target["boxes"] = torch.zeros((0, 4), dtype=torch.float32)
-            target["labels"] = torch.zeros((0,), dtype=torch.int64)
-            target["area"] = torch.zeros((0,), dtype=torch.float32)
-            target["iscrowd"] = torch.zeros((0,), dtype=torch.int64)
 
         if self.transforms:
             image = self.transforms(image)
