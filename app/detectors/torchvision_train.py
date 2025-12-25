@@ -76,8 +76,10 @@ def _normalize_losses(loss_out: Any, device: torch.device) -> Tuple[torch.Tensor
     logger = logging.getLogger("ssd_train")
     warned_types: set[str] = set()
     loss_items: dict[str, float] = {}
+    warning_throttle = 0
 
     def _accumulate(obj: Any, prefix: str = "") -> torch.Tensor:
+        nonlocal warning_throttle
         total = torch.tensor(0.0, device=device)
 
         if obj is None:
@@ -99,18 +101,17 @@ def _normalize_losses(loss_out: Any, device: torch.device) -> Tuple[torch.Tensor
             if obj.device != device:
                 obj = obj.to(device)
             if obj.numel() == 0:
-                reduced = torch.tensor(0.0, device=device)
-            elif obj.dim() == 0:
-                reduced = obj
-            else:
-                reduced = obj.mean()
-            name = prefix[:-1] if prefix.endswith(".") else prefix
-            if name:
-                try:
-                    loss_items[name] = float(reduced.detach().cpu())
-                except Exception:
-                    logger.debug("Falha ao registrar loss_item para %s", name)
-            return reduced
+                return torch.tensor(0.0, device=obj.device)
+            if obj.is_floating_point() or obj.is_complex():
+                reduced = obj.mean() if obj.dim() > 0 else obj
+                name = prefix[:-1] if prefix.endswith(".") else prefix
+                if name:
+                    try:
+                        loss_items[name] = float(reduced.detach().cpu())
+                    except Exception:
+                        logger.debug("Falha ao registrar loss_item para %s", name)
+                return reduced
+            return torch.tensor(0.0, device=obj.device)
 
         if isinstance(obj, (int, float)):
             name = prefix[:-1] if prefix.endswith(".") else prefix
@@ -119,19 +120,37 @@ def _normalize_losses(loss_out: Any, device: torch.device) -> Tuple[torch.Tensor
             return torch.tensor(float(obj), device=device)
 
         tname = type(obj).__name__
-        if tname not in warned_types:
+        if tname not in warned_types and warning_throttle == 0:
             warned_types.add(tname)
             logger.warning("_normalize_losses ignorando tipo inesperado em loss_out: %s", tname)
+        warning_throttle = (warning_throttle + 1) % 50
         return total
 
     try:
-        loss_total = _accumulate(loss_out)
+        if isinstance(loss_out, dict) and loss_out:
+            tensors = [
+                v
+                for v in loss_out.values()
+                if torch.is_tensor(v) and (v.is_floating_point() or v.is_complex())
+            ]
+            if tensors:
+                loss_total = sum(tensors)
+                for key, value in loss_out.items():
+                    if torch.is_tensor(value) and (value.is_floating_point() or value.is_complex()):
+                        loss_items[key] = float(value.detach().mean().cpu())
+            else:
+                loss_total = _accumulate(loss_out)
+        else:
+            loss_total = _accumulate(loss_out)
     except Exception:
         logger.exception("_normalize_losses falhou; retornando 0.0")
         return torch.tensor(0.0, device=device), {}
 
     if loss_total.dim() > 0:
         loss_total = loss_total.mean()
+
+    if not loss_total.is_floating_point() and not loss_total.is_complex():
+        loss_total = loss_total.float()
 
     return loss_total, loss_items
 
