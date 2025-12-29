@@ -106,7 +106,7 @@ class DetectorApp(tk.Tk):
         action_combo = ttk.Combobox(
             action_frame,
             textvariable=self.action_var,
-            values=["Treinar", "Inferir", "Validar", "Avaliar SSD", "Normalizar dataset"],
+            values=["Treinar", "Inferir", "Avaliar SSD", "Normalizar dataset"],
             state="readonly",
             width=25,
         )
@@ -116,7 +116,9 @@ class DetectorApp(tk.Tk):
         self.dynamic_frame = tk.LabelFrame(container, text="Parâmetros", bg="#12233d", fg="white")
         self.dynamic_frame.pack(fill="x", pady=5)
 
-        self.run_button = ttk.Button(container, text="Executar", command=self._execute_action)
+        self.style.configure("Run.TButton", padding=(14, 10), font=("Helvetica", 11, "bold"))
+        self.run_button = ttk.Button(container, text="Executar", command=self._execute_action, style="Run.TButton")
+        self.run_button.configure(width=18)
         self.run_button.pack(pady=10)
 
     def _build_log_area(self) -> None:
@@ -155,12 +157,6 @@ class DetectorApp(tk.Tk):
             self._add_path_selector("Pesos para inferência", "inference_weights")
             self._add_path_selector("Imagens para inferência", "images", is_dir=True)
             self._add_path_selector("Relatório PDF da inferência", "report", is_file=True, defaultextension=".pdf")
-            self._add_pedestrian_filter_selector()
-        elif action == "Validar":
-            self._add_path_selector("Pesos para validação", "validation_weights")
-            self._add_path_selector("Imagens de validação", "images", is_dir=True)
-            self._add_path_selector("Pasta para gráficos", "plots", is_dir=True)
-            self._add_path_selector("Relatório PDF da validação", "report", is_file=True, defaultextension=".pdf")
             self._add_pedestrian_filter_selector()
         elif action == "Avaliar SSD":
             if algorithm != "SSD":
@@ -379,32 +375,6 @@ class DetectorApp(tk.Tk):
                 def run_action() -> OperationResult:
                     return self.controller.execute_infer(
                         algorithm_key, images, weights, report, pedestrian_only, prompt_logger
-                    )
-
-            elif action == "Validar":
-                dataset_selection = Path(self.path_vars["images"].get())
-                weights_raw = self.path_vars["validation_weights"].get().strip()
-                weights = Path(weights_raw) if weights_raw else None
-                plots = Path(self.path_vars["plots"].get())
-                report = Path(self.path_vars["report"].get())
-                pedestrian_only = bool(self.pedestrian_only_var.get())
-                prompt_logger(
-                    self._build_prompt_command(
-                        "validar",
-                        algorithm_key,
-                        {
-                            "imagens": dataset_selection,
-                            "pesos": weights or "padrão",
-                            "graficos": plots,
-                            "relatorio": report,
-                            "apenas_pedestrian": pedestrian_only,
-                        },
-                    )
-                )
-
-                def run_action() -> OperationResult:
-                    return self.controller.execute_validate(
-                        algorithm_key, dataset_selection, weights, report, plots, pedestrian_only, prompt_logger
                     )
 
             elif action == "Avaliar SSD":

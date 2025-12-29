@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from datetime import datetime
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -19,6 +20,11 @@ from app.detectors.utils import resolve_device, validate_voc_dataset
 
 
 _PREDICTION_KEYS = ("boxes", "scores", "labels")
+
+
+def ssd_collate_fn(batch: Sequence[tuple[torch.Tensor, dict]]) -> tuple[list[torch.Tensor], list[dict]]:
+    images, targets = zip(*batch)
+    return list(images), list(targets)
 
 
 def _load_split_ids(dataset_root: Path, split: str, fallback_ids: Sequence[str]) -> List[str]:
@@ -112,7 +118,7 @@ def evaluate_torchvision_ssd_voc(
 
     transform = transforms.Compose([transforms.ToTensor()])
     dataset = PascalVOCDataset(dataset_root, available_ids[split_normalized], {"human": 1}, transforms=transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=lambda x: tuple(zip(*x)))
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=ssd_collate_fn)
 
     model = build_ssd(num_classes=2)
     state_dict = torch.load(Path(weights_path), map_location=torch_device)
@@ -123,8 +129,18 @@ def evaluate_torchvision_ssd_voc(
     metric = MeanAveragePrecision(iou_type="bbox")
     counters = {"tp": 0, "fp": 0, "fn": 0}
 
+    total_batches = len(dataloader)
+    log_interval = max(1, total_batches // 10)
+
+    if logger:
+        logger(
+            f"[EVAL][SSD] Configuração de DataLoader: batch_size={batch_size}, num_workers={num_workers}, total_de_lotes={total_batches}"
+        )
+        if os.name == "nt" and num_workers > 0:
+            logger("[EVAL][SSD] Ambiente Windows detectado: usando funções globais compatíveis com multiprocessing.")
+
     with torch.no_grad():
-        for images, targets in dataloader:
+        for batch_idx, (images, targets) in enumerate(dataloader, start=1):
             images_device = [img.to(torch_device) for img in images]
             outputs = model(images_device)
             for output, target in zip(outputs, targets):
@@ -134,6 +150,12 @@ def evaluate_torchvision_ssd_voc(
                 pr_counts = _update_pr_counters(preds, tgt, iou_threshold)
                 for key in counters:
                     counters[key] += pr_counts[key]
+
+            if logger and (batch_idx % log_interval == 0 or batch_idx == total_batches):
+                processed_images = min(batch_idx * batch_size, len(dataset))
+                logger(
+                    f"[EVAL][SSD] Processados {batch_idx}/{total_batches} lotes, cobrindo aproximadamente {processed_images} imagens"
+                )
 
     metric_result = metric.compute()
     precision = counters["tp"] / (counters["tp"] + counters["fp"] + 1e-8) if (counters["tp"] + counters["fp"]) > 0 else 0.0
