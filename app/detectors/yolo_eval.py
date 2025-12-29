@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+import torch
 from ultralytics import YOLO
 
 from app.detectors.base import Logger
@@ -18,7 +19,7 @@ def evaluate_yolo(
     split: str = "val",
     imgsz: int = 640,
     batch: int = 16,
-    device: str = "0",
+    device: str = "cpu",
     conf: float = 0.001,
     iou: float = 0.6,
     logger: Optional[Logger] = None,
@@ -42,11 +43,19 @@ def evaluate_yolo(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    torch_cuda_available = torch.cuda.is_available()
+    if not device:
+        device = "cpu"
+    device = str(device)
+    if (device.isdigit() or device.startswith("cuda")) and not torch_cuda_available:
+        device = "cpu"
+
     _emit("[EVAL][YOLO] Iniciando avaliação via Ultralytics API")
     _emit(
         f"[EVAL][YOLO] Parâmetros: data={data_path}, weights={weights}, out_dir={output_dir}, split={split}, "
         f"imgsz={imgsz}, batch={batch}, device={device}, conf={conf}, iou={iou}"
     )
+    _emit(f"[EVAL] device selecionado: {device} | cuda_available={torch_cuda_available}")
 
     model = YOLO(str(weights))
     _emit("[EVAL][YOLO] Executando model.val()...")
@@ -55,7 +64,7 @@ def evaluate_yolo(
         split=split,
         imgsz=imgsz,
         batch=batch,
-        device=device,
+        device=str(device),
         conf=conf,
         iou=iou,
         project=str(output_dir),

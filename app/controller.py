@@ -167,7 +167,7 @@ class ExperimentController:
         split: str = "val",
         imgsz: int = 640,
         batch: int = 16,
-        device: str = "0",
+        device: str = "cpu",
         conf: float = 0.001,
         iou: float = 0.6,
         logger: Optional[Logger] = None,
