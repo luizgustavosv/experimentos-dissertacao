@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+import csv
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
+
+import torch
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.ops import box_iou
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+
+from app.detectors.base import Logger
+from app.detectors.dataset_voc import PascalVOCDataset
+from app.detectors.torchvision_models import build_ssd
+from app.detectors.utils import resolve_device, validate_voc_dataset
+
+
+_PREDICTION_KEYS = ("boxes", "scores", "labels")
+
+
+def _load_split_ids(dataset_root: Path, split: str, fallback_ids: Sequence[str]) -> List[str]:
+    imagesets_dir = dataset_root / "ImageSets" / "Main"
+    split_file = imagesets_dir / f"{split}.txt"
+    if split_file.exists():
+        return [line.strip() for line in split_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return list(fallback_ids)
+
+
+def _filter_predictions(output: Dict[str, torch.Tensor], threshold: float) -> Dict[str, torch.Tensor]:
+    keep = output.get("scores", torch.tensor([])) >= threshold
+    filtered = {key: output.get(key, torch.empty((0,), device=output.get("scores", torch.tensor([])).device)) for key in _PREDICTION_KEYS}
+    return {k: v[keep].detach().cpu() if v.numel() > 0 else torch.zeros_like(v.detach().cpu()) for k, v in filtered.items()}
+
+
+def _prepare_target(target: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {
+        "boxes": target.get("boxes", torch.zeros((0, 4), dtype=torch.float32)).detach().cpu().float(),
+        "labels": target.get("labels", torch.zeros((0,), dtype=torch.int64)).detach().cpu().long(),
+    }
+
+
+def _update_pr_counters(
+    preds: Dict[str, torch.Tensor],
+    target: Dict[str, torch.Tensor],
+    iou_threshold: float,
+) -> Dict[str, int]:
+    tp = fp = fn = 0
+    pred_boxes = preds["boxes"].float()
+    pred_scores = preds["scores"].float()
+    pred_labels = preds["labels"].long()
+    gt_boxes = target["boxes"].float()
+    gt_labels = target["labels"].long()
+
+    if pred_scores.numel() > 0:
+        order = torch.argsort(pred_scores, descending=True)
+        pred_boxes = pred_boxes[order]
+        pred_labels = pred_labels[order]
+
+    matched = torch.zeros(gt_boxes.shape[0], dtype=torch.bool)
+    for box, label in zip(pred_boxes, pred_labels):
+        if label.item() != 1:
+            continue
+        if gt_boxes.numel() == 0:
+            fp += 1
+            continue
+        ious = box_iou(box.unsqueeze(0), gt_boxes).squeeze(0)
+        max_iou, max_idx = (ious.max(0) if ious.numel() > 0 else (torch.tensor(0.0), torch.tensor(0)))
+        if max_iou >= iou_threshold and not matched[max_idx] and gt_labels[max_idx] == 1:
+            tp += 1
+            matched[max_idx] = True
+        else:
+            fp += 1
+
+    positives = int((gt_labels == 1).sum().item())
+    matched_count = int(matched.sum().item())
+    fn += max(0, positives - matched_count)
+    return {"tp": tp, "fp": fp, "fn": fn}
+
+
+def evaluate_torchvision_ssd_voc(
+    voc_root: str,
+    weights_path: str,
+    split: str = "val",
+    device: Optional[str] = None,
+    batch_size: int = 1,
+    num_workers: int = 2,
+    conf_threshold: float = 0.05,
+    iou_threshold: float = 0.5,
+    out_dir: Optional[str] = None,
+    logger: Optional[Logger] = None,
+) -> dict:
+    dataset_root, class_names, train_ids, val_ids = validate_voc_dataset(Path(voc_root))
+    split_normalized = split.lower().strip()
+    available_ids = {
+        "train": train_ids,
+        "val": val_ids,
+        "test": _load_split_ids(dataset_root, "test", val_ids),
+    }
+    if split_normalized not in available_ids:
+        raise ValueError(f"Split desconhecido: {split}. Opções válidas: train, val, test.")
+
+    device_str = resolve_device(device)
+    torch_device = torch.device(device_str)
+
+    if logger:
+        logger(f"[EVAL][SSD] Usando dispositivo {device_str}")
+        logger(f"[EVAL][SSD] Raiz do dataset: {dataset_root}")
+        logger(f"[EVAL][SSD] Split: {split_normalized} ({len(available_ids[split_normalized])} imagens)")
+
+    transform = transforms.Compose([transforms.ToTensor()])
+    dataset = PascalVOCDataset(dataset_root, available_ids[split_normalized], {"human": 1}, transforms=transform)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=lambda x: tuple(zip(*x)))
+
+    model = build_ssd(num_classes=2)
+    state_dict = torch.load(Path(weights_path), map_location=torch_device)
+    model.load_state_dict(state_dict)
+    model.to(torch_device)
+    model.eval()
+
+    metric = MeanAveragePrecision(iou_type="bbox")
+    counters = {"tp": 0, "fp": 0, "fn": 0}
+
+    with torch.no_grad():
+        for images, targets in dataloader:
+            images_device = [img.to(torch_device) for img in images]
+            outputs = model(images_device)
+            for output, target in zip(outputs, targets):
+                preds = _filter_predictions(output, conf_threshold)
+                tgt = _prepare_target(target)
+                metric.update([preds], [tgt])
+                pr_counts = _update_pr_counters(preds, tgt, iou_threshold)
+                for key in counters:
+                    counters[key] += pr_counts[key]
+
+    metric_result = metric.compute()
+    precision = counters["tp"] / (counters["tp"] + counters["fp"] + 1e-8) if (counters["tp"] + counters["fp"]) > 0 else 0.0
+    recall = counters["tp"] / (counters["tp"] + counters["fn"] + 1e-8) if (counters["tp"] + counters["fn"]) > 0 else 0.0
+
+    result = {
+        "map": float(metric_result.get("map", torch.tensor(0.0)).item()),
+        "map50": float(metric_result.get("map_50", torch.tensor(0.0)).item()),
+        "mar_100": float(metric_result.get("mar_100", torch.tensor(0.0)).item()),
+        "precision": float(precision),
+        "recall": float(recall),
+        "conf_threshold": float(conf_threshold),
+        "iou_threshold": float(iou_threshold),
+        "split": split_normalized,
+        "weights_path": str(Path(weights_path).expanduser().resolve()),
+        "timestamp": datetime.now().isoformat(),
+        "device": device_str,
+        "num_images": len(dataset),
+        "classes": class_names,
+    }
+
+    output_dir = Path(out_dir) if out_dir else Path(weights_path).expanduser().resolve().parent / "eval"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "metrics.json"
+    csv_path = output_dir / "metrics.csv"
+
+    json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    csv_fields = ["timestamp", "split", "map", "map50", "mar_100", "precision", "recall", "conf_threshold", "iou_threshold", "weights_path", "num_images", "device"]
+    with csv_path.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=csv_fields)
+        writer.writeheader()
+        writer.writerow({field: result.get(field, "") for field in csv_fields})
+
+    if logger:
+        logger(f"[EVAL][SSD] Resultado salvo em {output_dir}")
+        logger(
+            f"[EVAL][SSD] mAP@0.5:0.95={result['map']:.4f} | mAP@0.5={result['map50']:.4f} | Precision={result['precision']:.4f} | Recall={result['recall']:.4f}"
+        )
+
+    return result

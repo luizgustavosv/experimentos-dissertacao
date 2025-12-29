@@ -43,9 +43,15 @@ class DetectorApp(tk.Tk):
             "report": tk.StringVar(),
             "plots": tk.StringVar(),
             "normalized": tk.StringVar(),
+            "eval_dataset": tk.StringVar(),
+            "eval_weights": tk.StringVar(),
+            "eval_out": tk.StringVar(),
         }
         self.epochs_var = tk.IntVar(value=10)
         self.pedestrian_only_var = tk.BooleanVar(value=False)
+        self.eval_split_var = tk.StringVar(value="val")
+        self.conf_threshold_var = tk.DoubleVar(value=0.05)
+        self.iou_threshold_var = tk.DoubleVar(value=0.5)
 
         self._build_header()
         self._build_forms()
@@ -100,7 +106,7 @@ class DetectorApp(tk.Tk):
         action_combo = ttk.Combobox(
             action_frame,
             textvariable=self.action_var,
-            values=["Treinar", "Inferir", "Validar", "Normalizar dataset"],
+            values=["Treinar", "Inferir", "Validar", "Avaliar SSD", "Normalizar dataset"],
             state="readonly",
             width=25,
         )
@@ -156,6 +162,22 @@ class DetectorApp(tk.Tk):
             self._add_path_selector("Pasta para gráficos", "plots", is_dir=True)
             self._add_path_selector("Relatório PDF da validação", "report", is_file=True, defaultextension=".pdf")
             self._add_pedestrian_filter_selector()
+        elif action == "Avaliar SSD":
+            if algorithm != "SSD":
+                tk.Label(
+                    self.dynamic_frame,
+                    text="A avaliação pós-treinamento está disponível apenas para o algoritmo SSD.",
+                    bg="#12233d",
+                    fg="white",
+                    wraplength=760,
+                ).pack(fill="x", padx=10, pady=6)
+            else:
+                self._add_path_selector("Pasta do dataset Pascal VOC", "eval_dataset", is_dir=True)
+                self._add_path_selector("Pesos do SSD", "eval_weights", filetypes=get_weights_filetypes(algorithm))
+                self._add_path_selector("Pasta para salvar métricas", "eval_out", is_dir=True)
+                self._add_split_selector()
+                self._add_conf_threshold_selector()
+                self._add_iou_threshold_selector()
         elif action == "Normalizar dataset":
             self._add_dataset_type_selector()
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
@@ -197,6 +219,27 @@ class DetectorApp(tk.Tk):
         tk.Label(frame, text="Tipo de dataset", bg="#12233d", fg="white").pack(anchor="w")
         combo = ttk.Combobox(frame, textvariable=self.dataset_type_var, values=["HERIDAL", "VisDrone"], state="readonly", width=30)
         combo.pack(anchor="w")
+
+    def _add_split_selector(self) -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        tk.Label(frame, text="Split para avaliação (VOC)", bg="#12233d", fg="white").pack(anchor="w")
+        combo = ttk.Combobox(frame, textvariable=self.eval_split_var, values=["train", "val", "test"], state="readonly", width=20)
+        combo.pack(anchor="w")
+
+    def _add_conf_threshold_selector(self) -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        tk.Label(frame, text="Limite de confiança (score)", bg="#12233d", fg="white").pack(anchor="w")
+        spinbox = tk.Spinbox(frame, from_=0.0, to=1.0, increment=0.01, textvariable=self.conf_threshold_var, width=8)
+        spinbox.pack(anchor="w")
+
+    def _add_iou_threshold_selector(self) -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        tk.Label(frame, text="Limite de IoU para precision/recall", bg="#12233d", fg="white").pack(anchor="w")
+        spinbox = tk.Spinbox(frame, from_=0.1, to=1.0, increment=0.05, textvariable=self.iou_threshold_var, width=8)
+        spinbox.pack(anchor="w")
 
     def _add_epoch_selector(self) -> None:
         frame = tk.Frame(self.dynamic_frame, bg="#12233d")
@@ -362,6 +405,34 @@ class DetectorApp(tk.Tk):
                 def run_action() -> OperationResult:
                     return self.controller.execute_validate(
                         algorithm_key, dataset_selection, weights, report, plots, pedestrian_only, prompt_logger
+                    )
+
+            elif action == "Avaliar SSD":
+                if algorithm_key != "SSD":
+                    raise ValueError("Selecione o algoritmo SSD para executar a avaliação dedicada.")
+                dataset_dir = Path(self.path_vars["eval_dataset"].get())
+                weights = Path(self.path_vars["eval_weights"].get())
+                out_dir_raw = self.path_vars["eval_out"].get().strip()
+                out_dir = Path(out_dir_raw) if out_dir_raw else None
+                split = self.eval_split_var.get().strip() or "val"
+                conf_threshold = float(self.conf_threshold_var.get())
+                iou_threshold = float(self.iou_threshold_var.get())
+                prompt_logger(
+                    self._build_prompt_command(
+                        "avaliar", algorithm_key, {"dataset": dataset_dir, "pesos": weights, "split": split, "saida": out_dir or "padrão"}
+                    )
+                )
+
+                def run_action() -> OperationResult:
+                    return self.controller.execute_eval_ssd(
+                        algorithm_key,
+                        dataset_dir=dataset_dir,
+                        weights_path=weights,
+                        split=split,
+                        out_dir=out_dir,
+                        conf_threshold=conf_threshold,
+                        iou_threshold=iou_threshold,
+                        logger=prompt_logger,
                     )
 
             elif action == "Normalizar dataset":

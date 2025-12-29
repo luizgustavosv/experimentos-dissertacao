@@ -8,3 +8,4 @@ pytest
 opencv-python-headless
 pyyaml
 numpy>=1.26,<2
+torchmetrics
