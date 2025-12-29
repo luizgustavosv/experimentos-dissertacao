@@ -106,24 +106,40 @@ class DetectorApp(tk.Tk):
 
         action_frame = tk.LabelFrame(container, text="Ação", bg="#12233d", fg="white")
         action_frame.pack(fill="x", pady=5)
+        action_frame.columnconfigure(0, weight=1)
+
+        action_row = ttk.Frame(action_frame, padding=(8, 6))
+        action_row.grid(row=0, column=0, sticky="ew")
+        action_row.columnconfigure(0, weight=1)
+        action_row.columnconfigure(1, weight=0)
+
         action_combo = ttk.Combobox(
-            action_frame,
+            action_row,
             textvariable=self.action_var,
             values=["Treinar", "Inferir", "Avaliar SSD", "Normalizar dataset"],
             state="readonly",
             width=25,
         )
-        action_combo.pack(padx=10, pady=10)
+        action_combo.grid(row=0, column=0, sticky="ew")
         action_combo.bind("<<ComboboxSelected>>", lambda _: self._render_fields())
+
+        if hasattr(self, "btn_execute"):
+            self.btn_execute.destroy()
+        self.btn_execute = tk.Button(
+            action_row,
+            text="Executar",
+            textvariable=self.run_button_text,
+            command=self.on_execute_clicked,
+            relief="raised",
+            bd=2,
+            padx=14,
+            pady=6,
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.btn_execute.grid(row=0, column=1, sticky="e", padx=(12, 0))
 
         self.dynamic_frame = tk.LabelFrame(container, text="Parâmetros", bg="#12233d", fg="white")
         self.dynamic_frame.pack(fill="x", pady=5)
-
-        self.style.configure("Run.TButton", padding=(10, 6), font=("Helvetica", 11, "bold"))
-        self.run_button = ttk.Button(
-            container, textvariable=self.run_button_text, command=self.on_execute_clicked, style="Run.TButton", width=18
-        )
-        self.run_button.pack(pady=10)
 
     def _build_log_area(self) -> None:
         log_frame = tk.LabelFrame(self, text="Log de execução", bg="#12233d", fg="white")
@@ -341,12 +357,14 @@ class DetectorApp(tk.Tk):
         else:
             self.run_button_text.set("Executar")
 
-    def _emit_gui(self, message: str) -> None:
-        print(message, flush=True)
+    def _emit_gui(self, message: str, *, stdout: bool = True) -> None:
+        if stdout:
+            print(message, flush=True)
         self.after(0, self.append_log, message)
 
     def on_execute_clicked(self) -> None:
-        self._emit_gui("[UI] Clique em Executar recebido.")
+        print("[UI] Clique em Executar recebido.", flush=True)
+        self._emit_gui("[UI] Clique em Executar recebido.", stdout=False)
         if self.action_var.get() == "Avaliar SSD":
             self._execute_eval_ssd()
         else:
@@ -567,9 +585,9 @@ class DetectorApp(tk.Tk):
 
     def _set_running(self, running: bool) -> None:
         if running:
-            self.run_button.state(["disabled"])
+            self.btn_execute.config(state=tk.DISABLED)
         else:
-            self.run_button.state(["!disabled"])
+            self.btn_execute.config(state=tk.NORMAL)
         self.update_idletasks()
 
 
