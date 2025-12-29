@@ -5,7 +5,8 @@ import json
 from datetime import datetime
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+import time
+from typing import Callable, Dict, List, Optional, Sequence
 
 import torch
 from torch.utils.data import DataLoader
@@ -97,6 +98,8 @@ def evaluate_torchvision_ssd_voc(
     iou_threshold: float = 0.5,
     out_dir: Optional[str] = None,
     logger: Optional[Logger] = None,
+    log_cb: Optional[Callable[[str], None]] = None,
+    progress_every: int = 50,
 ) -> dict:
     dataset_root, class_names, train_ids, val_ids = validate_voc_dataset(Path(voc_root))
     split_normalized = split.lower().strip()
@@ -111,13 +114,24 @@ def evaluate_torchvision_ssd_voc(
     device_str = resolve_device(device)
     torch_device = torch.device(device_str)
 
-    if logger:
-        logger(f"[EVAL][SSD] Usando dispositivo {device_str}")
-        logger(f"[EVAL][SSD] Raiz do dataset: {dataset_root}")
-        logger(f"[EVAL][SSD] Split: {split_normalized} ({len(available_ids[split_normalized])} imagens)")
+    def _emit(message: str) -> None:
+        print(message, flush=True)
+        if log_cb:
+            log_cb(message)
+        if logger:
+            logger(message)
+
+    _emit("[EVAL] Iniciando avaliação SSD")
+    _emit(
+        f"[EVAL] Parâmetros: voc_root={dataset_root}, weights={weights_path}, split={split_normalized}, conf_threshold={conf_threshold}, "
+        f"iou_threshold={iou_threshold}, device={device_str}, num_workers={num_workers}, out_dir={out_dir or 'padrão'}"
+    )
+
+    progress_every = max(1, progress_every)
 
     transform = transforms.Compose([transforms.ToTensor()])
     dataset = PascalVOCDataset(dataset_root, available_ids[split_normalized], {"human": 1}, transforms=transform)
+    _emit(f"[EVAL] Total de imagens no split '{split_normalized}': {len(dataset)}")
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=ssd_collate_fn)
 
     model = build_ssd(num_classes=2)
@@ -130,15 +144,14 @@ def evaluate_torchvision_ssd_voc(
     counters = {"tp": 0, "fp": 0, "fn": 0}
 
     total_batches = len(dataloader)
-    log_interval = max(1, total_batches // 10)
 
-    if logger:
-        logger(
-            f"[EVAL][SSD] Configuração de DataLoader: batch_size={batch_size}, num_workers={num_workers}, total_de_lotes={total_batches}"
-        )
-        if os.name == "nt" and num_workers > 0:
-            logger("[EVAL][SSD] Ambiente Windows detectado: usando funções globais compatíveis com multiprocessing.")
+    _emit(
+        f"[EVAL] Configuração de DataLoader: batch_size={batch_size}, num_workers={num_workers}, total_de_lotes={total_batches}"
+    )
+    if os.name == "nt" and num_workers > 0:
+        _emit("[EVAL] Ambiente Windows detectado: usando funções globais compatíveis com multiprocessing.")
 
+    start_time = time.time()
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(dataloader, start=1):
             images_device = [img.to(torch_device) for img in images]
@@ -151,10 +164,14 @@ def evaluate_torchvision_ssd_voc(
                 for key in counters:
                     counters[key] += pr_counts[key]
 
-            if logger and (batch_idx % log_interval == 0 or batch_idx == total_batches):
-                processed_images = min(batch_idx * batch_size, len(dataset))
-                logger(
-                    f"[EVAL][SSD] Processados {batch_idx}/{total_batches} lotes, cobrindo aproximadamente {processed_images} imagens"
+            processed_images = min(batch_idx * batch_size, len(dataset))
+            if processed_images % progress_every == 0 or batch_idx == total_batches:
+                elapsed = time.time() - start_time
+                rate = processed_images / elapsed if elapsed > 0 else 0.0
+                remaining = max(len(dataset) - processed_images, 0)
+                eta = remaining / rate if rate > 0 else float("inf")
+                _emit(
+                    f"[EVAL] {processed_images}/{len(dataset)} | {rate:.2f} img/s | elapsed {elapsed:.1f}s | ETA {eta:.1f}s"
                 )
 
     metric_result = metric.compute()
@@ -190,10 +207,9 @@ def evaluate_torchvision_ssd_voc(
         writer.writeheader()
         writer.writerow({field: result.get(field, "") for field in csv_fields})
 
-    if logger:
-        logger(f"[EVAL][SSD] Resultado salvo em {output_dir}")
-        logger(
-            f"[EVAL][SSD] mAP@0.5:0.95={result['map']:.4f} | mAP@0.5={result['map50']:.4f} | Precision={result['precision']:.4f} | Recall={result['recall']:.4f}"
-        )
+    _emit(f"[EVAL] Resultado salvo em {output_dir}")
+    _emit(
+        f"[EVAL] mAP@0.5:0.95={result['map']:.4f} | mAP@0.5={result['map50']:.4f} | Precision={result['precision']:.4f} | Recall={result['recall']:.4f}"
+    )
 
     return result
