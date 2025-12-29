@@ -52,6 +52,8 @@ class DetectorApp(tk.Tk):
         self.eval_split_var = tk.StringVar(value="val")
         self.conf_threshold_var = tk.DoubleVar(value=0.05)
         self.iou_threshold_var = tk.DoubleVar(value=0.5)
+        self.run_button_text = tk.StringVar(value="Executar")
+        self._variable_traces: list[tuple[tk.Variable, str]] = []
 
         self._build_header()
         self._build_forms()
@@ -117,7 +119,9 @@ class DetectorApp(tk.Tk):
         self.dynamic_frame.pack(fill="x", pady=5)
 
         self.style.configure("Run.TButton", padding=(14, 10), font=("Helvetica", 11, "bold"))
-        self.run_button = ttk.Button(container, text="Executar", command=self._execute_action, style="Run.TButton")
+        self.run_button = ttk.Button(
+            container, textvariable=self.run_button_text, command=self._execute_action, style="Run.TButton"
+        )
         self.run_button.configure(width=18)
         self.run_button.pack(pady=10)
 
@@ -130,6 +134,12 @@ class DetectorApp(tk.Tk):
     def _clear_dynamic(self) -> None:
         for widget in self.dynamic_frame.winfo_children():
             widget.destroy()
+        self._clear_variable_traces()
+
+    def _clear_variable_traces(self) -> None:
+        for var, trace_id in self._variable_traces:
+            var.trace_remove("write", trace_id)
+        self._variable_traces.clear()
 
     def _render_fields(self) -> None:
         self._clear_dynamic()
@@ -174,10 +184,13 @@ class DetectorApp(tk.Tk):
                 self._add_split_selector()
                 self._add_conf_threshold_selector()
                 self._add_iou_threshold_selector()
+                self._register_eval_traces()
         elif action == "Normalizar dataset":
             self._add_dataset_type_selector()
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
             self._add_path_selector("Destino do dataset normalizado", "normalized", is_dir=True)
+
+        self._update_run_button_text()
 
     def _add_path_selector(
         self,
@@ -237,6 +250,20 @@ class DetectorApp(tk.Tk):
         spinbox = tk.Spinbox(frame, from_=0.1, to=1.0, increment=0.05, textvariable=self.iou_threshold_var, width=8)
         spinbox.pack(anchor="w")
 
+    def _register_eval_traces(self) -> None:
+        variables: list[tk.Variable] = [
+            self.path_vars["eval_dataset"],
+            self.path_vars["eval_weights"],
+            self.path_vars["eval_out"],
+            self.eval_split_var,
+            self.conf_threshold_var,
+            self.iou_threshold_var,
+        ]
+
+        for var in variables:
+            trace_id = var.trace_add("write", self._update_run_button_text)
+            self._variable_traces.append((var, trace_id))
+
     def _add_epoch_selector(self) -> None:
         frame = tk.Frame(self.dynamic_frame, bg="#12233d")
         frame.pack(fill="x", padx=10, pady=6)
@@ -292,6 +319,27 @@ class DetectorApp(tk.Tk):
                 value_to_append = value
             parts.append(f"{key}={value_to_append}")
         return "$ " + " ".join(str(part) for part in parts)
+
+    def _update_run_button_text(self, *_args: object) -> None:
+        action = self.action_var.get()
+        algorithm = self.algorithm_var.get()
+
+        if action == "Avaliar SSD" and algorithm == "SSD":
+            dataset_raw = self.path_vars["eval_dataset"].get().strip()
+            weights_raw = self.path_vars["eval_weights"].get().strip()
+            out_dir_raw = self.path_vars["eval_out"].get().strip()
+
+            args: dict[str, object] = {
+                "dataset": Path(dataset_raw) if dataset_raw else None,
+                "pesos": Path(weights_raw) if weights_raw else None,
+                "split": self.eval_split_var.get(),
+                "saida": Path(out_dir_raw) if out_dir_raw else None,
+                "conf": float(self.conf_threshold_var.get()),
+                "iou": float(self.iou_threshold_var.get()),
+            }
+            self.run_button_text.set(self._build_prompt_command("avaliar", algorithm, args))
+        else:
+            self.run_button_text.set("Executar")
 
     def _execute_action(self) -> None:
         if self._worker_thread and self._worker_thread.is_alive():
