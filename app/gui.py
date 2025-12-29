@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
+import traceback
 from pathlib import Path
 from queue import Queue
 from threading import Thread
@@ -118,11 +119,10 @@ class DetectorApp(tk.Tk):
         self.dynamic_frame = tk.LabelFrame(container, text="Parâmetros", bg="#12233d", fg="white")
         self.dynamic_frame.pack(fill="x", pady=5)
 
-        self.style.configure("Run.TButton", padding=(14, 10), font=("Helvetica", 11, "bold"))
+        self.style.configure("Run.TButton", padding=(10, 6), font=("Helvetica", 11, "bold"))
         self.run_button = ttk.Button(
-            container, textvariable=self.run_button_text, command=self._execute_action, style="Run.TButton"
+            container, textvariable=self.run_button_text, command=self.on_execute_clicked, style="Run.TButton", width=18
         )
-        self.run_button.configure(width=18)
         self.run_button.pack(pady=10)
 
     def _build_log_area(self) -> None:
@@ -291,7 +291,7 @@ class DetectorApp(tk.Tk):
         )
         check.pack(anchor="w")
 
-    def _append_log(self, message: str) -> None:
+    def append_log(self, message: str) -> None:
         self.log_widget.insert("end", message + "\n")
         self.log_widget.see("end")
 
@@ -300,7 +300,7 @@ class DetectorApp(tk.Tk):
 
     def _poll_log_queue(self) -> None:
         while not self.log_queue.empty():
-            self._append_log(self.log_queue.get())
+            self.append_log(self.log_queue.get())
         self.after(100, self._poll_log_queue)
 
     def _build_prompt_command(self, action: str, algorithm: str, args: dict[str, object]) -> str:
@@ -340,6 +340,17 @@ class DetectorApp(tk.Tk):
             self.run_button_text.set(self._build_prompt_command("avaliar", algorithm, args))
         else:
             self.run_button_text.set("Executar")
+
+    def _emit_gui(self, message: str) -> None:
+        print(message, flush=True)
+        self.after(0, self.append_log, message)
+
+    def on_execute_clicked(self) -> None:
+        self._emit_gui("[UI] Clique em Executar recebido.")
+        if self.action_var.get() == "Avaliar SSD":
+            self._execute_eval_ssd()
+        else:
+            self._execute_action()
 
     def _execute_action(self) -> None:
         if self._worker_thread and self._worker_thread.is_alive():
@@ -474,7 +485,7 @@ class DetectorApp(tk.Tk):
                 raise ValueError("Ação desconhecida")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Erro", str(exc))
-            self._append_log(f"Erro: {exc}")
+            self.append_log(f"Erro: {exc}")
             return
 
         self._set_running(True)
@@ -491,24 +502,67 @@ class DetectorApp(tk.Tk):
         self._worker_thread = Thread(target=worker, daemon=True)
         self._worker_thread.start()
 
+    def _execute_eval_ssd(self) -> None:
+        if self._worker_thread and self._worker_thread.is_alive():
+            messagebox.showinfo("Em execução", "Aguarde o término do comando atual antes de iniciar outro.")
+            return
+
+        algorithm_key = self.algorithm_var.get()
+        if algorithm_key != "SSD":
+            messagebox.showerror("Erro", "Selecione o algoritmo SSD para executar a avaliação dedicada.")
+            return
+
+        dataset_dir = Path(self.path_vars["eval_dataset"].get())
+        weights = Path(self.path_vars["eval_weights"].get())
+        out_dir_raw = self.path_vars["eval_out"].get().strip()
+        out_dir = Path(out_dir_raw) if out_dir_raw else None
+        split = self.eval_split_var.get().strip() or "val"
+        conf_threshold = float(self.conf_threshold_var.get())
+        iou_threshold = float(self.iou_threshold_var.get())
+
+        self._set_running(True)
+        self._emit_gui("[EVAL] Preparando dataloader...")
+
+        def worker() -> None:
+            try:
+                result = self.controller.execute_eval_ssd(
+                    algorithm_key,
+                    dataset_dir=dataset_dir,
+                    weights_path=weights,
+                    split=split,
+                    out_dir=out_dir,
+                    conf_threshold=conf_threshold,
+                    iou_threshold=iou_threshold,
+                    logger=None,
+                    log_cb=self._emit_gui,
+                )
+                self.after(0, self._on_action_complete, result)
+            except Exception as exc:  # noqa: BLE001
+                tb = traceback.format_exc()
+                self._emit_gui(tb)
+                self.after(0, self._on_action_error, exc)
+
+        self._worker_thread = Thread(target=worker, daemon=True)
+        self._worker_thread.start()
+
     def _on_action_complete(self, result: OperationResult) -> None:
         if result.inference_performance:
             perf = result.inference_performance
-            self._append_log(
+            self.append_log(
                 f"Latência → {perf.images_per_second:.2f} img/s ({perf.milliseconds_per_image:.2f} ms/imagem)"
             )
         elif result.metrics:
             m = result.metrics
-            self._append_log(
+            self.append_log(
                 f"Métricas → Precisão: {m.precision:.3f}, Recall: {m.recall:.3f}, mAP@0.50: {m.map50:.3f}, mAP@0.50:0.95: {m.map50_95:.3f}"
             )
-        self._append_log(result.message)
+        self.append_log(result.message)
         self._set_running(False)
         messagebox.showinfo("Concluído", result.message)
 
     def _on_action_error(self, exc: Exception) -> None:
         self._set_running(False)
-        self._append_log(f"Erro: {exc}")
+        self.append_log(f"Erro: {exc}")
         messagebox.showerror("Erro", str(exc))
 
     def _set_running(self, running: bool) -> None:

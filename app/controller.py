@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from app.detectors import load_detectors
 from app.detectors.base import DetectionAlgorithm, Logger
@@ -123,6 +123,7 @@ class ExperimentController:
         batch_size: int = 1,
         num_workers: int = 2,
         logger: Optional[Logger] = None,
+        log_cb: Optional[Callable[[str], None]] = None,
     ) -> OperationResult:
         if algorithm_key != "SSD":
             raise ValueError("A avaliação dedicada está disponível apenas para SSD.")
@@ -138,6 +139,7 @@ class ExperimentController:
             iou_threshold=iou_threshold,
             out_dir=str(out_dir) if out_dir else None,
             logger=logger,
+            log_cb=log_cb,
         )
 
         metrics = Metrics(
