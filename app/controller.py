@@ -7,6 +7,7 @@ from typing import Dict, Optional
 
 from app.detectors import load_detectors
 from app.detectors.base import DetectionAlgorithm, Logger
+from app.detectors.torchvision_eval import evaluate_torchvision_ssd_voc
 from app.metrics import InferencePerformance, Metrics
 
 
@@ -109,6 +110,50 @@ class ExperimentController:
         detector = self._get_detector(algorithm_key)
         detector.normalize_dataset(dataset_type, dataset_dir, normalized_dir, logger)
         return OperationResult(metrics=None, message="Normalização concluída.")
+
+    def execute_eval_ssd(
+        self,
+        algorithm_key: str,
+        dataset_dir: Path,
+        weights_path: Path,
+        split: str = "val",
+        out_dir: Optional[Path] = None,
+        conf_threshold: float = 0.05,
+        iou_threshold: float = 0.5,
+        batch_size: int = 1,
+        num_workers: int = 2,
+        logger: Optional[Logger] = None,
+    ) -> OperationResult:
+        if algorithm_key != "SSD":
+            raise ValueError("A avaliação dedicada está disponível apenas para SSD.")
+
+        voc_root = self._validate_voc_root(dataset_dir)
+        result = evaluate_torchvision_ssd_voc(
+            voc_root=str(voc_root),
+            weights_path=str(weights_path),
+            split=split,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            out_dir=str(out_dir) if out_dir else None,
+            logger=logger,
+        )
+
+        metrics = Metrics(
+            precision=float(result.get("precision", 0.0)),
+            recall=float(result.get("recall", 0.0)),
+            map50=float(result.get("map50", 0.0)),
+            map50_95=float(result.get("map", 0.0)),
+            device=result.get("device"),
+            weights_path=weights_path,
+            map_computed=True,
+            extra={"mar_100": float(result.get("mar_100", 0.0))},
+        )
+
+        output_dir = Path(out_dir) if out_dir else Path(result["weights_path"]).parent / "eval"
+        message = f"Avaliação concluída. Resultados salvos em {output_dir}"
+        return OperationResult(metrics=metrics, message=message)
 
     def _get_detector(self, algorithm_key: str) -> DetectionAlgorithm:
         if algorithm_key not in self.detectors:
