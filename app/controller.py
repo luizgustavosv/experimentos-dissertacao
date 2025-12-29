@@ -8,6 +8,7 @@ from typing import Callable, Dict, Optional
 from app.detectors import load_detectors
 from app.detectors.base import DetectionAlgorithm, Logger
 from app.detectors.torchvision_eval import evaluate_torchvision_ssd_voc
+from app.detectors.yolo_eval import evaluate_yolo
 from app.metrics import InferencePerformance, Metrics
 
 
@@ -156,6 +157,45 @@ class ExperimentController:
         output_dir = Path(out_dir) if out_dir else Path(result["weights_path"]).parent / "eval"
         message = f"Avaliação concluída. Resultados salvos em {output_dir}"
         return OperationResult(metrics=metrics, message=message)
+
+    def execute_eval_yolo(
+        self,
+        algorithm_key: str,
+        data_yaml: Path,
+        weights_path: Path,
+        out_dir: Path,
+        split: str = "val",
+        imgsz: int = 640,
+        batch: int = 16,
+        device: str = "0",
+        conf: float = 0.001,
+        iou: float = 0.6,
+        logger: Optional[Logger] = None,
+        log_cb: Optional[Callable[[str], None]] = None,
+    ) -> OperationResult:
+        if algorithm_key != "YOLO":
+            raise ValueError("A avaliação dedicada está disponível apenas para YOLO.")
+
+        data_yaml = data_yaml.expanduser().resolve()
+        weights_path = weights_path.expanduser().resolve()
+        out_dir = out_dir.expanduser().resolve()
+
+        result = evaluate_yolo(
+            data_yaml=str(data_yaml),
+            weights_path=str(weights_path),
+            out_dir=str(out_dir),
+            split=split,
+            imgsz=imgsz,
+            batch=batch,
+            device=device,
+            conf=conf,
+            iou=iou,
+            logger=logger,
+            log_cb=log_cb,
+        )
+
+        message = f"Avaliação concluída. Resultados salvos em {out_dir}"
+        return OperationResult(metrics=None, message=message)
 
     def _get_detector(self, algorithm_key: str) -> DetectionAlgorithm:
         if algorithm_key not in self.detectors:

@@ -47,12 +47,21 @@ class DetectorApp(tk.Tk):
             "eval_dataset": tk.StringVar(),
             "eval_weights": tk.StringVar(),
             "eval_out": tk.StringVar(),
+            "yolo_eval_dataset": tk.StringVar(),
+            "yolo_eval_weights": tk.StringVar(),
+            "yolo_eval_out": tk.StringVar(),
         }
         self.epochs_var = tk.IntVar(value=10)
         self.pedestrian_only_var = tk.BooleanVar(value=False)
         self.eval_split_var = tk.StringVar(value="val")
         self.conf_threshold_var = tk.DoubleVar(value=0.05)
         self.iou_threshold_var = tk.DoubleVar(value=0.5)
+        self.yolo_split_var = tk.StringVar(value="val")
+        self.yolo_conf_var = tk.DoubleVar(value=0.001)
+        self.yolo_iou_var = tk.DoubleVar(value=0.6)
+        self.yolo_imgsz_var = tk.IntVar(value=640)
+        self.yolo_batch_var = tk.IntVar(value=16)
+        self.yolo_device_var = tk.StringVar(value="0")
         self.run_button_text = tk.StringVar(value="Executar")
         self._variable_traces: list[tuple[tk.Variable, str]] = []
 
@@ -116,7 +125,7 @@ class DetectorApp(tk.Tk):
         action_combo = ttk.Combobox(
             action_row,
             textvariable=self.action_var,
-            values=["Treinar", "Inferir", "Avaliar SSD", "Normalizar dataset"],
+            values=["Treinar", "Inferir", "Avaliar SSD", "Avaliar YOLO", "Normalizar dataset"],
             state="readonly",
             width=25,
         )
@@ -201,6 +210,26 @@ class DetectorApp(tk.Tk):
                 self._add_conf_threshold_selector()
                 self._add_iou_threshold_selector()
                 self._register_eval_traces()
+        elif action == "Avaliar YOLO":
+            if algorithm != "YOLO":
+                tk.Label(
+                    self.dynamic_frame,
+                    text="A avaliação pós-treinamento está disponível apenas para o algoritmo YOLO.",
+                    bg="#12233d",
+                    fg="white",
+                    wraplength=760,
+                ).pack(fill="x", padx=10, pady=6)
+            else:
+                self._add_path_selector("Dataset (arquivo data.yaml)", "yolo_eval_dataset", filetypes=[("YAML", "*.yaml")])
+                self._add_path_selector("Pesos do YOLO (.pt)", "yolo_eval_weights", filetypes=get_weights_filetypes(algorithm))
+                self._add_path_selector("Pasta para salvar métricas", "yolo_eval_out", is_dir=True)
+                self._add_split_selector(variable=self.yolo_split_var, values=["val", "test"], label="Split para avaliação (YOLO)")
+                self._add_conf_threshold_selector(variable=self.yolo_conf_var, label="Limite de confiança (YOLO)")
+                self._add_iou_threshold_selector(variable=self.yolo_iou_var, label="Limite de IoU (YOLO)")
+                self._add_numeric_selector("Tamanho da imagem (imgsz)", self.yolo_imgsz_var)
+                self._add_numeric_selector("Tamanho do batch", self.yolo_batch_var)
+                self._add_text_selector("Dispositivo", self.yolo_device_var, placeholder="0 / cpu / cuda:0")
+                self._register_yolo_eval_traces()
         elif action == "Normalizar dataset":
             self._add_dataset_type_selector()
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
@@ -245,26 +274,48 @@ class DetectorApp(tk.Tk):
         combo = ttk.Combobox(frame, textvariable=self.dataset_type_var, values=["HERIDAL", "VisDrone"], state="readonly", width=30)
         combo.pack(anchor="w")
 
-    def _add_split_selector(self) -> None:
+    def _add_split_selector(self, variable: Optional[tk.Variable] = None, values: Optional[list[str]] = None, label: str = "Split para avaliação (VOC)") -> None:
         frame = tk.Frame(self.dynamic_frame, bg="#12233d")
         frame.pack(fill="x", padx=10, pady=6)
-        tk.Label(frame, text="Split para avaliação (VOC)", bg="#12233d", fg="white").pack(anchor="w")
-        combo = ttk.Combobox(frame, textvariable=self.eval_split_var, values=["train", "val", "test"], state="readonly", width=20)
+        tk.Label(frame, text=label, bg="#12233d", fg="white").pack(anchor="w")
+        combo = ttk.Combobox(
+            frame,
+            textvariable=variable or self.eval_split_var,
+            values=values or ["train", "val", "test"],
+            state="readonly",
+            width=20,
+        )
         combo.pack(anchor="w")
 
-    def _add_conf_threshold_selector(self) -> None:
+    def _add_conf_threshold_selector(self, variable: Optional[tk.Variable] = None, label: str = "Limite de confiança (score)") -> None:
         frame = tk.Frame(self.dynamic_frame, bg="#12233d")
         frame.pack(fill="x", padx=10, pady=6)
-        tk.Label(frame, text="Limite de confiança (score)", bg="#12233d", fg="white").pack(anchor="w")
-        spinbox = tk.Spinbox(frame, from_=0.0, to=1.0, increment=0.01, textvariable=self.conf_threshold_var, width=8)
+        tk.Label(frame, text=label, bg="#12233d", fg="white").pack(anchor="w")
+        spinbox = tk.Spinbox(frame, from_=0.0, to=1.0, increment=0.01, textvariable=variable or self.conf_threshold_var, width=8)
         spinbox.pack(anchor="w")
 
-    def _add_iou_threshold_selector(self) -> None:
+    def _add_iou_threshold_selector(self, variable: Optional[tk.Variable] = None, label: str = "Limite de IoU para precision/recall") -> None:
         frame = tk.Frame(self.dynamic_frame, bg="#12233d")
         frame.pack(fill="x", padx=10, pady=6)
-        tk.Label(frame, text="Limite de IoU para precision/recall", bg="#12233d", fg="white").pack(anchor="w")
-        spinbox = tk.Spinbox(frame, from_=0.1, to=1.0, increment=0.05, textvariable=self.iou_threshold_var, width=8)
+        tk.Label(frame, text=label, bg="#12233d", fg="white").pack(anchor="w")
+        spinbox = tk.Spinbox(frame, from_=0.1, to=1.0, increment=0.05, textvariable=variable or self.iou_threshold_var, width=8)
         spinbox.pack(anchor="w")
+
+    def _add_numeric_selector(self, label: str, variable: tk.Variable) -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        tk.Label(frame, text=label, bg="#12233d", fg="white").pack(anchor="w")
+        entry = ttk.Entry(frame, textvariable=variable, width=12)
+        entry.pack(anchor="w")
+
+    def _add_text_selector(self, label: str, variable: tk.Variable, placeholder: str = "") -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        tk.Label(frame, text=label, bg="#12233d", fg="white").pack(anchor="w")
+        entry = ttk.Entry(frame, textvariable=variable, width=20)
+        entry.pack(anchor="w")
+        if placeholder and not variable.get():
+            entry.insert(0, placeholder)
 
     def _register_eval_traces(self) -> None:
         variables: list[tk.Variable] = [
@@ -274,6 +325,23 @@ class DetectorApp(tk.Tk):
             self.eval_split_var,
             self.conf_threshold_var,
             self.iou_threshold_var,
+        ]
+
+        for var in variables:
+            trace_id = var.trace_add("write", self._update_run_button_text)
+            self._variable_traces.append((var, trace_id))
+
+    def _register_yolo_eval_traces(self) -> None:
+        variables: list[tk.Variable] = [
+            self.path_vars["yolo_eval_dataset"],
+            self.path_vars["yolo_eval_weights"],
+            self.path_vars["yolo_eval_out"],
+            self.yolo_split_var,
+            self.yolo_conf_var,
+            self.yolo_iou_var,
+            self.yolo_imgsz_var,
+            self.yolo_batch_var,
+            self.yolo_device_var,
         ]
 
         for var in variables:
@@ -352,6 +420,23 @@ class DetectorApp(tk.Tk):
                 "saida": Path(out_dir_raw) if out_dir_raw else None,
                 "conf": float(self.conf_threshold_var.get()),
                 "iou": float(self.iou_threshold_var.get()),
+            }
+            self.run_button_text.set(self._build_prompt_command("avaliar", algorithm, args))
+        elif action == "Avaliar YOLO" and algorithm == "YOLO":
+            dataset_raw = self.path_vars["yolo_eval_dataset"].get().strip()
+            weights_raw = self.path_vars["yolo_eval_weights"].get().strip()
+            out_dir_raw = self.path_vars["yolo_eval_out"].get().strip()
+
+            args = {
+                "dataset": Path(dataset_raw) if dataset_raw else None,
+                "pesos": Path(weights_raw) if weights_raw else None,
+                "saida": Path(out_dir_raw) if out_dir_raw else None,
+                "split": self.yolo_split_var.get(),
+                "imgsz": int(self.yolo_imgsz_var.get()),
+                "batch": int(self.yolo_batch_var.get()),
+                "device": self.yolo_device_var.get(),
+                "conf": float(self.yolo_conf_var.get()),
+                "iou": float(self.yolo_iou_var.get()),
             }
             self.run_button_text.set(self._build_prompt_command("avaliar", algorithm, args))
         else:
@@ -480,6 +565,54 @@ class DetectorApp(tk.Tk):
                         conf_threshold=conf_threshold,
                         iou_threshold=iou_threshold,
                         logger=prompt_logger,
+                    )
+
+            elif action == "Avaliar YOLO":
+                if algorithm_key != "YOLO":
+                    raise ValueError("Selecione o algoritmo YOLO para executar a avaliação dedicada.")
+
+                data_yaml = Path(self.path_vars["yolo_eval_dataset"].get())
+                weights = Path(self.path_vars["yolo_eval_weights"].get())
+                out_dir = Path(self.path_vars["yolo_eval_out"].get())
+                split = self.yolo_split_var.get().strip() or "val"
+                imgsz = int(self.yolo_imgsz_var.get())
+                batch = int(self.yolo_batch_var.get())
+                device = self.yolo_device_var.get().strip() or "0"
+                conf = float(self.yolo_conf_var.get())
+                iou = float(self.yolo_iou_var.get())
+
+                prompt_logger(
+                    self._build_prompt_command(
+                        "avaliar",
+                        algorithm_key,
+                        {
+                            "dataset": data_yaml,
+                            "pesos": weights,
+                            "saida": out_dir,
+                            "split": split,
+                            "imgsz": imgsz,
+                            "batch": batch,
+                            "device": device,
+                            "conf": conf,
+                            "iou": iou,
+                        },
+                    )
+                )
+
+                def run_action() -> OperationResult:
+                    return self.controller.execute_eval_yolo(
+                        algorithm_key,
+                        data_yaml=data_yaml,
+                        weights_path=weights,
+                        out_dir=out_dir,
+                        split=split,
+                        imgsz=imgsz,
+                        batch=batch,
+                        device=device,
+                        conf=conf,
+                        iou=iou,
+                        logger=prompt_logger,
+                        log_cb=lambda msg: self._emit_gui(msg, stdout=False),
                     )
 
             elif action == "Normalizar dataset":
