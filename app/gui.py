@@ -8,6 +8,8 @@ from threading import Thread
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+import torch
+
 from app.controller import ExperimentController, OperationResult
 from app.logging_utils import PromptLogForwarder, capture_prompt_output
 
@@ -30,6 +32,7 @@ class DetectorApp(tk.Tk):
         self.configure(bg="#0b172a")
 
         self.controller = ExperimentController()
+        self.cuda_available = torch.cuda.is_available()
         self.algorithm_var = tk.StringVar(value="YOLO")
         self.action_var = tk.StringVar(value="Treinar")
         self.dataset_type_var = tk.StringVar(value="HERIDAL")
@@ -61,7 +64,7 @@ class DetectorApp(tk.Tk):
         self.yolo_iou_var = tk.DoubleVar(value=0.6)
         self.yolo_imgsz_var = tk.IntVar(value=640)
         self.yolo_batch_var = tk.IntVar(value=16)
-        self.yolo_device_var = tk.StringVar(value="0")
+        self.yolo_device_var = tk.StringVar(value="cpu")
         self.run_button_text = tk.StringVar(value="Executar")
         self._variable_traces: list[tuple[tk.Variable, str]] = []
 
@@ -228,7 +231,7 @@ class DetectorApp(tk.Tk):
                 self._add_iou_threshold_selector(variable=self.yolo_iou_var, label="Limite de IoU (YOLO)")
                 self._add_numeric_selector("Tamanho da imagem (imgsz)", self.yolo_imgsz_var)
                 self._add_numeric_selector("Tamanho do batch", self.yolo_batch_var)
-                self._add_text_selector("Dispositivo", self.yolo_device_var, placeholder="0 / cpu / cuda:0")
+                self._add_device_selector()
                 self._register_yolo_eval_traces()
         elif action == "Normalizar dataset":
             self._add_dataset_type_selector()
@@ -314,8 +317,29 @@ class DetectorApp(tk.Tk):
         tk.Label(frame, text=label, bg="#12233d", fg="white").pack(anchor="w")
         entry = ttk.Entry(frame, textvariable=variable, width=20)
         entry.pack(anchor="w")
-        if placeholder and not variable.get():
-            entry.insert(0, placeholder)
+
+    def _build_device_options(self) -> list[str]:
+        if not self.cuda_available:
+            return ["cpu"]
+        gpu_indices = [str(idx) for idx in range(torch.cuda.device_count())]
+        return ["cpu", *gpu_indices]
+
+    def _add_device_selector(self) -> None:
+        options = self._build_device_options()
+        if self.yolo_device_var.get() not in options:
+            self.yolo_device_var.set("cpu")
+
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        tk.Label(frame, text="Dispositivo", bg="#12233d", fg="white").pack(anchor="w")
+        combo = ttk.Combobox(
+            frame,
+            textvariable=self.yolo_device_var,
+            values=options,
+            state="readonly",
+            width=20,
+        )
+        combo.pack(anchor="w")
 
     def _register_eval_traces(self) -> None:
         variables: list[tk.Variable] = [
@@ -434,7 +458,7 @@ class DetectorApp(tk.Tk):
                 "split": self.yolo_split_var.get(),
                 "imgsz": int(self.yolo_imgsz_var.get()),
                 "batch": int(self.yolo_batch_var.get()),
-                "device": self.yolo_device_var.get(),
+                "device": self.yolo_device_var.get().strip() or "cpu",
                 "conf": float(self.yolo_conf_var.get()),
                 "iou": float(self.yolo_iou_var.get()),
             }
@@ -577,7 +601,7 @@ class DetectorApp(tk.Tk):
                 split = self.yolo_split_var.get().strip() or "val"
                 imgsz = int(self.yolo_imgsz_var.get())
                 batch = int(self.yolo_batch_var.get())
-                device = self.yolo_device_var.get().strip() or "0"
+                device = self.yolo_device_var.get().strip() or "cpu"
                 conf = float(self.yolo_conf_var.get())
                 iou = float(self.yolo_iou_var.get())
 
