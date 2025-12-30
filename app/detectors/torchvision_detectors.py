@@ -24,6 +24,11 @@ class TorchvisionDetector(DetectionAlgorithm):
         self.build_model = build_model
         self.config = config or TrainConfig()
 
+    def _prepare_model(
+        self, num_classes: int, pretrained_weights: Optional[Path], logger: Optional[Logger]
+    ) -> torch.nn.Module:
+        return self.build_model(num_classes)
+
     def train(
         self,
         dataset_dir: Path,
@@ -43,7 +48,7 @@ class TorchvisionDetector(DetectionAlgorithm):
             logger(f"[DATA] Anotações train: {train_ann}")
             logger(f"[DATA] Anotações val: {val_ann}")
 
-        model = self.build_model(num_classes)
+        model = self._prepare_model(num_classes, pretrained_weights, logger)
         metrics = train_torchvision_detector(
             model,
             dataset_dir,

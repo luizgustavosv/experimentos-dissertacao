@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import torch
+
 from PIL import Image
 
 from app.detectors.base import DetectorContext, Logger
@@ -31,6 +33,43 @@ class ImageAnnotations:
 class FasterRCNNDetector(TorchvisionDetector):
     def __init__(self, context: DetectorContext):
         super().__init__(context, build_faster_rcnn)
+
+    def _prepare_model(
+        self, num_classes: int, pretrained_weights: Optional[Path], logger: Optional[Logger]
+    ) -> torch.nn.Module:
+        from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights, fasterrcnn_resnet50_fpn
+        from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+
+        num_classes_dataset = num_classes
+        if logger:
+            logger(f"[FRCNN][INIT] num_classes_dataset={num_classes_dataset}")
+
+        if pretrained_weights is None:
+            model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
+            if logger:
+                logger("[FRCNN][WEIGHTS] Usando pesos COCO padrão (torchvision)")
+        else:
+            weights_path = pretrained_weights.expanduser().resolve()
+            state_dict = torch.load(weights_path, map_location="cpu")
+            filtered_state_dict = {
+                key: value for key, value in state_dict.items() if not key.startswith("roi_heads.box_predictor.")
+            }
+            removed_keys = [key for key in state_dict if key.startswith("roi_heads.box_predictor.")]
+            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, num_classes=num_classes_dataset)
+            missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
+            if logger:
+                logger(f"[FRCNN][WEIGHTS] Checkpoint aplicado de {weights_path}")
+                logger(f"[FRCNN][WEIGHTS] Head removido do checkpoint: {len(removed_keys)} chaves")
+                logger(
+                    f"[FRCNN][WEIGHTS] missing_keys={len(missing)} | unexpected_keys={len(unexpected)} (strict=False)"
+                )
+
+        in_features = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes_dataset)
+        if logger:
+            logger(f"[FRCNN][HEAD] Head recriado para num_classes={num_classes_dataset}")
+
+        return model
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):
         dataset_dir = dataset_dir.expanduser().resolve()
