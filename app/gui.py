@@ -33,8 +33,14 @@ class DetectorApp(tk.Tk):
 
         self.controller = ExperimentController()
         self.cuda_available = torch.cuda.is_available()
+        self.algorithm_actions: dict[str, list[str]] = {
+            "YOLO": ["Treinar", "Inferir", "Avaliar YOLO", "Normalizar dataset"],
+            "SSD": ["Treinar", "Inferir", "Avaliar SSD", "Normalizar dataset"],
+            "Faster R-CNN": ["Treinar", "Inferir", "Normalizar dataset"],
+            "RetinaNet": ["Treinar", "Inferir", "Normalizar dataset"],
+        }
         self.algorithm_var = tk.StringVar(value="YOLO")
-        self.action_var = tk.StringVar(value="Treinar")
+        self.action_var = tk.StringVar(value=self.algorithm_actions["YOLO"][0])
         self.dataset_type_var = tk.StringVar(value="HERIDAL")
         self.path_vars = {
             "dataset": tk.StringVar(),
@@ -109,12 +115,12 @@ class DetectorApp(tk.Tk):
         algo_combo = ttk.Combobox(
             algo_frame,
             textvariable=self.algorithm_var,
-            values=list(self.controller.detectors.keys()),
+            values=list(self.algorithm_actions.keys()),
             state="readonly",
             width=25,
         )
         algo_combo.pack(padx=10, pady=10)
-        algo_combo.bind("<<ComboboxSelected>>", lambda _: self._render_fields())
+        algo_combo.bind("<<ComboboxSelected>>", self._on_algorithm_change)
 
         action_frame = tk.LabelFrame(container, text="Ação", bg="#12233d", fg="white")
         action_frame.pack(fill="x", pady=5)
@@ -125,22 +131,21 @@ class DetectorApp(tk.Tk):
         action_row.columnconfigure(0, weight=1)
         action_row.columnconfigure(1, weight=0)
 
-        action_combo = ttk.Combobox(
+        self.action_combo = ttk.Combobox(
             action_row,
             textvariable=self.action_var,
-            values=["Treinar", "Inferir", "Avaliar SSD", "Avaliar YOLO", "Normalizar dataset"],
+            values=self._available_actions(self.algorithm_var.get()),
             state="readonly",
             width=25,
         )
-        action_combo.grid(row=0, column=0, sticky="ew")
-        action_combo.bind("<<ComboboxSelected>>", lambda _: self._render_fields())
+        self.action_combo.grid(row=0, column=0, sticky="ew")
+        self.action_combo.bind("<<ComboboxSelected>>", lambda _: self._render_fields())
 
         if hasattr(self, "btn_execute"):
             self.btn_execute.destroy()
         self.btn_execute = tk.Button(
             action_row,
             text="Executar",
-            textvariable=self.run_button_text,
             command=self.on_execute_clicked,
             relief="raised",
             bd=2,
@@ -152,6 +157,8 @@ class DetectorApp(tk.Tk):
 
         self.dynamic_frame = tk.LabelFrame(container, text="Parâmetros", bg="#12233d", fg="white")
         self.dynamic_frame.pack(fill="x", pady=5)
+
+        self._update_action_options()
 
     def _build_log_area(self) -> None:
         log_frame = tk.LabelFrame(self, text="Log de execução", bg="#12233d", fg="white")
@@ -239,6 +246,19 @@ class DetectorApp(tk.Tk):
             self._add_path_selector("Destino do dataset normalizado", "normalized", is_dir=True)
 
         self._update_run_button_text()
+
+    def _available_actions(self, algorithm: str) -> list[str]:
+        return self.algorithm_actions.get(algorithm, ["Treinar", "Inferir", "Normalizar dataset"])
+
+    def _on_algorithm_change(self, _event: object | None = None) -> None:
+        self._update_action_options()
+        self._render_fields()
+
+    def _update_action_options(self) -> None:
+        actions = self._available_actions(self.algorithm_var.get())
+        self.action_combo.configure(values=actions)
+        if self.action_var.get() not in actions:
+            self.action_var.set(actions[0] if actions else "")
 
     def _add_path_selector(
         self,
@@ -429,42 +449,7 @@ class DetectorApp(tk.Tk):
         return "$ " + " ".join(str(part) for part in parts)
 
     def _update_run_button_text(self, *_args: object) -> None:
-        action = self.action_var.get()
-        algorithm = self.algorithm_var.get()
-
-        if action == "Avaliar SSD" and algorithm == "SSD":
-            dataset_raw = self.path_vars["eval_dataset"].get().strip()
-            weights_raw = self.path_vars["eval_weights"].get().strip()
-            out_dir_raw = self.path_vars["eval_out"].get().strip()
-
-            args: dict[str, object] = {
-                "dataset": Path(dataset_raw) if dataset_raw else None,
-                "pesos": Path(weights_raw) if weights_raw else None,
-                "split": self.eval_split_var.get(),
-                "saida": Path(out_dir_raw) if out_dir_raw else None,
-                "conf": float(self.conf_threshold_var.get()),
-                "iou": float(self.iou_threshold_var.get()),
-            }
-            self.run_button_text.set(self._build_prompt_command("avaliar", algorithm, args))
-        elif action == "Avaliar YOLO" and algorithm == "YOLO":
-            dataset_raw = self.path_vars["yolo_eval_dataset"].get().strip()
-            weights_raw = self.path_vars["yolo_eval_weights"].get().strip()
-            out_dir_raw = self.path_vars["yolo_eval_out"].get().strip()
-
-            args = {
-                "dataset": Path(dataset_raw) if dataset_raw else None,
-                "pesos": Path(weights_raw) if weights_raw else None,
-                "saida": Path(out_dir_raw) if out_dir_raw else None,
-                "split": self.yolo_split_var.get(),
-                "imgsz": int(self.yolo_imgsz_var.get()),
-                "batch": int(self.yolo_batch_var.get()),
-                "device": self.yolo_device_var.get().strip() or "cpu",
-                "conf": float(self.yolo_conf_var.get()),
-                "iou": float(self.yolo_iou_var.get()),
-            }
-            self.run_button_text.set(self._build_prompt_command("avaliar", algorithm, args))
-        else:
-            self.run_button_text.set("Executar")
+        self.run_button_text.set("Executar")
 
     def _emit_gui(self, message: str, *, stdout: bool = True) -> None:
         if stdout:
