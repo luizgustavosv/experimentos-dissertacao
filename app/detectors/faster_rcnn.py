@@ -37,15 +37,21 @@ class FasterRCNNDetector(TorchvisionDetector):
     def _prepare_model(
         self, num_classes: int, pretrained_weights: Optional[Path], logger: Optional[Logger]
     ) -> torch.nn.Module:
-        from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights, fasterrcnn_resnet50_fpn
+        from torchvision.models import ResNet50_Weights
+        from torchvision.models.detection import fasterrcnn_resnet50_fpn
         from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
         num_classes_dataset = num_classes
         if logger:
             logger(f"[FRCNN][INIT] num_classes_dataset={num_classes_dataset}")
 
-        weights_backbone = FasterRCNN_ResNet50_FPN_Weights.COCO_V1.backbone_weights
-        model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=weights_backbone, num_classes=num_classes_dataset)
+        backbone_weights = ResNet50_Weights.IMAGENET1K_V2
+        try:
+            model = fasterrcnn_resnet50_fpn(
+                weights=None, weights_backbone=backbone_weights, num_classes=num_classes_dataset
+            )
+        except TypeError:
+            model = fasterrcnn_resnet50_fpn(weights=None, num_classes=num_classes_dataset)
 
         if pretrained_weights is not None:
             weights_path = pretrained_weights.expanduser().resolve()
