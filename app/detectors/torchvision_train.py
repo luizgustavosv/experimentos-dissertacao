@@ -15,11 +15,16 @@ from typing import Any, Iterable, Optional, Tuple
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, random_split
-from torchvision import transforms
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 from app.detectors.base import Logger
 from app.detectors.config import TrainConfig
-from app.detectors.dataset_coco import CocoDetectionDataset
+from app.detectors.dataset_coco import (
+    CocoDetectionDataset,
+    DetectionResize,
+    DetectionToTensor,
+    DetectionTransformCompose,
+)
 from app.detectors.utils import coco_collate, describe_dataloader, ensure_weights_size, resolve_device, seed_everything
 from app.metrics import Metrics
 
@@ -239,6 +244,18 @@ def _infer_num_classes_from_model(model: torch.nn.Module) -> Optional[int]:
     return None
 
 
+def _infer_num_classes_from_dataset(dataset: Any) -> Optional[int]:
+    candidates = [getattr(dataset, "num_classes", None)]
+    if hasattr(dataset, "annotations") and isinstance(getattr(dataset, "annotations"), dict):
+        categories = dataset.annotations.get("categories", [])
+        if isinstance(categories, list):
+            candidates.append(len(categories) + 1)
+    for cand in candidates:
+        if isinstance(cand, int) and cand > 0:
+            return cand
+    return None
+
+
 def _validate_targets_batch(
     targets: list[dict[str, torch.Tensor]],
     *,
@@ -248,31 +265,43 @@ def _validate_targets_batch(
 ) -> None:
     sizes = list(image_sizes)
     for idx, target in enumerate(targets):
+        path_hint = target.get("img_path") if isinstance(target, dict) else None
+        path_label = f" (img={path_hint})" if path_hint else ""
         if not isinstance(target, dict):
-            raise TypeError(f"Target no índice {idx} não é um dicionário: {type(target).__name__}")
+            raise TypeError(f"Target no índice {idx}{path_label} não é um dicionário: {type(target).__name__}")
 
         if "boxes" not in target or "labels" not in target:
-            raise ValueError(f"Target no índice {idx} deve conter 'boxes' e 'labels'")
+            raise ValueError(f"Target no índice {idx}{path_label} deve conter 'boxes' e 'labels'")
 
         boxes = target["boxes"]
         labels = target["labels"]
 
         if not torch.is_tensor(boxes):
-            raise TypeError(f"Target boxes no índice {idx} não é tensor")
+            raise TypeError(f"Target boxes no índice {idx}{path_label} não é tensor")
         if not torch.is_tensor(labels):
-            raise TypeError(f"Target labels no índice {idx} não é tensor")
+            raise TypeError(f"Target labels no índice {idx}{path_label} não é tensor")
 
         if boxes.dim() != 2 or boxes.size(1) != 4:
-            raise ValueError(f"Boxes no índice {idx} devem ter shape [N,4], recebido {tuple(boxes.shape)}")
+            raise ValueError(
+                f"Boxes no índice {idx}{path_label} devem ter shape [N,4], recebido {tuple(boxes.shape)}"
+            )
+        if boxes.dtype != torch.float32:
+            logger.debug("Convertendo boxes para float32 no índice %d%s", idx, path_label)
+            boxes = boxes.float()
+            target["boxes"] = boxes
         if not torch.isfinite(boxes).all():
-            raise ValueError(f"Boxes não finitos no índice {idx}")
+            raise ValueError(f"Boxes não finitos no índice {idx}{path_label}")
+        if (boxes < 0).any():
+            raise ValueError(f"Boxes negativos encontrados no índice {idx}{path_label}")
 
         if labels.dim() != 1:
-            raise ValueError(f"Labels no índice {idx} devem ser 1D, recebido {tuple(labels.shape)}")
+            raise ValueError(f"Labels no índice {idx}{path_label} devem ser 1D, recebido {tuple(labels.shape)}")
         if boxes.size(0) != labels.numel():
-            raise ValueError(f"Mismatch boxes/labels no índice {idx}: {boxes.size(0)} vs {labels.numel()}")
+            raise ValueError(
+                f"Mismatch boxes/labels no índice {idx}{path_label}: {boxes.size(0)} vs {labels.numel()}"
+            )
         if labels.dtype != torch.int64:
-            raise TypeError(f"Labels no índice {idx} devem ser int64, recebido {labels.dtype}")
+            raise TypeError(f"Labels no índice {idx}{path_label} devem ser int64, recebido {labels.dtype}")
 
         if boxes.numel() == 0:
             if boxes.shape != (0, 4):
@@ -291,27 +320,26 @@ def _validate_targets_batch(
 
         x_min, y_min, x_max, y_max = boxes.unbind(dim=1)
         if not (x_max > x_min).all():
-            raise ValueError(f"xmax <= xmin encontrado no índice {idx}")
+            raise ValueError(f"xmax <= xmin encontrado no índice {idx}{path_label}")
         if not (y_max > y_min).all():
-            raise ValueError(f"ymax <= ymin encontrado no índice {idx}")
+            raise ValueError(f"ymax <= ymin encontrado no índice {idx}{path_label}")
 
         if num_classes is not None and num_classes > 0:
             if (labels < 1).any():
-                raise ValueError(f"Labels fora do intervalo no índice {idx}: mínimo {int(labels.min())}")
+                raise ValueError(
+                    f"Labels fora do intervalo no índice {idx}{path_label}: mínimo {int(labels.min())} (esperado >=1)"
+                )
             if (labels >= num_classes).any():
                 raise ValueError(
-                    f"Labels fora do intervalo no índice {idx}: máximo {int(labels.max())} >= num_classes ({num_classes})"
+                    f"Labels fora do intervalo no índice {idx}{path_label}: máximo {int(labels.max())} >= num_classes ({num_classes})"
                 )
         else:
             if (labels < 1).any():
-                raise ValueError(f"Labels devem ser >=1 quando num_classes é desconhecido (índice {idx})")
+                raise ValueError(f"Labels devem ser >=1 quando num_classes é desconhecido (índice {idx}{path_label})")
 
         if not torch.isfinite(labels.float()).all():
-            raise ValueError(f"Labels não finitos no índice {idx}")
+            raise ValueError(f"Labels não finitos no índice {idx}{path_label}")
 
-        if boxes.dtype != torch.float32:
-            logger.debug("Convertendo boxes para float32 no índice %d", idx)
-            target["boxes"] = boxes.float()
 
 
 def _collect_batch_identifiers(
@@ -387,6 +415,112 @@ def _summarize_targets_for_logging(targets: list[dict[str, torch.Tensor]]) -> li
         if entry:
             summary.append(entry)
     return summary
+
+
+def _build_detection_transforms(img_size: int, logger: logging.Logger):
+    logger.info("[TRANSFORM] Aplicando resize fixo para %dx%d + ToTensor em train/val", img_size, img_size)
+    return DetectionTransformCompose([DetectionResize(img_size), DetectionToTensor()])
+
+
+def _audit_dataset(
+    dataset: Any, phase: str, *, num_classes: Optional[int], logger: logging.Logger, limit: Optional[int] = None
+) -> None:
+    logger.info("[AUDIT] Iniciando auditoria do dataset (%s)...", phase)
+    total = len(dataset)
+    inspected = 0
+    with torch.no_grad():
+        for idx in range(total):
+            if limit is not None and inspected >= limit:
+                break
+            image, target = dataset[idx]
+            h, w = (int(image.shape[-2]), int(image.shape[-1])) if torch.is_tensor(image) else (image.height, image.width)
+            try:
+                _validate_targets_batch([target], num_classes=num_classes, image_sizes=[(h, w)], logger=logger)
+            except Exception as exc:
+                raise ValueError(f"[AUDIT] Falha no {phase} idx={idx} img={target.get('img_path', '<desconhecido>')}: {exc}")
+            inspected += 1
+    logger.info("[AUDIT] Auditoria concluída para %s: %d/%d amostras verificadas", phase, inspected, total)
+
+
+def _ensure_frcnn_head(model: torch.nn.Module, num_classes: int, logger: logging.Logger) -> None:
+    roi_heads = getattr(model, "roi_heads", None)
+    if roi_heads is None or not hasattr(roi_heads, "box_predictor"):
+        logger.debug("[MODEL] roi_heads.box_predictor indisponível; nada a reconfigurar")
+        return
+    predictor = getattr(roi_heads, "box_predictor", None)
+    in_features = None
+    if predictor is not None and hasattr(predictor, "cls_score"):
+        in_features = predictor.cls_score.in_features
+    if in_features is None and hasattr(roi_heads, "box_predictor"):
+        in_features = roi_heads.box_predictor.cls_score.in_features  # type: ignore[attr-defined]
+    if in_features is None:
+        logger.warning("[MODEL] Não foi possível identificar in_features do box_predictor; mantendo configuração atual")
+        return
+    roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    logger.info("[MODEL] Faster R-CNN configurado com num_classes=%d (incluindo background)", num_classes)
+
+
+def _summarize_boxes_for_debug(targets: list[dict[str, Any]]) -> list[str]:
+    summaries = []
+    for tgt in targets:
+        boxes = tgt.get("boxes") if isinstance(tgt, dict) else None
+        if torch.is_tensor(boxes) and boxes.numel() > 0:
+            summaries.append(
+                f"shape={tuple(boxes.shape)} min={boxes.min().item():.2f} max={boxes.max().item():.2f}"
+            )
+        else:
+            summaries.append("shape=(0, 4) [sem boxes]")
+    return summaries
+
+
+def _run_smoke_test_val_loss(
+    model: torch.nn.Module,
+    val_loader: DataLoader,
+    device: torch.device,
+    logger: logging.Logger,
+    *,
+    max_images: int = 8,
+    num_classes: Optional[int] = None,
+) -> None:
+    logger.info("[SMOKE] Iniciando smoke_test_val_loss com limite de %d imagens", max_images)
+    processed_images = 0
+    total_loss = 0.0
+    component_sum: dict[str, float] = {}
+    batches = 0
+    model.eval()
+    with torch.no_grad():
+        for images, targets in val_loader:
+            images = [img.to(device) for img in images]
+            targets = [
+                {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()}
+                for t in targets
+            ]
+            image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
+            _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logger)
+            loss_out = model(images, targets)
+            batch_loss = torch.tensor(0.0, device=device)
+            if isinstance(loss_out, dict) and loss_out:
+                for key, value in loss_out.items():
+                    val_tensor = value.mean() if torch.is_tensor(value) else torch.tensor(float(value), device=device)
+                    batch_loss = batch_loss + val_tensor
+                    component_sum[key] = component_sum.get(key, 0.0) + float(val_tensor.detach().cpu())
+            total_loss += float(batch_loss.detach().cpu())
+            batches += 1
+            processed_images += len(images)
+            logger.info(
+                "[SMOKE] batch=%d loss=%.4f boxes=%s",
+                batches,
+                float(batch_loss.detach().cpu()),
+                _summarize_boxes_for_debug(targets),
+            )
+            if processed_images >= max_images:
+                break
+    if batches == 0:
+        logger.warning("[SMOKE] Nenhum batch processado no smoke_test_val_loss")
+        return
+    avg_loss = total_loss / batches
+    comp_mean = {k: v / batches for k, v in component_sum.items()}
+    logger.info("[SMOKE] loss médio/batch=%.4f componentes=%s", avg_loss, comp_mean)
 
 
 @contextmanager
@@ -481,7 +615,7 @@ def train_torchvision_detector(
     optimizer: Optional[torch.optim.Optimizer] = None
     try:
         if train_dataset is None or val_dataset is None:
-            transform = transforms.Compose([transforms.ToTensor()])
+            transform = _build_detection_transforms(config.imgsz, logging_logger)
             logging_logger.info("[SETUP] Construindo datasets COCO a partir de %s", dataset_dir)
             train_ds_full = CocoDetectionDataset(dataset_dir / "images" / "train", train_ann, transforms=transform)
             val_ds_full = CocoDetectionDataset(dataset_dir / "images" / "val", val_ann, transforms=transform)
@@ -498,6 +632,30 @@ def train_torchvision_detector(
 
         describe_dataloader(train_ds_full, logging_logger.info)
         logging_logger.info("[SETUP] Tamanho train=%d | val=%d", len(train_ds_full), len(val_ds_full))
+
+        dataset_num_classes = _infer_num_classes_from_dataset(train_ds_full)
+        if dataset_num_classes is None:
+            raise ValueError("Não foi possível inferir num_classes a partir do dataset; verifique as categorias.")
+
+        val_num_classes = _infer_num_classes_from_dataset(val_ds_full)
+        if val_num_classes is not None and val_num_classes != dataset_num_classes:
+            logging_logger.warning(
+                "[AUDIT] num_classes do val (%s) difere do train (%s); usando o do train.",
+                val_num_classes,
+                dataset_num_classes,
+            )
+
+        if hasattr(train_ds_full, "transforms") and hasattr(val_ds_full, "transforms"):
+            if type(getattr(train_ds_full, "transforms")) != type(getattr(val_ds_full, "transforms")):
+                logging_logger.warning(
+                    "[TRANSFORM] Transforms de train e val divergem em tipo (%s vs %s)",
+                    type(getattr(train_ds_full, "transforms")),
+                    type(getattr(val_ds_full, "transforms")),
+                )
+
+        if config.audit_datasets:
+            _audit_dataset(train_ds_full, "train", num_classes=dataset_num_classes, logger=logging_logger)
+            _audit_dataset(val_ds_full, "val", num_classes=dataset_num_classes, logger=logging_logger)
 
         dataloader_kwargs = dict(
             batch_size=config.batch_size,
@@ -540,6 +698,16 @@ def train_torchvision_detector(
         val_loader = DataLoader(val_ds_full, shuffle=False, **dataloader_kwargs)
         logging_logger.info("DataLoader construído. num_batches=%d", len(train_loader))
 
+        if config.smoke_test_val_loss:
+            _run_smoke_test_val_loss(
+                model,
+                val_loader,
+                device,
+                logging_logger,
+                max_images=config.smoke_test_samples,
+                num_classes=dataset_num_classes,
+            )
+
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logging_logger.info("[MODEL] Modelo preparado. params=%d | treináveis=%d", total_params, trainable_params)
@@ -550,11 +718,8 @@ def train_torchvision_detector(
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.lr_step_size, gamma=config.lr_gamma)
         logging_logger.info("Starting training...")
 
-        num_classes = _infer_num_classes_from_model(model)
-        if num_classes is None:
-            logging_logger.debug("Não foi possível inferir num_classes do modelo; validação usará apenas limites mínimos.")
-        else:
-            logging_logger.info("num_classes inferido: %s", num_classes)
+        num_classes = dataset_num_classes
+        _ensure_frcnn_head(model, num_classes, logging_logger)
 
         last_progress = [time.monotonic()]
         watchdog_stop = threading.Event()
@@ -716,7 +881,10 @@ def train_torchvision_detector(
             )
 
             model.eval()
-            val_loss = 0.0
+            val_loss_sum = 0.0
+            val_component_sum: dict[str, float] = {}
+            total_images = 0
+            total_batches = 0
             with _watchdog_paused(last_progress, watchdog_pause):
                 with torch.no_grad():
                     for vstep, (images, targets) in enumerate(val_loader, start=1):
@@ -728,13 +896,24 @@ def train_torchvision_detector(
                         image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
                         _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
                         loss_out = model(images, targets)
-                        try:
-                            losses, loss_items = _normalize_losses(loss_out, device)
-                        except Exception:
-                            logging_logger.exception("Falha ao normalizar losses no val; usando 0.0 para continuar.")
-                            losses = torch.tensor(0.0, device=device)
-                            loss_items = {}
-                        if not torch.isfinite(losses):
+                        batch_loss = torch.tensor(0.0, device=device)
+                        batch_items: dict[str, float] = {}
+                        if isinstance(loss_out, dict) and loss_out:
+                            for key, value in loss_out.items():
+                                if torch.is_tensor(value):
+                                    val_tensor = value.mean() if value.dim() > 0 else value
+                                else:
+                                    val_tensor = torch.tensor(float(value), device=device)
+                                batch_loss = batch_loss + val_tensor
+                                batch_items[key] = float(val_tensor.detach().cpu())
+                        else:
+                            try:
+                                batch_loss, normalized_items = _normalize_losses(loss_out, device)
+                                batch_items.update({k: float(v) for k, v in normalized_items.items()})
+                            except Exception:
+                                logging_logger.exception("Falha ao normalizar losses no val; usando 0.0 para continuar.")
+                                batch_loss = torch.tensor(0.0, device=device)
+                        if not torch.isfinite(batch_loss):
                             image_ids, file_paths = _collect_batch_identifiers(targets, val_loader.dataset)
                             target_dump = _summarize_targets_for_logging(targets)
                             logging_logger.error(
@@ -772,11 +951,22 @@ def train_torchvision_detector(
                             except Exception:
                                 logging_logger.exception("Falha ao salvar informações do bad batch de validação")
                             raise RuntimeError("Non-finite loss detected")
-                        if loss_items:
-                            logging_logger.debug(f"Loss components: {loss_items}")
-                        val_loss += losses.item()
-            val_loss = val_loss / max(1, len(val_loader))
-            logging_logger.info(f"[VAL] Época {epoch} | loss={val_loss:.4f}")
+                        if batch_items:
+                            logging_logger.debug(f"Loss components: {batch_items}")
+
+                        total_batches += 1
+                        total_images += len(images)
+                        val_loss_sum += float(batch_loss.detach().cpu())
+                        for key, value in batch_items.items():
+                            val_component_sum[key] = val_component_sum.get(key, 0.0) + value
+            val_loss_mean_per_batch = val_loss_sum / max(1, total_batches)
+            val_loss_mean_per_image = val_loss_sum / max(1, total_images)
+            breakdown_mean = {k: v / max(1, total_batches) for k, v in val_component_sum.items()}
+            logging_logger.info(
+                f"[VAL] Época {epoch} | loss={val_loss_mean_per_batch:.4f} | loss/img={val_loss_mean_per_image:.4f}"
+            )
+            if breakdown_mean:
+                logging_logger.info("[VAL] Breakdown médio por batch: %s", breakdown_mean)
 
             with _watchdog_paused(last_progress, watchdog_pause):
                 epoch_ckpt = ckpt_dir / f"epoch_{epoch:03d}.pth"

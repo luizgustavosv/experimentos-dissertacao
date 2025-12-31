@@ -44,18 +44,16 @@ class FasterRCNNDetector(TorchvisionDetector):
         if logger:
             logger(f"[FRCNN][INIT] num_classes_dataset={num_classes_dataset}")
 
-        if pretrained_weights is None:
-            model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
-            if logger:
-                logger("[FRCNN][WEIGHTS] Usando pesos COCO padrão (torchvision)")
-        else:
+        weights_backbone = FasterRCNN_ResNet50_FPN_Weights.COCO_V1.backbone_weights
+        model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=weights_backbone, num_classes=num_classes_dataset)
+
+        if pretrained_weights is not None:
             weights_path = pretrained_weights.expanduser().resolve()
             state_dict = torch.load(weights_path, map_location="cpu")
             filtered_state_dict = {
                 key: value for key, value in state_dict.items() if not key.startswith("roi_heads.box_predictor.")
             }
             removed_keys = [key for key in state_dict if key.startswith("roi_heads.box_predictor.")]
-            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, num_classes=num_classes_dataset)
             missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
             if logger:
                 logger(f"[FRCNN][WEIGHTS] Checkpoint aplicado de {weights_path}")
@@ -63,6 +61,9 @@ class FasterRCNNDetector(TorchvisionDetector):
                 logger(
                     f"[FRCNN][WEIGHTS] missing_keys={len(missing)} | unexpected_keys={len(unexpected)} (strict=False)"
                 )
+        else:
+            if logger:
+                logger("[FRCNN][WEIGHTS] Backbone pré-treinado carregado; cabeça COCO não aplicada")
 
         in_features = model.roi_heads.box_predictor.cls_score.in_features
         model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes_dataset)
