@@ -27,3 +27,6 @@ class TrainConfig:
     persistent_workers: bool = False
     prefetch_factor: Optional[int] = 2
     drop_last: bool = False
+    smoke_test_val_loss: bool = False
+    smoke_test_samples: int = 8
+    audit_datasets: bool = True
