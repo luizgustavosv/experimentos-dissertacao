@@ -30,3 +30,5 @@ class TrainConfig:
     smoke_test_val_loss: bool = False
     smoke_test_samples: int = 8
     audit_datasets: bool = True
+    dataset_num_classes: Optional[int] = None
+    num_classes: Optional[int] = None

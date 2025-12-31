@@ -34,6 +34,9 @@ except Exception:  # pragma: no cover - fallback silencioso se tqdm não estiver
     tqdm = None
 
 
+VISDRONE_MULTICLASS_DATASET_CLASSES = 11
+
+
 def _describe_structure(obj: Any, depth: int = 0, max_depth: int = 4) -> str:
     if depth >= max_depth:
         return "..."
@@ -254,6 +257,37 @@ def _infer_num_classes_from_dataset(dataset: Any) -> Optional[int]:
         if isinstance(cand, int) and cand > 0:
             return cand
     return None
+
+
+def _normalize_dataset_class_count(raw_num_classes: Optional[int]) -> Optional[int]:
+    if raw_num_classes is None:
+        return None
+    if isinstance(raw_num_classes, int) and raw_num_classes > 0:
+        return raw_num_classes - 1 if raw_num_classes > 1 else raw_num_classes
+    return None
+
+
+def _is_visdrone_dataset(dataset_dir: Path, dataset: Any) -> bool:
+    def _matches(path_like: Any) -> bool:
+        if isinstance(path_like, (str, Path)):
+            return "visdrone" in str(path_like).lower()
+        return False
+
+    if _matches(dataset_dir):
+        return True
+
+    for attr in ("root", "dataset_dir", "images_dir", "annotations_dir"):
+        if _matches(getattr(dataset, attr, None)):
+            return True
+
+    annotations = getattr(dataset, "annotations", None)
+    if isinstance(annotations, dict):
+        info = annotations.get("info")
+        description = info.get("description") if isinstance(info, dict) else None
+        if _matches(description):
+            return True
+
+    return False
 
 
 def _validate_targets_batch(
@@ -633,16 +667,42 @@ def train_torchvision_detector(
         describe_dataloader(train_ds_full, logging_logger.info)
         logging_logger.info("[SETUP] Tamanho train=%d | val=%d", len(train_ds_full), len(val_ds_full))
 
-        dataset_num_classes = _infer_num_classes_from_dataset(train_ds_full)
+        configured_dataset_classes = getattr(config, "dataset_num_classes", None)
+        configured_model_num_classes = getattr(config, "num_classes", None)
+
+        inferred_train_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(train_ds_full))
+        inferred_val_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(val_ds_full))
+
+        dataset_num_classes = configured_dataset_classes if configured_dataset_classes is not None else inferred_train_classes
+
+        looks_like_visdrone = _is_visdrone_dataset(dataset_dir, train_ds_full) or _is_visdrone_dataset(
+            dataset_dir, val_ds_full
+        )
+        if dataset_num_classes is None and looks_like_visdrone:
+            dataset_num_classes = VISDRONE_MULTICLASS_DATASET_CLASSES
+
+        if dataset_num_classes is None and configured_model_num_classes is not None and configured_model_num_classes > 0:
+            dataset_num_classes = max(1, configured_model_num_classes - 1)
+
         if dataset_num_classes is None:
             raise ValueError("Não foi possível inferir num_classes a partir do dataset; verifique as categorias.")
 
-        val_num_classes = _infer_num_classes_from_dataset(val_ds_full)
-        if val_num_classes is not None and val_num_classes != dataset_num_classes:
+        if inferred_val_classes is not None and inferred_val_classes != dataset_num_classes:
             logging_logger.warning(
                 "[AUDIT] num_classes do val (%s) difere do train (%s); usando o do train.",
-                val_num_classes,
+                inferred_val_classes,
                 dataset_num_classes,
+            )
+
+        model_num_classes = configured_model_num_classes
+        if model_num_classes is None:
+            model_num_classes = dataset_num_classes + 1 if dataset_num_classes > 0 else dataset_num_classes
+
+        if looks_like_visdrone:
+            logging_logger.info(
+                "[DATASET] VisDrone multi-class: dataset_classes=%d -> model_num_classes=%d (incluindo background)",
+                dataset_num_classes,
+                model_num_classes,
             )
 
         if hasattr(train_ds_full, "transforms") and hasattr(val_ds_full, "transforms"):
@@ -654,8 +714,8 @@ def train_torchvision_detector(
                 )
 
         if config.audit_datasets:
-            _audit_dataset(train_ds_full, "train", num_classes=dataset_num_classes, logger=logging_logger)
-            _audit_dataset(val_ds_full, "val", num_classes=dataset_num_classes, logger=logging_logger)
+            _audit_dataset(train_ds_full, "train", num_classes=model_num_classes, logger=logging_logger)
+            _audit_dataset(val_ds_full, "val", num_classes=model_num_classes, logger=logging_logger)
 
         dataloader_kwargs = dict(
             batch_size=config.batch_size,
@@ -705,7 +765,7 @@ def train_torchvision_detector(
                 device,
                 logging_logger,
                 max_images=config.smoke_test_samples,
-                num_classes=dataset_num_classes,
+                num_classes=model_num_classes,
             )
 
         total_params = sum(p.numel() for p in model.parameters())
@@ -718,7 +778,7 @@ def train_torchvision_detector(
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.lr_step_size, gamma=config.lr_gamma)
         logging_logger.info("Starting training...")
 
-        num_classes = dataset_num_classes
+        num_classes = model_num_classes
         _ensure_frcnn_head(model, num_classes, logging_logger)
 
         last_progress = [time.monotonic()]
