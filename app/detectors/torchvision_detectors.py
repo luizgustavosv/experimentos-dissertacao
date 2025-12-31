@@ -246,7 +246,10 @@ class TorchvisionDetector(DetectionAlgorithm):
                 raise FileNotFoundError(f"Pesos não encontrados: {weights_path}")
             state_dict = torch.load(weights_path, map_location="cpu")
             num_classes = self._infer_faster_rcnn_num_classes(state_dict, logger)
-            model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, num_classes=num_classes)
+            try:
+                model = fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None, num_classes=num_classes)
+            except TypeError:
+                model = fasterrcnn_resnet50_fpn(weights=None, num_classes=num_classes)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             if logger:
                 if missing:
