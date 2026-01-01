@@ -25,7 +25,14 @@ from app.detectors.dataset_coco import (
     DetectionToTensor,
     DetectionTransformCompose,
 )
-from app.detectors.utils import coco_collate, describe_dataloader, ensure_weights_size, resolve_device, seed_everything
+from app.detectors.utils import (
+    atomic_torch_save,
+    coco_collate,
+    describe_dataloader,
+    ensure_weights_size,
+    resolve_device,
+    seed_everything,
+)
 from app.metrics import Metrics
 
 try:
@@ -940,11 +947,21 @@ def train_torchvision_detector(
                 time.perf_counter() - epoch_wall_start,
             )
 
+            val_mode = getattr(config, "val_mode", "loss")
+            if val_mode not in {"loss", "metrics"}:
+                logging_logger.warning("[VAL] val_mode desconhecido %s; forçando 'loss'", val_mode)
+                val_mode = "loss"
+
+            original_mode = model.training
             model.eval()
             val_loss_sum = 0.0
             val_component_sum: dict[str, float] = {}
             total_images = 0
             total_batches = 0
+            return_type_logged = False
+            if val_mode == "metrics":  # pragma: no cover - extensão futura
+                raise NotImplementedError("val_mode='metrics' ainda não implementado (mAP)")
+
             with _watchdog_paused(last_progress, watchdog_pause):
                 with torch.no_grad():
                     for vstep, (images, targets) in enumerate(val_loader, start=1):
@@ -955,25 +972,29 @@ def train_torchvision_detector(
                         ]
                         image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
                         _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
+
+                        model.train()
                         loss_out = model(images, targets)
-                        batch_loss = torch.tensor(0.0, device=device)
-                        batch_items: dict[str, float] = {}
-                        if isinstance(loss_out, dict) and loss_out:
-                            for key, value in loss_out.items():
-                                if torch.is_tensor(value):
-                                    val_tensor = value.mean() if value.dim() > 0 else value
-                                else:
-                                    val_tensor = torch.tensor(float(value), device=device)
-                                batch_loss = batch_loss + val_tensor
-                                batch_items[key] = float(val_tensor.detach().cpu())
-                        else:
-                            try:
-                                batch_loss, normalized_items = _normalize_losses(loss_out, device)
-                                batch_items.update({k: float(v) for k, v in normalized_items.items()})
-                            except Exception:
-                                logging_logger.exception("Falha ao normalizar losses no val; usando 0.0 para continuar.")
-                                batch_loss = torch.tensor(0.0, device=device)
-                        if not torch.isfinite(batch_loss):
+                        model.eval()
+
+                        if not return_type_logged:
+                            keys = list(loss_out.keys()) if isinstance(loss_out, dict) else None
+                            logging_logger.info(
+                                "[VAL] Return type detected: %s keys=%s", type(loss_out).__name__, keys
+                            )
+                            return_type_logged = True
+
+                        if not isinstance(loss_out, dict) or not all(
+                            torch.is_tensor(v) for v in loss_out.values()
+                        ):
+                            raise RuntimeError(
+                                "VAL expected loss dict, got predictions. Ensure calling model(images, targets) with model in "
+                                "train() under no_grad()."
+                            )
+
+                        batch_loss_tensor = sum(loss_out.values())
+
+                        if not torch.isfinite(batch_loss_tensor):
                             image_ids, file_paths = _collect_batch_identifiers(targets, val_loader.dataset)
                             target_dump = _summarize_targets_for_logging(targets)
                             logging_logger.error(
@@ -1011,26 +1032,32 @@ def train_torchvision_detector(
                             except Exception:
                                 logging_logger.exception("Falha ao salvar informações do bad batch de validação")
                             raise RuntimeError("Non-finite loss detected")
-                        if batch_items:
-                            logging_logger.debug(f"Loss components: {batch_items}")
 
                         total_batches += 1
                         total_images += len(images)
-                        val_loss_sum += float(batch_loss.detach().cpu())
-                        for key, value in batch_items.items():
-                            val_component_sum[key] = val_component_sum.get(key, 0.0) + value
+                        batch_loss_value = float(batch_loss_tensor.detach().cpu())
+                        val_loss_sum += batch_loss_value
+
+                        for key, value in loss_out.items():
+                            val_component_sum[key] = val_component_sum.get(key, 0.0) + float(value.detach().cpu())
+
+            if original_mode:
+                model.train()
+            else:
+                model.eval()
+
             val_loss_mean_per_batch = val_loss_sum / max(1, total_batches)
             val_loss_mean_per_image = val_loss_sum / max(1, total_images)
             breakdown_mean = {k: v / max(1, total_batches) for k, v in val_component_sum.items()}
             logging_logger.info(
-                f"[VAL] Época {epoch} | loss={val_loss_mean_per_batch:.4f} | loss/img={val_loss_mean_per_image:.4f}"
+                f"[VAL] Época {epoch} | loss/batch={val_loss_mean_per_batch:.4f} | loss/img={val_loss_mean_per_image:.4f}"
             )
             if breakdown_mean:
                 logging_logger.info("[VAL] Breakdown médio por batch: %s", breakdown_mean)
 
             with _watchdog_paused(last_progress, watchdog_pause):
                 epoch_ckpt = ckpt_dir / f"epoch_{epoch:03d}.pth"
-                torch.save(
+                atomic_torch_save(
                     {
                         "epoch": epoch,
                         "model_state": model.state_dict(),
@@ -1055,8 +1082,8 @@ def train_torchvision_detector(
 
         with _watchdog_paused(last_progress, watchdog_pause):
             logging_logger.info("Salvando pesos em %s", out)
-            torch.save(model.state_dict(), str(out))
-            ensure_weights_size(out)
+            atomic_torch_save(model.state_dict(), out)
+            ensure_weights_size(out, logger=logging_logger.info)
             weights_out = out
             logging_logger.info("Treinamento finalizado com sucesso.")
 
@@ -1080,7 +1107,7 @@ def train_torchvision_detector(
             with _watchdog_paused(last_progress, watchdog_pause):
                 final_epoch = epoch if epoch else 0
                 last_ckpt = ckpt_dir / "last.pth"
-                torch.save(
+                atomic_torch_save(
                     {
                         "epoch": final_epoch,
                         "model_state": model.state_dict(),

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -104,14 +105,62 @@ def validate_voc_dataset(dataset_dir: Path) -> Tuple[Path, List[str], List[str],
     return dataset_root, class_names, train_ids, val_ids
 
 
-def ensure_weights_size(weights_path: Path, min_bytes: int = 1_000_000) -> None:
+def atomic_torch_save(obj: Any, path: Path) -> Path:
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+    return path
+
+
+def _looks_like_state_dict(obj: Any) -> bool:
+    if isinstance(obj, dict):
+        if "model" in obj or "state_dict" in obj:
+            return True
+        if obj and all(torch.is_tensor(v) for v in obj.values()):
+            return True
+    return False
+
+
+def ensure_weights_size(
+    weights_path: Path, min_bytes: int = 1_000_000, logger: Optional[Logger] = None, integrity_check: bool = True
+) -> None:
+    weights_path = weights_path.expanduser().resolve()
+    if logger:
+        logger(f"[WEIGHTS] Saved weights path={weights_path}")
     if not weights_path.exists():
-        raise FileNotFoundError(f"Arquivo de pesos não foi criado: {weights_path}")
+        msg = f"Pesos não encontrados em {weights_path}."
+        if logger:
+            logger(f"[WEIGHTS] integrity_check=FAIL reason=missing_file")
+        raise FileNotFoundError(msg)
     size = weights_path.stat().st_size
+    if logger:
+        logger(f"[WEIGHTS] size_bytes={size} min_bytes={min_bytes}")
     if size < min_bytes:
-        raise ValueError(
-            f"Arquivo de pesos muito pequeno ({size} bytes). O treinamento pode não ter sido executado corretamente."
-        )
+        msg = f"Pesos muito pequenos ({size} bytes). Possível falha ao salvar."
+        if logger:
+            logger("[WEIGHTS] integrity_check=FAIL reason=size_below_min")
+        raise ValueError(msg)
+
+    if not integrity_check:
+        if logger:
+            logger("[WEIGHTS] integrity_check=SKIPPED")
+        return
+
+    try:
+        loaded = torch.load(weights_path, map_location="cpu")
+        if not _looks_like_state_dict(loaded):
+            raise ValueError("estrutura inesperada")
+    except Exception as exc:  # pragma: no cover - robustez de IO
+        if logger:
+            logger(f"[WEIGHTS] integrity_check=FAIL reason={exc}")
+        raise ValueError(f"Arquivo de pesos corrompido/incompleto em {weights_path}: {exc}") from exc
+
+    if logger:
+        logger("[WEIGHTS] integrity_check=OK")
 
 
 def save_state_dict(model: torch.nn.Module, path: Path) -> Path:
