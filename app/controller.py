@@ -204,6 +204,7 @@ class ExperimentController:
         images_dir: Path,
         weights_path: Path,
         val_annotations: Optional[Path] = None,
+        val_mode: Optional[str] = None,
         logger: Optional[Logger] = None,
         log_cb: Optional[Callable[[str], None]] = None,
     ) -> OperationResult:
@@ -221,6 +222,7 @@ class ExperimentController:
             weights_path.expanduser().resolve(),
             train_ann=coco_ann,
             val_ann=val_ann,
+            val_mode=val_mode,
             logger=logger,
             log_cb=log_cb,
         )

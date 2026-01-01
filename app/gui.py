@@ -72,6 +72,7 @@ class DetectorApp(tk.Tk):
         self.yolo_imgsz_var = tk.IntVar(value=640)
         self.yolo_batch_var = tk.IntVar(value=16)
         self.yolo_device_var = tk.StringVar(value="cpu")
+        self.val_mode_var = tk.StringVar(value="loss")
         self.run_button_text = tk.StringVar(value="Executar")
         self._variable_traces: list[tuple[tk.Variable, str]] = []
 
@@ -263,6 +264,7 @@ class DetectorApp(tk.Tk):
                     "validation_weights",
                     filetypes=get_weights_filetypes(algorithm),
                 )
+                self._add_val_mode_selector()
         elif action == "Normalizar dataset":
             self._add_dataset_type_selector()
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
@@ -346,6 +348,19 @@ class DetectorApp(tk.Tk):
         tk.Label(frame, text=label, bg="#12233d", fg="white").pack(anchor="w")
         spinbox = tk.Spinbox(frame, from_=0.1, to=1.0, increment=0.05, textvariable=variable or self.iou_threshold_var, width=8)
         spinbox.pack(anchor="w")
+
+    def _add_val_mode_selector(self) -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        tk.Label(frame, text="Modo de validação", bg="#12233d", fg="white").pack(anchor="w")
+        combo = ttk.Combobox(
+            frame,
+            textvariable=self.val_mode_var,
+            values=["loss", "metrics"],
+            state="readonly",
+            width=12,
+        )
+        combo.pack(anchor="w")
 
     def _add_numeric_selector(self, label: str, variable: tk.Variable) -> None:
         frame = tk.Frame(self.dynamic_frame, bg="#12233d")
@@ -677,6 +692,7 @@ class DetectorApp(tk.Tk):
                         images_dir=images_dir,
                         weights_path=weights,
                         val_annotations=val_annotations,
+                        val_mode=self.val_mode_var.get(),
                         logger=prompt_logger,
                         log_cb=lambda msg: self._emit_gui(msg, stdout=False),
                     )

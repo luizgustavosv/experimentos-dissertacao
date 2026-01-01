@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 
 @dataclass
@@ -32,5 +32,5 @@ class TrainConfig:
     audit_datasets: bool = True
     dataset_num_classes: Optional[int] = None
     num_classes: Optional[int] = None
-    val_mode: str = "loss"
+    val_mode: Literal["loss", "metrics"] = "loss"
     val_ratio: float = 0.1
