@@ -4,7 +4,7 @@ import csv
 import json
 import random
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -15,7 +15,7 @@ from PIL import Image
 from app.detectors.base import DetectorContext, Logger
 from app.detectors.torchvision_detectors import TorchvisionDetector
 from app.detectors.torchvision_models import build_faster_rcnn
-from app.detectors.torchvision_train import run_post_training_val_loss
+from app.detectors.torchvision_train import run_post_training_validation
 from app.detectors.utils import validate_coco_dataset
 from app.detectors.utils_visdrone_coco import normalize_visdrone_to_coco
 
@@ -42,6 +42,7 @@ class FasterRCNNDetector(TorchvisionDetector):
         weights_path: Path,
         train_ann: Optional[Path] = None,
         val_ann: Optional[Path] = None,
+        val_mode: Optional[str] = None,
         logger: Optional[Logger] = None,
         log_cb: Optional[Callable[[str], None]] = None,
     ) -> dict:
@@ -52,13 +53,15 @@ class FasterRCNNDetector(TorchvisionDetector):
         def _build_model(num_classes: int) -> torch.nn.Module:
             return self._prepare_model(num_classes, None, logger)
 
-        return run_post_training_val_loss(
+        config_to_use = replace(self.config, val_mode=val_mode) if val_mode else self.config
+
+        return run_post_training_validation(
             model_builder=_build_model,
             dataset_dir=dataset_dir,
             train_ann=train_ann,
             val_ann=val_ann,
             weights_path=weights_path,
-            config=self.config,
+            config=config_to_use,
             logger=logger,
             log_cb=log_cb,
             run_tag="faster_rcnn",

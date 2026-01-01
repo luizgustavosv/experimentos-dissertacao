@@ -73,6 +73,7 @@ class TorchvisionDetector(DetectionAlgorithm):
                 persistent_workers=self.config.persistent_workers,
                 prefetch_factor=self.config.prefetch_factor,
                 drop_last=self.config.drop_last,
+                val_mode=self.config.val_mode,
             ),
             logger=logger,
         )
