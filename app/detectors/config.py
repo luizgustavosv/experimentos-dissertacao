@@ -33,3 +33,4 @@ class TrainConfig:
     dataset_num_classes: Optional[int] = None
     num_classes: Optional[int] = None
     val_mode: str = "loss"
+    val_ratio: float = 0.1

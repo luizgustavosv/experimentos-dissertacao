@@ -36,7 +36,7 @@ class DetectorApp(tk.Tk):
         self.algorithm_actions: dict[str, list[str]] = {
             "YOLO": ["Treinar", "Inferir", "Avaliar YOLO", "Normalizar dataset"],
             "SSD": ["Treinar", "Inferir", "Avaliar SSD", "Normalizar dataset"],
-            "Faster R-CNN": ["Treinar", "Inferir", "Normalizar dataset"],
+            "Faster R-CNN": ["Treinar", "Inferir", "Validar", "Normalizar dataset"],
             "RetinaNet": ["Treinar", "Inferir", "Normalizar dataset"],
         }
         self.algorithm_var = tk.StringVar(value="YOLO")
@@ -59,6 +59,7 @@ class DetectorApp(tk.Tk):
             "yolo_eval_dataset": tk.StringVar(),
             "yolo_eval_weights": tk.StringVar(),
             "yolo_eval_out": tk.StringVar(),
+            "val_annotations": tk.StringVar(),
         }
         self.epochs_var = tk.IntVar(value=10)
         self.pedestrian_only_var = tk.BooleanVar(value=False)
@@ -240,6 +241,28 @@ class DetectorApp(tk.Tk):
                 self._add_numeric_selector("Tamanho do batch", self.yolo_batch_var)
                 self._add_device_selector()
                 self._register_yolo_eval_traces()
+        elif action == "Validar":
+            if algorithm != "Faster R-CNN":
+                tk.Label(
+                    self.dynamic_frame,
+                    text="A validação pós-treinamento está disponível apenas para o algoritmo Faster R-CNN.",
+                    bg="#12233d",
+                    fg="white",
+                    wraplength=760,
+                ).pack(fill="x", padx=10, pady=6)
+            else:
+                self._add_path_selector("Anotações COCO de treino (.json)", "annotations", filetypes=[("COCO JSON", "*.json")])
+                self._add_path_selector(
+                    "Anotações COCO de validação (.json) [opcional]",
+                    "val_annotations",
+                    filetypes=[("COCO JSON", "*.json")],
+                )
+                self._add_path_selector("Pasta de imagens COCO (deve conter train/ e val/)", "images", is_dir=True)
+                self._add_path_selector(
+                    "Pesos do Faster R-CNN",
+                    "validation_weights",
+                    filetypes=get_weights_filetypes(algorithm),
+                )
         elif action == "Normalizar dataset":
             self._add_dataset_type_selector()
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
@@ -620,6 +643,40 @@ class DetectorApp(tk.Tk):
                         device=device,
                         conf=conf,
                         iou=iou,
+                        logger=prompt_logger,
+                        log_cb=lambda msg: self._emit_gui(msg, stdout=False),
+                    )
+
+            elif action == "Validar":
+                if algorithm_key != "Faster R-CNN":
+                    raise ValueError("Selecione o algoritmo Faster R-CNN para executar a validação pós-treinamento.")
+
+                train_annotations = Path(self.path_vars["annotations"].get())
+                images_dir = Path(self.path_vars["images"].get())
+                val_annotations_raw = self.path_vars["val_annotations"].get().strip()
+                val_annotations = Path(val_annotations_raw) if val_annotations_raw else None
+                weights = Path(self.path_vars["validation_weights"].get())
+
+                prompt_logger(
+                    self._build_prompt_command(
+                        "validar",
+                        algorithm_key,
+                        {
+                            "treino": train_annotations,
+                            "val": val_annotations or "auto",
+                            "imagens": images_dir,
+                            "pesos": weights,
+                        },
+                    )
+                )
+
+                def run_action() -> OperationResult:
+                    return self.controller.execute_validate_faster_rcnn(
+                        algorithm_key,
+                        train_annotations=train_annotations,
+                        images_dir=images_dir,
+                        weights_path=weights,
+                        val_annotations=val_annotations,
                         logger=prompt_logger,
                         log_cb=lambda msg: self._emit_gui(msg, stdout=False),
                     )

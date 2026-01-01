@@ -6,7 +6,7 @@ import random
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -15,6 +15,8 @@ from PIL import Image
 from app.detectors.base import DetectorContext, Logger
 from app.detectors.torchvision_detectors import TorchvisionDetector
 from app.detectors.torchvision_models import build_faster_rcnn
+from app.detectors.torchvision_train import run_post_training_val_loss
+from app.detectors.utils import validate_coco_dataset
 from app.detectors.utils_visdrone_coco import normalize_visdrone_to_coco
 
 
@@ -33,6 +35,34 @@ class ImageAnnotations:
 class FasterRCNNDetector(TorchvisionDetector):
     def __init__(self, context: DetectorContext):
         super().__init__(context, build_faster_rcnn)
+
+    def validate_trained_weights(
+        self,
+        dataset_dir: Path,
+        weights_path: Path,
+        train_ann: Optional[Path] = None,
+        val_ann: Optional[Path] = None,
+        logger: Optional[Logger] = None,
+        log_cb: Optional[Callable[[str], None]] = None,
+    ) -> dict:
+        dataset_dir = dataset_dir.expanduser().resolve()
+        if train_ann is None or val_ann is None:
+            train_ann, val_ann = validate_coco_dataset(dataset_dir)
+
+        def _build_model(num_classes: int) -> torch.nn.Module:
+            return self._prepare_model(num_classes, None, logger)
+
+        return run_post_training_val_loss(
+            model_builder=_build_model,
+            dataset_dir=dataset_dir,
+            train_ann=train_ann,
+            val_ann=val_ann,
+            weights_path=weights_path,
+            config=self.config,
+            logger=logger,
+            log_cb=log_cb,
+            run_tag="faster_rcnn",
+        )
 
     def _prepare_model(
         self, num_classes: int, pretrained_weights: Optional[Path], logger: Optional[Logger]
