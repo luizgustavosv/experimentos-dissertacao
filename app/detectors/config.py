@@ -32,3 +32,4 @@ class TrainConfig:
     audit_datasets: bool = True
     dataset_num_classes: Optional[int] = None
     num_classes: Optional[int] = None
+    val_mode: str = "loss"
