@@ -10,7 +10,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch.nn.utils import clip_grad_norm_
@@ -202,9 +202,14 @@ def _safe_stream(prefer: str, log_dir: Path):
 
 
 def _configure_logging(
-    verbose: bool, log_dir: Path, external_logger: Optional[Logger], stream_override=None
+    verbose: bool,
+    log_dir: Path,
+    external_logger: Optional[Logger],
+    stream_override=None,
+    logger_name: str = "ssd_train",
+    log_prefix: str = "ssd_train",
 ) -> tuple[logging.Logger, Path]:
-    logger = logging.getLogger("ssd_train")
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
     for handler in list(logger.handlers):
@@ -212,7 +217,7 @@ def _configure_logging(
 
     log_dir = log_dir.expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"ssd_train_{datetime.now():%Y%m%d_%H%M%S}.log"
+    log_path = log_dir / f"{log_prefix}_{datetime.now():%Y%m%d_%H%M%S}.log"
     formatter = logging.Formatter(fmt="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
     stream_handler = logging.StreamHandler(stream=stream_override or _safe_stream("stdout", log_dir))
@@ -610,6 +615,280 @@ def _split_dataset(dataset, val_ratio: float, seed: int):
     return random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed))
 
 
+def _extract_state_dict(loaded: Any) -> tuple[Dict[str, torch.Tensor], str]:
+    if isinstance(loaded, dict):
+        model_obj = loaded.get("model")
+        if isinstance(model_obj, dict):
+            return model_obj, "checkpoint.model"
+        state_dict = loaded.get("state_dict")
+        if isinstance(state_dict, dict):
+            return state_dict, "checkpoint.state_dict"
+        if loaded and all(torch.is_tensor(v) for v in loaded.values()):
+            return loaded, "state_dict"
+    raise ValueError("Formato de checkpoint não suportado para carregamento de pesos.")
+
+
+def _build_val_loader_and_classes(
+    dataset_dir: Path,
+    train_ann: Path,
+    val_ann: Path,
+    config: TrainConfig,
+    logging_logger: logging.Logger,
+    *,
+    override_val_ratio: Optional[float] = None,
+) -> tuple[DataLoader, int, int, int]:
+    transform = _build_detection_transforms(config.imgsz, logging_logger)
+    logging_logger.info("[SETUP] Construindo datasets COCO para validação pós-treinamento")
+    train_ds_full = CocoDetectionDataset(dataset_dir / "images" / "train", train_ann, transforms=transform)
+    val_ds_full = CocoDetectionDataset(dataset_dir / "images" / "val", val_ann, transforms=transform)
+
+    val_ratio = config.val_ratio if override_val_ratio is None else override_val_ratio
+    if val_ratio and val_ratio > 0:
+        logging_logger.info("[SETUP] Aplicando split adicional train/val com val_ratio=%.3f seed=%s", val_ratio, config.seed)
+        train_ds_full, extra_val = _split_dataset(train_ds_full, val_ratio, config.seed)
+        val_ds_full = extra_val
+
+    describe_dataloader(train_ds_full, logging_logger.info)
+    logging_logger.info("[SETUP] Tamanho train=%d | val=%d", len(train_ds_full), len(val_ds_full))
+
+    configured_dataset_classes = getattr(config, "dataset_num_classes", None)
+    configured_model_num_classes = getattr(config, "num_classes", None)
+
+    inferred_train_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(train_ds_full))
+    inferred_val_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(val_ds_full))
+
+    dataset_num_classes = configured_dataset_classes if configured_dataset_classes is not None else inferred_train_classes
+
+    looks_like_visdrone = _is_visdrone_dataset(dataset_dir, train_ds_full) or _is_visdrone_dataset(dataset_dir, val_ds_full)
+    if dataset_num_classes is None and looks_like_visdrone:
+        dataset_num_classes = VISDRONE_MULTICLASS_DATASET_CLASSES
+
+    if dataset_num_classes is None and configured_model_num_classes is not None and configured_model_num_classes > 0:
+        dataset_num_classes = max(1, configured_model_num_classes - 1)
+
+    if dataset_num_classes is None:
+        raise ValueError("Não foi possível inferir num_classes a partir do dataset; verifique as categorias.")
+
+    if inferred_val_classes is not None and inferred_val_classes != dataset_num_classes:
+        logging_logger.warning(
+            "[AUDIT] num_classes do val (%s) difere do train (%s); usando o do train.",
+            inferred_val_classes,
+            dataset_num_classes,
+        )
+
+    model_num_classes = configured_model_num_classes
+    if model_num_classes is None:
+        model_num_classes = dataset_num_classes + 1 if dataset_num_classes > 0 else dataset_num_classes
+
+    if looks_like_visdrone:
+        logging_logger.info(
+            "[DATASET] VisDrone multi-class: dataset_classes=%d -> model_num_classes=%d (incluindo background)",
+            dataset_num_classes,
+            model_num_classes,
+        )
+
+    dataloader_kwargs = dict(
+        batch_size=config.batch_size,
+        collate_fn=coco_collate,
+        drop_last=config.drop_last,
+    )
+    val_workers = config.num_workers
+    pin_memory = config.pin_memory
+    persistent_workers = config.persistent_workers
+    prefetch_factor = config.prefetch_factor
+    if config.debug_dataloader:
+        logging_logger.warning("[DATALOADER] Modo debug ativado -> num_workers=0, persistent_workers=False, pin_memory=False")
+        val_workers = 0
+        pin_memory = False
+        persistent_workers = False
+        prefetch_factor = None
+        dataloader_kwargs["drop_last"] = False
+    if val_workers > 0:
+        dataloader_kwargs.update(
+            num_workers=val_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
+        if prefetch_factor is not None:
+            dataloader_kwargs["prefetch_factor"] = prefetch_factor
+    else:
+        dataloader_kwargs["num_workers"] = 0
+
+    logging_logger.info(
+        "[DATALOADER] (val) batch_size=%s num_workers=%s pin_memory=%s persistent_workers=%s prefetch_factor=%s drop_last=%s",
+        dataloader_kwargs.get("batch_size"),
+        dataloader_kwargs.get("num_workers"),
+        dataloader_kwargs.get("pin_memory"),
+        dataloader_kwargs.get("persistent_workers"),
+        dataloader_kwargs.get("prefetch_factor"),
+        dataloader_kwargs.get("drop_last"),
+    )
+
+    val_loader = DataLoader(val_ds_full, shuffle=False, **dataloader_kwargs)
+    return val_loader, int(model_num_classes), int(dataset_num_classes), int(dataloader_kwargs.get("num_workers", 0))
+
+
+def run_val_loss_loop(
+    model: torch.nn.Module,
+    val_loader: DataLoader,
+    device_str: str,
+    num_classes: int,
+    logging_logger: logging.Logger,
+    *,
+    tag: str = "[VAL-POST]",
+) -> dict:
+    model.eval()
+    val_loss_sum = 0.0
+    val_component_sum: dict[str, float] = {}
+    total_images = 0
+    total_batches = 0
+    return_type_logged = False
+
+    with torch.no_grad():
+        for vstep, (images, targets) in enumerate(val_loader, start=1):
+            images = [img.to(device_str) for img in images]
+            targets = [
+                {k: (v.to(device_str) if torch.is_tensor(v) else v) for k, v in t.items()}
+                for t in targets
+            ]
+            image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
+            _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
+
+            model.train()
+            loss_out = model(images, targets)
+            model.eval()
+
+            if not return_type_logged:
+                keys = list(loss_out.keys()) if isinstance(loss_out, dict) else None
+                logging_logger.info("%s Return type detected: %s keys=%s", tag, type(loss_out).__name__, keys)
+                return_type_logged = True
+
+            if not isinstance(loss_out, dict) or not all(
+                torch.is_tensor(v) and (v.is_floating_point() or v.is_complex()) for v in loss_out.values()
+            ):
+                raise RuntimeError(
+                    "Validação pós-treinamento esperava um dicionário de losses; recebeu predições."
+                )
+
+            batch_loss_tensor = sum(loss_out.values())
+
+            if not torch.isfinite(batch_loss_tensor):
+                raise RuntimeError(f"Loss não finito detectado no val (step={vstep}).")
+
+            total_batches += 1
+            total_images += len(images)
+            batch_loss_value = float(batch_loss_tensor.detach().cpu())
+            val_loss_sum += batch_loss_value
+
+            for key, value in loss_out.items():
+                val_component_sum[key] = val_component_sum.get(key, 0.0) + float(value.detach().cpu())
+
+    val_loss_mean_per_batch = val_loss_sum / max(1, total_batches)
+    val_loss_mean_per_image = val_loss_sum / max(1, total_images)
+    breakdown_mean = {k: v / max(1, total_batches) for k, v in val_component_sum.items()}
+    logging_logger.info(f"{tag} loss/batch={val_loss_mean_per_batch:.4f} | loss/img={val_loss_mean_per_image:.4f}")
+    if breakdown_mean:
+        logging_logger.info("%s Breakdown médio por batch: %s", tag, breakdown_mean)
+
+    return {
+        "loss_per_batch": val_loss_mean_per_batch,
+        "loss_per_image": val_loss_mean_per_image,
+        "breakdown": breakdown_mean,
+        "total_batches": total_batches,
+        "total_images": total_images,
+    }
+
+
+def run_post_training_val_loss(
+    model_builder: Callable[[int], torch.nn.Module],
+    dataset_dir: Path,
+    train_ann: Path,
+    val_ann: Path,
+    weights_path: Path,
+    config: TrainConfig,
+    *,
+    logger: Optional[Logger] = None,
+    log_cb: Optional[Callable[[str], None]] = None,
+    run_tag: str = "torchvision",
+) -> dict:
+    log_dir = Path(config.log_dir).expanduser().resolve()
+    safe_stdout = _safe_stream(f"{run_tag}_val_stdout", log_dir)
+    logging_logger, log_path = _configure_logging(
+        config.verbose,
+        log_dir,
+        logger,
+        stream_override=safe_stdout,
+        logger_name=f"{run_tag}_val",
+        log_prefix=f"{run_tag}_val",
+    )
+
+    def _emit(message: str) -> None:
+        if log_cb:
+            log_cb(message)
+        logging_logger.info(message)
+
+    _emit(f"[{run_tag.upper()}][VAL-POST] Logger inicializado em {log_path}")
+
+    device_str = resolve_device(config.device)
+    device = torch.device(device_str)
+    _emit(f"[{run_tag.upper()}][VAL-POST] Dispositivo: {device_str}")
+
+    ensure_weights_size(weights_path, logger=_emit)
+
+    val_loader, model_num_classes, dataset_num_classes, num_workers = _build_val_loader_and_classes(
+        dataset_dir, train_ann, val_ann, config, logging_logger
+    )
+
+    model = model_builder(model_num_classes)
+    model.to(device)
+
+    loaded = torch.load(weights_path.expanduser().resolve(), map_location="cpu")
+    state_dict, checkpoint_format = _extract_state_dict(loaded)
+    _emit(f"[{run_tag.upper()}][VAL-POST] Formato de checkpoint: {checkpoint_format}")
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        _emit(f"[{run_tag.upper()}][VAL-POST] missing_keys: {missing}")
+    if unexpected:
+        _emit(f"[{run_tag.upper()}][VAL-POST] unexpected_keys: {unexpected}")
+
+    results = run_val_loss_loop(
+        model,
+        val_loader,
+        device_str,
+        num_classes=model_num_classes,
+        logging_logger=logging_logger,
+    )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = log_dir / run_tag / "val_post" / timestamp
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_payload = {
+        "dataset": str(dataset_dir),
+        "train_annotations": str(train_ann),
+        "val_annotations": str(val_ann),
+        "split": "val",
+        "val_ratio": config.val_ratio,
+        "seed": config.seed,
+        "imgsz": config.imgsz,
+        "batch_size": config.batch_size,
+        "num_workers": num_workers,
+        "weights_path": str(weights_path.expanduser().resolve()),
+        "timestamp": datetime.now().isoformat(),
+        "device": device_str,
+        "dataset_num_classes": dataset_num_classes,
+        "model_num_classes": model_num_classes,
+        **results,
+    }
+    results_payload.update({"output_dir": str(out_dir)})
+    results_path = out_dir / "results.json"
+    results_path.write_text(json.dumps(results_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    _emit(f"[{run_tag.upper()}][VAL-POST] Resultado salvo em {results_path}")
+
+    results_payload.update({"results_path": str(results_path)})
+
+    return results_payload
+
+
 def train_torchvision_detector(
     model: torch.nn.Module,
     dataset_dir: Path,
@@ -618,7 +897,7 @@ def train_torchvision_detector(
     weights_out: Path,
     config: TrainConfig,
     logger: Optional[Logger] = None,
-    val_ratio: float = 0.1,
+    val_ratio: Optional[float] = None,
     train_dataset=None,
     val_dataset=None,
     checkpoint_dir: Optional[Path] = None,
@@ -655,6 +934,8 @@ def train_torchvision_detector(
     epoch = 0
     optimizer: Optional[torch.optim.Optimizer] = None
     try:
+        val_ratio_to_use = config.val_ratio if val_ratio is None else val_ratio
+
         if train_dataset is None or val_dataset is None:
             transform = _build_detection_transforms(config.imgsz, logging_logger)
             logging_logger.info("[SETUP] Construindo datasets COCO a partir de %s", dataset_dir)
@@ -662,9 +943,11 @@ def train_torchvision_detector(
             val_ds_full = CocoDetectionDataset(dataset_dir / "images" / "val", val_ann, transforms=transform)
 
             # Dividir train em train/val adicionais se desejado
-            if val_ratio > 0:
-                logging_logger.info("[SETUP] Aplicando split adicional train/val com val_ratio=%.3f seed=%s", val_ratio, config.seed)
-                train_ds_full, extra_val = _split_dataset(train_ds_full, val_ratio, config.seed)
+            if val_ratio_to_use and val_ratio_to_use > 0:
+                logging_logger.info(
+                    "[SETUP] Aplicando split adicional train/val com val_ratio=%.3f seed=%s", val_ratio_to_use, config.seed
+                )
+                train_ds_full, extra_val = _split_dataset(train_ds_full, val_ratio_to_use, config.seed)
                 val_ds_full = extra_val
         else:
             logging_logger.info("[SETUP] Usando datasets pré-construídos (train/val).")
