@@ -42,6 +42,9 @@ try:
 except Exception:  # pragma: no cover - fallback silencioso se tqdm não estiver disponível
     tqdm = None
 
+_retinanet_label_log_before = False
+_retinanet_label_log_after = False
+
 
 def _describe_structure(obj: Any, depth: int = 0, max_depth: int = 4) -> str:
     if depth >= max_depth:
@@ -330,6 +333,73 @@ def _is_visdrone_dataset(dataset_dir: Path, dataset: Any) -> bool:
     return False
 
 
+def _remap_retinanet_labels(
+    targets: list[dict[str, torch.Tensor]], *, num_classes: int, logger: logging.Logger
+) -> None:
+    global _retinanet_label_log_before, _retinanet_label_log_after
+
+    if num_classes <= 0:
+        raise ValueError("[RETINANET] num_classes inválido para remapeamento de labels.")
+
+    labels_before: list[torch.Tensor] = []
+    for target in targets:
+        labels = target.get("labels") if isinstance(target, dict) else None
+        if not torch.is_tensor(labels):
+            continue
+        if labels.numel() > 0:
+            labels_before.append(labels)
+            if (labels <= 0).any():
+                bad_example = int(labels.min())
+                raise ValueError(
+                    f"[RETINANET] category_id inválido (<=0) detectado antes do remap. Exemplo: {bad_example}."
+                )
+
+    if labels_before and not _retinanet_label_log_before:
+        merged = torch.cat(labels_before)
+        _retinanet_label_log_before = True
+        logger.info(
+            "[RETINANET] label range before remap: min=%d max=%d",
+            int(merged.min()),
+            int(merged.max()),
+        )
+
+    for target in targets:
+        labels = target.get("labels") if isinstance(target, dict) else None
+        if torch.is_tensor(labels):
+            target["labels"] = labels - 1
+
+    labels_after: list[torch.Tensor] = []
+    for target in targets:
+        labels = target.get("labels") if isinstance(target, dict) else None
+        if torch.is_tensor(labels) and labels.numel() > 0:
+            labels_after.append(labels)
+
+    if labels_after:
+        merged = torch.cat(labels_after)
+        if (merged < 0).any() or (merged >= num_classes).any():
+            raise ValueError(
+                (
+                    f"[RETINANET] Labels fora do intervalo após remap (esperado 0..{num_classes - 1}). "
+                    f"Exemplo min={int(merged.min())} max={int(merged.max())}"
+                )
+            )
+        if not _retinanet_label_log_after:
+            _retinanet_label_log_after = True
+            logger.info(
+                "[RETINANET] label range after remap: min=%d max=%d num_classes=%d",
+                int(merged.min()),
+                int(merged.max()),
+                num_classes,
+            )
+
+
+def _maybe_remap_retinanet_targets(
+    model: torch.nn.Module, targets: list[dict[str, torch.Tensor]], *, num_classes: int, logger: logging.Logger
+) -> None:
+    if isinstance(model, RetinaNet):
+        _remap_retinanet_labels(targets, num_classes=num_classes, logger=logger)
+
+
 def _validate_targets_batch(
     targets: list[dict[str, torch.Tensor]],
     *,
@@ -571,6 +641,7 @@ def _run_smoke_test_val_loss(
             ]
             image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
             _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logger)
+            _maybe_remap_retinanet_targets(model, targets, num_classes=num_classes or 0, logger=logger)
             loss_out = model(images, targets)
             batch_loss = torch.tensor(0.0, device=device)
             if isinstance(loss_out, dict) and loss_out:
@@ -757,6 +828,7 @@ def _build_val_loader_and_classes(
     logging_logger: logging.Logger,
     *,
     override_val_ratio: Optional[float] = None,
+    expects_background: bool = True,
 ) -> tuple[DataLoader, int, int, int]:
     transform = _build_detection_transforms(config.imgsz, logging_logger)
     logging_logger.info("[SETUP] Construindo datasets COCO para validação pós-treinamento")
@@ -783,7 +855,9 @@ def _build_val_loader_and_classes(
     if configured_dataset_classes is not None:
         dataset_num_classes = configured_dataset_classes
     elif configured_model_num_classes is not None and configured_model_num_classes > 0:
-        dataset_num_classes = max(1, configured_model_num_classes - 1)
+        dataset_num_classes = (
+            max(1, configured_model_num_classes - 1) if expects_background else configured_model_num_classes
+        )
     elif ann_dataset_classes is not None:
         dataset_num_classes = ann_dataset_classes
     else:
@@ -811,28 +885,30 @@ def _build_val_loader_and_classes(
             dataset_num_classes,
         )
 
-    expected_model_classes = dataset_num_classes + 1 if dataset_num_classes > 0 else dataset_num_classes
+    expected_model_classes = dataset_num_classes + 1 if expects_background and dataset_num_classes > 0 else dataset_num_classes
     model_num_classes = expected_model_classes
     if configured_model_num_classes is not None and configured_model_num_classes > 0:
         model_num_classes = configured_model_num_classes
         if configured_model_num_classes != expected_model_classes:
             logging_logger.warning(
-                "[DATASET] num_classes configurado (%s) difere do esperado para background (%s); respeitando o configurado.",
+                "[DATASET] num_classes configurado (%s) difere do esperado (%s); respeitando o configurado.",
                 configured_model_num_classes,
                 expected_model_classes,
             )
 
     logging_logger.info(
-        "[MODEL] num_classes configurado=%d (esperado c/ background=%s)",
+        "[MODEL] num_classes configurado=%d (esperado%s=%s)",
         model_num_classes,
+        " c/ background" if expects_background else " foreground",
         expected_model_classes,
     )
 
     if looks_like_visdrone:
         logging_logger.info(
-            "[DATASET] VisDrone multi-class: dataset_classes=%d -> model_num_classes=%d (incluindo background)",
+            "[DATASET] VisDrone multi-class: dataset_classes=%d -> model_num_classes=%d (%s)",
             dataset_num_classes,
             model_num_classes,
+            "incluindo background" if expects_background else "foreground only",
         )
 
     dataloader_kwargs = dict(
@@ -903,6 +979,7 @@ def run_val_loss_loop(
             _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
 
             model.train()
+            _maybe_remap_retinanet_targets(model, targets, num_classes=num_classes, logger=logging_logger)
             loss_out = model(images, targets)
             model.eval()
 
@@ -964,6 +1041,7 @@ def run_val_coco_metrics(
     coco_cat_ids = sorted(int(cat_id) for cat_id in coco_gt.getCatIds())
     dataset_num_classes = len(coco_cat_ids)
     logging_logger.info("%s [DATASET] COCO categories=%d ids=%s", tag, dataset_num_classes, coco_cat_ids)
+    is_retinanet = isinstance(model, RetinaNet)
 
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -975,8 +1053,13 @@ def run_val_coco_metrics(
         raise RuntimeError(f"{tag} Não há categorias no GT para gerar métricas COCO.")
 
     predictions: list[dict[str, float | int | list[float]]] = []
-    label_mapping: dict[int, int] = {i: coco_cat_ids[i - 1] for i in range(1, dataset_num_classes + 1)}
-    logging_logger.info("%s label->category_id mapping (foreground): %s", tag, label_mapping)
+    if is_retinanet:
+        logging_logger.info(
+            "%s [RETINANET] Exportando category_id como pred_label+1 | coco_ids=%s", tag, coco_cat_ids
+        )
+    else:
+        label_mapping: dict[int, int] = {i: coco_cat_ids[i - 1] for i in range(1, dataset_num_classes + 1)}
+        logging_logger.info("%s label->category_id mapping (foreground): %s", tag, label_mapping)
 
     model.eval()
     predicted_image_ids: set[int] = set()
@@ -1007,23 +1090,41 @@ def run_val_coco_metrics(
 
                 for box, score, label in zip(boxes_cpu, scores_cpu, labels_cpu):
                     raw_label = int(label)
-                    if raw_label <= 0 or raw_label > dataset_num_classes:
-                        invalid_label_count += 1
-                        if len(invalid_label_examples) < 5:
-                            invalid_label_examples.append(
-                                {
-                                    "label": raw_label,
-                                    "score": float(score),
-                                    "image_id": int(image_id),
-                                }
+                    if is_retinanet:
+                        if raw_label < 0 or raw_label >= dataset_num_classes:
+                            invalid_label_count += 1
+                            if len(invalid_label_examples) < 5:
+                                invalid_label_examples.append(
+                                    {
+                                        "label": raw_label,
+                                        "score": float(score),
+                                        "image_id": int(image_id),
+                                    }
+                                )
+                            continue
+                        category_id = raw_label + 1
+                        if category_id not in coco_cat_ids:
+                            raise RuntimeError(
+                                f"{tag} category_id inválido após remap: {category_id} não está em {coco_cat_ids}"
                             )
-                        continue
+                    else:
+                        if raw_label <= 0 or raw_label > dataset_num_classes:
+                            invalid_label_count += 1
+                            if len(invalid_label_examples) < 5:
+                                invalid_label_examples.append(
+                                    {
+                                        "label": raw_label,
+                                        "score": float(score),
+                                        "image_id": int(image_id),
+                                    }
+                                )
+                            continue
 
-                    category_id = label_mapping.get(raw_label)
-                    if category_id is None:
-                        raise RuntimeError(
-                            f"label {raw_label} não encontrado no mapping; revise categorias ou mapeamento."
-                        )
+                        category_id = label_mapping.get(raw_label)
+                        if category_id is None:
+                            raise RuntimeError(
+                                f"label {raw_label} não encontrado no mapping; revise categorias ou mapeamento."
+                            )
                     predicted_image_ids.add(int(image_id))
                     predicted_category_ids.add(int(category_id))
                     predictions.append(
@@ -1037,13 +1138,22 @@ def run_val_coco_metrics(
 
     logging_logger.info("%s Maior label previsto (raw)=%s", tag, max_label_observed)
     if invalid_label_count:
-        logging_logger.warning(
-            "%s Labels fora do intervalo (1..%d) encontrados: %d descartados. Exemplos: %s",
-            tag,
-            dataset_num_classes,
-            invalid_label_count,
-            invalid_label_examples,
-        )
+        if is_retinanet:
+            logging_logger.warning(
+                "%s Labels fora do intervalo (0..%d) encontrados: %d descartados. Exemplos: %s",
+                tag,
+                dataset_num_classes - 1,
+                invalid_label_count,
+                invalid_label_examples,
+            )
+        else:
+            logging_logger.warning(
+                "%s Labels fora do intervalo (1..%d) encontrados: %d descartados. Exemplos: %s",
+                tag,
+                dataset_num_classes,
+                invalid_label_count,
+                invalid_label_examples,
+            )
 
     predictions_path.write_text(json.dumps(predictions, ensure_ascii=False), encoding="utf-8")
     gt_image_ids = set(int(x) for x in coco_gt.getImgIds())
@@ -1146,8 +1256,9 @@ def run_post_training_validation(
 
     ensure_weights_size(weights_path, logger=_emit)
 
+    expects_background = getattr(config, "num_classes", None) != getattr(config, "dataset_num_classes", None)
     val_loader, model_num_classes, dataset_num_classes, num_workers = _build_val_loader_and_classes(
-        dataset_dir, train_ann, val_ann, config, logging_logger
+        dataset_dir, train_ann, val_ann, config, logging_logger, expects_background=expects_background
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1315,6 +1426,7 @@ def train_torchvision_detector(
 
         configured_dataset_classes = getattr(config, "dataset_num_classes", None)
         configured_model_num_classes = getattr(config, "num_classes", None)
+        use_background = not isinstance(model, RetinaNet)
 
         train_ann_classes, train_cat_ids = _infer_dataset_classes_from_annotations(train_ann, "train", logging_logger)
         val_ann_classes, val_cat_ids = _infer_dataset_classes_from_annotations(val_ann, "val", logging_logger)
@@ -1327,7 +1439,9 @@ def train_torchvision_detector(
         if configured_dataset_classes is not None:
             dataset_num_classes = configured_dataset_classes
         elif configured_model_num_classes is not None and configured_model_num_classes > 0:
-            dataset_num_classes = max(1, configured_model_num_classes - 1)
+            dataset_num_classes = (
+                max(1, configured_model_num_classes - 1) if use_background else configured_model_num_classes
+            )
         elif ann_dataset_classes is not None:
             dataset_num_classes = ann_dataset_classes
         else:
@@ -1357,28 +1471,30 @@ def train_torchvision_detector(
                 dataset_num_classes,
             )
 
-        expected_model_classes = dataset_num_classes + 1 if dataset_num_classes > 0 else dataset_num_classes
+        expected_model_classes = dataset_num_classes + 1 if use_background and dataset_num_classes > 0 else dataset_num_classes
         model_num_classes = expected_model_classes
         if configured_model_num_classes is not None and configured_model_num_classes > 0:
             model_num_classes = configured_model_num_classes
             if configured_model_num_classes != expected_model_classes:
                 logging_logger.warning(
-                    "[DATASET] num_classes configurado (%s) difere do esperado para background (%s); respeitando o configurado.",
+                    "[DATASET] num_classes configurado (%s) difere do esperado (%s); respeitando o configurado.",
                     configured_model_num_classes,
                     expected_model_classes,
                 )
 
         logging_logger.info(
-            "[MODEL] num_classes configurado=%d (esperado c/ background=%s)",
+            "[MODEL] num_classes configurado=%d (esperado%s=%s)",
             model_num_classes,
+            " c/ background" if use_background else " foreground",
             expected_model_classes,
         )
 
         if looks_like_visdrone:
             logging_logger.info(
-                "[DATASET] VisDrone multi-class: dataset_classes=%d -> model_num_classes=%d (incluindo background)",
+                "[DATASET] VisDrone multi-class: dataset_classes=%d -> model_num_classes=%d (%s)",
                 dataset_num_classes,
                 model_num_classes,
+                "incluindo background" if use_background else "foreground only",
             )
 
         if hasattr(train_ds_full, "transforms") and hasattr(val_ds_full, "transforms"):
@@ -1500,6 +1616,7 @@ def train_torchvision_detector(
                 image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
                 _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
 
+                _maybe_remap_retinanet_targets(model, targets, num_classes=num_classes, logger=logging_logger)
                 loss_out = model(images, targets)
                 if not logged_loss_structure:
                     try:
@@ -1657,6 +1774,9 @@ def train_torchvision_detector(
                             )
 
                             model.train()
+                            _maybe_remap_retinanet_targets(
+                                model, targets, num_classes=num_classes, logger=logging_logger
+                            )
                             loss_out = model(images, targets)
                             model.eval()
 
