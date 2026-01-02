@@ -655,6 +655,73 @@ def _extract_state_dict(loaded: Any) -> tuple[Dict[str, torch.Tensor], str]:
     raise ValueError("Formato de checkpoint não suportado para carregamento de pesos.")
 
 
+def _detect_checkpoint_num_classes(state_dict: Dict[str, torch.Tensor]) -> Optional[int]:
+    predictor_weight = state_dict.get("roi_heads.box_predictor.cls_score.weight")
+    if predictor_weight is not None and hasattr(predictor_weight, "shape") and len(predictor_weight.shape) > 0:
+        return int(predictor_weight.shape[0])
+    return None
+
+
+def _strip_box_predictor_head(
+    state_dict: Dict[str, torch.Tensor],
+) -> tuple[Dict[str, torch.Tensor], list[str]]:
+    box_keys = {
+        "roi_heads.box_predictor.cls_score.weight",
+        "roi_heads.box_predictor.cls_score.bias",
+        "roi_heads.box_predictor.bbox_pred.weight",
+        "roi_heads.box_predictor.bbox_pred.bias",
+    }
+    ignored = [key for key in state_dict if key in box_keys]
+    filtered = {key: value for key, value in state_dict.items() if key not in box_keys}
+    return filtered, ignored
+
+
+def _load_frcnn_weights_with_head_guard(
+    model: torch.nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+    *,
+    model_num_classes: int,
+    emit_info: Callable[[str], None],
+    emit_warning: Callable[[str], None],
+    logging_logger: logging.Logger,
+) -> tuple[list[str], list[str], Optional[int], bool, list[str]]:
+    ckpt_num_classes = _detect_checkpoint_num_classes(state_dict)
+    head_mismatch = ckpt_num_classes is not None and ckpt_num_classes != model_num_classes
+    filtered_state_dict = state_dict
+    ignored_keys: list[str] = []
+    strict_load = not head_mismatch
+
+    if head_mismatch:
+        emit_warning(
+            f"[WEIGHTS] class-mismatch ckpt_num_classes={ckpt_num_classes} model_num_classes={model_num_classes}"
+        )
+        filtered_state_dict, ignored_keys = _strip_box_predictor_head(state_dict)
+        emit_info(f"[WEIGHTS] Ignorando chaves do box_predictor: {ignored_keys}")
+
+    try:
+        missing, unexpected = model.load_state_dict(filtered_state_dict, strict=strict_load)
+    except RuntimeError as exc:
+        emit_warning(
+            f"[WEIGHTS] Falha ao carregar pesos com strict={strict_load}: {exc}; tentando ignorar box_predictor."
+        )
+        filtered_state_dict, ignored_keys = _strip_box_predictor_head(state_dict)
+        head_mismatch = True
+        missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
+        if ckpt_num_classes is None:
+            ckpt_num_classes = _detect_checkpoint_num_classes(state_dict)
+
+    if missing:
+        emit_info(f"[WEIGHTS] missing_keys: {missing}")
+    if unexpected:
+        emit_info(f"[WEIGHTS] unexpected_keys: {unexpected}")
+    if head_mismatch and not ignored_keys:
+        # Garantia de logging mesmo se a lista estiver vazia (ex.: state_dict já sem head)
+        ignored_keys = ["roi_heads.box_predictor.cls_score", "roi_heads.box_predictor.bbox_pred"]
+        logging_logger.debug("[WEIGHTS] Nenhuma chave do head presente para ignorar; registrando padrões")
+
+    return missing, unexpected, ckpt_num_classes, head_mismatch, ignored_keys
+
+
 def _ensure_pycocotools() -> tuple[type, type]:
     spec = importlib.util.find_spec("pycocotools")
     if spec is None:
@@ -1083,19 +1150,36 @@ def run_post_training_validation(
     model = model_builder(model_num_classes)
     model.to(device)
 
-    loaded = torch.load(weights_path.expanduser().resolve(), map_location="cpu")
-    state_dict, checkpoint_format = _extract_state_dict(loaded)
-    _emit(f"[{run_tag.upper()}][VAL-POST] Formato de checkpoint: {checkpoint_format}")
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        _emit(f"[{run_tag.upper()}][VAL-POST] missing_keys: {missing}")
-    if unexpected:
-        _emit(f"[{run_tag.upper()}][VAL-POST] unexpected_keys: {unexpected}")
+    def _emit_warning(message: str) -> None:
+        if log_cb:
+            log_cb(message)
+        logging_logger.warning(message)
 
     val_mode = getattr(config, "val_mode", "loss")
     if val_mode not in {"loss", "metrics"}:
         logging_logger.warning("[VAL] val_mode desconhecido %s; forçando 'loss'", val_mode)
         val_mode = "loss"
+
+    loaded = torch.load(weights_path.expanduser().resolve(), map_location="cpu")
+    state_dict, checkpoint_format = _extract_state_dict(loaded)
+    _emit(f"[{run_tag.upper()}][VAL-POST] Formato de checkpoint: {checkpoint_format}")
+    missing, unexpected, ckpt_num_classes, head_mismatch, ignored_keys = _load_frcnn_weights_with_head_guard(
+        model,
+        state_dict,
+        model_num_classes=model_num_classes,
+        emit_info=_emit,
+        emit_warning=_emit_warning,
+        logging_logger=logging_logger,
+    )
+    if head_mismatch and val_mode == "metrics":
+        warning_msg = (
+            "Pesos carregados sem head compatível; métricas podem ser inválidas. "
+            "Recomenda-se retreinar/fine-tunar com dataset_num_classes correto."
+        )
+        _emit_warning(warning_msg)
+        _emit(f"[{run_tag.upper()}][VAL-POST] Ignorados do checkpoint: {ignored_keys}")
+    elif head_mismatch:
+        _emit(f"[{run_tag.upper()}][VAL-POST] Head incompatível; ignorados: {ignored_keys}")
 
     if val_mode == "metrics":
         results = run_val_coco_metrics(
@@ -1131,6 +1215,9 @@ def run_post_training_validation(
         "device": device_str,
         "dataset_num_classes": dataset_num_classes,
         "model_num_classes": model_num_classes,
+        "ckpt_num_classes": ckpt_num_classes,
+        "weights_head_mismatch": head_mismatch,
+        "ignored_head_keys": ignored_keys,
         "val_mode": val_mode,
         **results,
     }
