@@ -839,16 +839,29 @@ def run_val_coco_metrics(
     COCO, COCOeval = _ensure_pycocotools()
     coco_gt = COCO(str(val_ann))
 
+    logging_logger.info("%s Ground truth annotations: %s", tag, val_ann)
+
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = output_dir / "predictions_coco.json"
+    predictions_path.unlink(missing_ok=True)
     logging_logger.info("%s Gerando predictions_coco.json em %s", tag, predictions_path)
 
     predictions: list[dict[str, float | int | list[float]]] = []
-    label_mapping = {cat_id: cat_id for cat_id in coco_gt.getCatIds()}
+    categories = coco_gt.dataset.get("categories", []) if hasattr(coco_gt, "dataset") else []
+    ordered_cat_ids = [cat.get("id") for cat in categories if "id" in cat]
+    fallback_cat_ids = sorted(coco_gt.getCatIds())
+    cat_ids_order = ordered_cat_ids or fallback_cat_ids
+
+    label_mapping: dict[int, int] = {int(cat_id): int(cat_id) for cat_id in cat_ids_order}
+    contiguous_mapping = {idx + 1: int(cat_id) for idx, cat_id in enumerate(cat_ids_order)}
+    for lbl, cat_id in contiguous_mapping.items():
+        label_mapping.setdefault(lbl, cat_id)
     logging_logger.info("%s label->category_id mapping: %s", tag, label_mapping)
 
     model.eval()
+    predicted_image_ids: set[int] = set()
+    predicted_category_ids: set[int] = set()
     with torch.no_grad():
         for images, targets in val_loader:
             images = [img.to(device_str) for img in images]
@@ -868,7 +881,13 @@ def run_val_coco_metrics(
                 labels_cpu = labels.detach().cpu()
 
                 for box, score, label in zip(boxes_cpu, scores_cpu, labels_cpu):
-                    category_id = int(label_mapping.get(int(label), int(label)))
+                    category_id = label_mapping.get(int(label))
+                    if category_id is None:
+                        raise RuntimeError(
+                            f"label {int(label)} não encontrado no mapping; revise categorias ou mapeamento."
+                        )
+                    predicted_image_ids.add(int(image_id))
+                    predicted_category_ids.add(int(category_id))
                     predictions.append(
                         {
                             "image_id": int(image_id),
@@ -879,6 +898,30 @@ def run_val_coco_metrics(
                     )
 
     predictions_path.write_text(json.dumps(predictions, ensure_ascii=False), encoding="utf-8")
+    gt_image_ids = set(int(x) for x in coco_gt.getImgIds())
+    gt_category_ids = set(int(x) for x in coco_gt.getCatIds())
+
+    invalid_image_ids = sorted(predicted_image_ids - gt_image_ids)
+    invalid_category_ids = sorted(predicted_category_ids - gt_category_ids)
+
+    if invalid_image_ids:
+        raise RuntimeError(
+            (
+                f"{tag} image_id inválidos detectados: {len(invalid_image_ids)} fora do conjunto GT. "
+                f"Exemplos: {invalid_image_ids[:5]} | GT={val_ann} | preds={predictions_path}"
+            )
+        )
+    logging_logger.info("%s image_id check OK (%d imgs)", tag, len(predicted_image_ids))
+
+    if invalid_category_ids:
+        raise RuntimeError(
+            (
+                f"{tag} category_id inválidos detectados: {len(invalid_category_ids)} fora do conjunto GT. "
+                f"Exemplos: {invalid_category_ids[:5]} | GT={val_ann} | preds={predictions_path}"
+            )
+        )
+    logging_logger.info("%s category_id check OK (%d cats)", tag, len(predicted_category_ids))
+
     logging_logger.info("%s Executando COCOeval...", tag)
 
     coco_dt = coco_gt.loadRes(str(predictions_path))
