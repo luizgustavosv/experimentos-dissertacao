@@ -16,7 +16,8 @@ from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, random_split
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRCNN
+from torchvision.models.detection.retinanet import RetinaNet
 
 from app.detectors.base import Logger
 from app.detectors.config import TrainConfig
@@ -1263,7 +1264,14 @@ def train_torchvision_detector(
     except Exception:  # pragma: no cover - compatibilidade com ambientes sem suporte
         logging_logger.warning("Não foi possível registrar handler de SIGTERM neste ambiente.")
 
-    logging_logger.info("Iniciando setup de treinamento SSD...")
+    if isinstance(model, FasterRCNN):
+        algorithm_name = "Faster R-CNN"
+    elif isinstance(model, RetinaNet):
+        algorithm_name = "RetinaNet"
+    else:
+        algorithm_name = "SSD"
+
+    logging_logger.info("Iniciando setup de treinamento do %s...", algorithm_name)
     device_str = resolve_device(config.device)
     device = torch.device(device_str)
     seed_everything(config.seed)
