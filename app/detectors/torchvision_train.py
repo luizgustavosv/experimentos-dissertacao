@@ -402,9 +402,9 @@ def _validate_targets_batch(
                 raise ValueError(
                     f"Labels fora do intervalo no índice {idx}{path_label}: mínimo {int(labels.min())} (esperado >=1)"
                 )
-            if (labels >= num_classes).any():
+            if (labels > num_classes).any():
                 raise ValueError(
-                    f"Labels fora do intervalo no índice {idx}{path_label}: máximo {int(labels.max())} >= num_classes ({num_classes})"
+                    f"Labels fora do intervalo no índice {idx}{path_label}: máximo {int(labels.max())} > num_classes ({num_classes})"
                 )
         else:
             if (labels < 1).any():
@@ -812,14 +812,20 @@ def _build_val_loader_and_classes(
 
     expected_model_classes = dataset_num_classes + 1 if dataset_num_classes > 0 else dataset_num_classes
     model_num_classes = expected_model_classes
-    if configured_model_num_classes is not None and configured_model_num_classes != expected_model_classes:
-        logging_logger.warning(
-            "[DATASET] num_classes configurado (%s) difere do esperado para background (%s); usando o esperado.",
-            configured_model_num_classes,
-            expected_model_classes,
-        )
+    if configured_model_num_classes is not None and configured_model_num_classes > 0:
+        model_num_classes = configured_model_num_classes
+        if configured_model_num_classes != expected_model_classes:
+            logging_logger.warning(
+                "[DATASET] num_classes configurado (%s) difere do esperado para background (%s); respeitando o configurado.",
+                configured_model_num_classes,
+                expected_model_classes,
+            )
 
-    logging_logger.info("[MODEL] Faster R-CNN num_classes=%d (inclui background)", model_num_classes)
+    logging_logger.info(
+        "[MODEL] num_classes configurado=%d (esperado c/ background=%s)",
+        model_num_classes,
+        expected_model_classes,
+    )
 
     if looks_like_visdrone:
         logging_logger.info(
@@ -1345,14 +1351,20 @@ def train_torchvision_detector(
 
         expected_model_classes = dataset_num_classes + 1 if dataset_num_classes > 0 else dataset_num_classes
         model_num_classes = expected_model_classes
-        if configured_model_num_classes is not None and configured_model_num_classes != expected_model_classes:
-            logging_logger.warning(
-                "[DATASET] num_classes configurado (%s) difere do esperado para background (%s); usando o esperado.",
-                configured_model_num_classes,
-                expected_model_classes,
-            )
+        if configured_model_num_classes is not None and configured_model_num_classes > 0:
+            model_num_classes = configured_model_num_classes
+            if configured_model_num_classes != expected_model_classes:
+                logging_logger.warning(
+                    "[DATASET] num_classes configurado (%s) difere do esperado para background (%s); respeitando o configurado.",
+                    configured_model_num_classes,
+                    expected_model_classes,
+                )
 
-        logging_logger.info("[MODEL] Faster R-CNN num_classes=%d (inclui background)", model_num_classes)
+        logging_logger.info(
+            "[MODEL] num_classes configurado=%d (esperado c/ background=%s)",
+            model_num_classes,
+            expected_model_classes,
+        )
 
         if looks_like_visdrone:
             logging_logger.info(
@@ -1435,7 +1447,8 @@ def train_torchvision_detector(
         logging_logger.info("Starting training...")
 
         num_classes = model_num_classes
-        _ensure_frcnn_head(model, num_classes, logging_logger)
+        if hasattr(model, "roi_heads"):
+            _ensure_frcnn_head(model, num_classes, logging_logger)
 
         last_progress = [time.monotonic()]
         watchdog_stop = threading.Event()

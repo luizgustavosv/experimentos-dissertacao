@@ -22,7 +22,21 @@ def build_faster_rcnn(num_classes: int):
 
 
 def build_retinanet(num_classes: int):
-    return torchvision.models.detection.retinanet_resnet50_fpn(weights="DEFAULT", num_classes=num_classes)
+    from torchvision.models.detection import RetinaNet_ResNet50_FPN_Weights, retinanet_resnet50_fpn
+    from torchvision.models.detection.retinanet import RetinaNetClassificationHead
+
+    # Carrega apenas backbone/FPN pré-treinados no COCO e recria o head para o dataset alvo.
+    weights = RetinaNet_ResNet50_FPN_Weights.COCO_V1
+    model = retinanet_resnet50_fpn(weights=weights)
+
+    classification_head = model.head.classification_head
+    num_anchors = classification_head.num_anchors
+    # Conv2dNormActivation -> acesso ao Conv2d interno pelo índice 0
+    in_channels = classification_head.conv[0][0].in_channels
+
+    model.head.classification_head = RetinaNetClassificationHead(in_channels, num_anchors, num_classes)
+    model.num_classes = num_classes
+    return model
 
 
 def build_ssd(num_classes: int):

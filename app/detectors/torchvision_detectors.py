@@ -29,6 +29,22 @@ class TorchvisionDetector(DetectionAlgorithm):
     ) -> torch.nn.Module:
         return self.build_model(num_classes)
 
+    def _infer_dataset_num_classes(self, ann_path: Path, logger: Optional[Logger]) -> int:
+        import json
+
+        data = json.loads(ann_path.read_text(encoding="utf-8"))
+        dataset_num_classes = len(data.get("categories", []))
+        if logger:
+            logger(f"[DATASET] COCO categories={dataset_num_classes}")
+        return dataset_num_classes
+
+    def _map_model_num_classes(self, dataset_num_classes: int) -> int:
+        return dataset_num_classes + 1  # background
+
+    def _log_model_num_classes(self, model_num_classes: int, logger: Optional[Logger]) -> None:
+        if logger:
+            logger(f"[MODEL] {self.context.name} num_classes={model_num_classes} (inclui background)")
+
     def train(
         self,
         dataset_dir: Path,
@@ -42,13 +58,15 @@ class TorchvisionDetector(DetectionAlgorithm):
         if train_ann is None or val_ann is None:
             train_ann, val_ann = validate_coco_dataset(dataset_dir)
         device_str = resolve_device(self.config.device)
-        num_classes = self._infer_num_classes(train_ann)
+        dataset_num_classes = self._infer_dataset_num_classes(train_ann, logger)
+        model_num_classes = self._map_model_num_classes(dataset_num_classes)
         if logger:
-            logger(f"[TRAIN] {self.context.name} em {device_str} com {num_classes} classes")
+            logger(f"[TRAIN] {self.context.name} em {device_str}")
             logger(f"[DATA] Anotações train: {train_ann}")
             logger(f"[DATA] Anotações val: {val_ann}")
+        self._log_model_num_classes(model_num_classes, logger)
 
-        model = self._prepare_model(num_classes, pretrained_weights, logger)
+        model = self._prepare_model(model_num_classes, pretrained_weights, logger)
         metrics = train_torchvision_detector(
             model,
             dataset_dir,
@@ -74,18 +92,14 @@ class TorchvisionDetector(DetectionAlgorithm):
                 prefetch_factor=self.config.prefetch_factor,
                 drop_last=self.config.drop_last,
                 val_mode=self.config.val_mode,
+                dataset_num_classes=dataset_num_classes,
+                num_classes=model_num_classes,
             ),
             logger=logger,
         )
 
         ensure_weights_size(output_dir)
         return metrics
-
-    def _infer_num_classes(self, ann_path: Path) -> int:
-        import json
-
-        data = json.loads(ann_path.read_text(encoding="utf-8"))
-        return len(data.get("categories", [])) + 1  # +1 para background
 
     def infer(
         self,
