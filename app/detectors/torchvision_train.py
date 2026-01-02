@@ -42,9 +42,6 @@ except Exception:  # pragma: no cover - fallback silencioso se tqdm não estiver
     tqdm = None
 
 
-VISDRONE_MULTICLASS_DATASET_CLASSES = 11
-
-
 def _describe_structure(obj: Any, depth: int = 0, max_depth: int = 4) -> str:
     if depth >= max_depth:
         return "..."
@@ -687,8 +684,6 @@ def _build_val_loader_and_classes(
     dataset_num_classes = configured_dataset_classes if configured_dataset_classes is not None else inferred_train_classes
 
     looks_like_visdrone = _is_visdrone_dataset(dataset_dir, train_ds_full) or _is_visdrone_dataset(dataset_dir, val_ds_full)
-    if dataset_num_classes is None and looks_like_visdrone:
-        dataset_num_classes = VISDRONE_MULTICLASS_DATASET_CLASSES
 
     if dataset_num_classes is None and configured_model_num_classes is not None and configured_model_num_classes > 0:
         dataset_num_classes = max(1, configured_model_num_classes - 1)
@@ -703,9 +698,14 @@ def _build_val_loader_and_classes(
             dataset_num_classes,
         )
 
-    model_num_classes = configured_model_num_classes
-    if model_num_classes is None:
-        model_num_classes = dataset_num_classes + 1 if dataset_num_classes > 0 else dataset_num_classes
+    expected_model_classes = dataset_num_classes + 1 if dataset_num_classes > 0 else dataset_num_classes
+    model_num_classes = expected_model_classes
+    if configured_model_num_classes is not None and configured_model_num_classes != expected_model_classes:
+        logging_logger.warning(
+            "[DATASET] num_classes configurado (%s) difere do esperado para background (%s); usando o esperado.",
+            configured_model_num_classes,
+            expected_model_classes,
+        )
 
     if looks_like_visdrone:
         logging_logger.info(
@@ -840,6 +840,9 @@ def run_val_coco_metrics(
     coco_gt = COCO(str(val_ann))
 
     logging_logger.info("%s Ground truth annotations: %s", tag, val_ann)
+    coco_cat_ids = sorted(int(cat_id) for cat_id in coco_gt.getCatIds())
+    dataset_num_classes = len(coco_cat_ids)
+    logging_logger.info("%s GT categories=%d ids=%s", tag, dataset_num_classes, coco_cat_ids)
 
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -847,21 +850,19 @@ def run_val_coco_metrics(
     predictions_path.unlink(missing_ok=True)
     logging_logger.info("%s Gerando predictions_coco.json em %s", tag, predictions_path)
 
-    predictions: list[dict[str, float | int | list[float]]] = []
-    categories = coco_gt.dataset.get("categories", []) if hasattr(coco_gt, "dataset") else []
-    ordered_cat_ids = [cat.get("id") for cat in categories if "id" in cat]
-    fallback_cat_ids = sorted(coco_gt.getCatIds())
-    cat_ids_order = ordered_cat_ids or fallback_cat_ids
+    if dataset_num_classes <= 0:
+        raise RuntimeError(f"{tag} Não há categorias no GT para gerar métricas COCO.")
 
-    label_mapping: dict[int, int] = {int(cat_id): int(cat_id) for cat_id in cat_ids_order}
-    contiguous_mapping = {idx + 1: int(cat_id) for idx, cat_id in enumerate(cat_ids_order)}
-    for lbl, cat_id in contiguous_mapping.items():
-        label_mapping.setdefault(lbl, cat_id)
-    logging_logger.info("%s label->category_id mapping: %s", tag, label_mapping)
+    predictions: list[dict[str, float | int | list[float]]] = []
+    label_mapping: dict[int, int] = {i: coco_cat_ids[i - 1] for i in range(1, dataset_num_classes + 1)}
+    logging_logger.info("%s label->category_id mapping (foreground): %s", tag, label_mapping)
 
     model.eval()
     predicted_image_ids: set[int] = set()
     predicted_category_ids: set[int] = set()
+    max_label_observed = 0
+    invalid_label_count = 0
+    invalid_label_examples: list[dict[str, float | int]] = []
     with torch.no_grad():
         for images, targets in val_loader:
             images = [img.to(device_str) for img in images]
@@ -880,11 +881,27 @@ def run_val_coco_metrics(
                 scores_cpu = scores.detach().cpu()
                 labels_cpu = labels.detach().cpu()
 
+                if labels_cpu.numel() > 0:
+                    max_label_observed = max(max_label_observed, int(labels_cpu.max()))
+
                 for box, score, label in zip(boxes_cpu, scores_cpu, labels_cpu):
-                    category_id = label_mapping.get(int(label))
+                    raw_label = int(label)
+                    if raw_label <= 0 or raw_label > dataset_num_classes:
+                        invalid_label_count += 1
+                        if len(invalid_label_examples) < 5:
+                            invalid_label_examples.append(
+                                {
+                                    "label": raw_label,
+                                    "score": float(score),
+                                    "image_id": int(image_id),
+                                }
+                            )
+                        continue
+
+                    category_id = label_mapping.get(raw_label)
                     if category_id is None:
                         raise RuntimeError(
-                            f"label {int(label)} não encontrado no mapping; revise categorias ou mapeamento."
+                            f"label {raw_label} não encontrado no mapping; revise categorias ou mapeamento."
                         )
                     predicted_image_ids.add(int(image_id))
                     predicted_category_ids.add(int(category_id))
@@ -897,9 +914,19 @@ def run_val_coco_metrics(
                         }
                     )
 
+    logging_logger.info("%s Maior label previsto (raw)=%s", tag, max_label_observed)
+    if invalid_label_count:
+        logging_logger.warning(
+            "%s Labels fora do intervalo (1..%d) encontrados: %d descartados. Exemplos: %s",
+            tag,
+            dataset_num_classes,
+            invalid_label_count,
+            invalid_label_examples,
+        )
+
     predictions_path.write_text(json.dumps(predictions, ensure_ascii=False), encoding="utf-8")
     gt_image_ids = set(int(x) for x in coco_gt.getImgIds())
-    gt_category_ids = set(int(x) for x in coco_gt.getCatIds())
+    gt_category_ids = set(coco_cat_ids)
 
     invalid_image_ids = sorted(predicted_image_ids - gt_image_ids)
     invalid_category_ids = sorted(predicted_category_ids - gt_category_ids)
@@ -1149,8 +1176,6 @@ def train_torchvision_detector(
         looks_like_visdrone = _is_visdrone_dataset(dataset_dir, train_ds_full) or _is_visdrone_dataset(
             dataset_dir, val_ds_full
         )
-        if dataset_num_classes is None and looks_like_visdrone:
-            dataset_num_classes = VISDRONE_MULTICLASS_DATASET_CLASSES
 
         if dataset_num_classes is None and configured_model_num_classes is not None and configured_model_num_classes > 0:
             dataset_num_classes = max(1, configured_model_num_classes - 1)
@@ -1165,9 +1190,14 @@ def train_torchvision_detector(
                 dataset_num_classes,
             )
 
-        model_num_classes = configured_model_num_classes
-        if model_num_classes is None:
-            model_num_classes = dataset_num_classes + 1 if dataset_num_classes > 0 else dataset_num_classes
+        expected_model_classes = dataset_num_classes + 1 if dataset_num_classes > 0 else dataset_num_classes
+        model_num_classes = expected_model_classes
+        if configured_model_num_classes is not None and configured_model_num_classes != expected_model_classes:
+            logging_logger.warning(
+                "[DATASET] num_classes configurado (%s) difere do esperado para background (%s); usando o esperado.",
+                configured_model_num_classes,
+                expected_model_classes,
+            )
 
         if looks_like_visdrone:
             logging_logger.info(
