@@ -11,3 +11,7 @@ class RetinaNetDetector(FasterRCNNDetector):
 
     def __init__(self, context: DetectorContext):
         TorchvisionDetector.__init__(self, context, build_retinanet)
+
+    def _prepare_model(self, num_classes: int, pretrained_weights, logger):  # type: ignore[override]
+        # Usa o construtor configurado para RetinaNet em vez da implementação do Faster R-CNN.
+        return TorchvisionDetector._prepare_model(self, num_classes, pretrained_weights, logger)
