@@ -277,6 +277,35 @@ def _normalize_dataset_class_count(raw_num_classes: Optional[int]) -> Optional[i
     return None
 
 
+def _infer_dataset_classes_from_annotations(
+    ann_path: Path, split: str, logging_logger: logging.Logger
+) -> tuple[Optional[int], list[int]]:
+    """Infer classes directly from the COCO annotations file."""
+
+    try:
+        data = json.loads(Path(ann_path).read_text(encoding="utf-8"))
+    except Exception as exc:  # pragma: no cover - leitura robusta
+        logging_logger.warning("[DATASET] Não foi possível ler %s para inferir classes: %s", ann_path, exc)
+        return None, []
+
+    categories = data.get("categories")
+    if not isinstance(categories, list):
+        logging_logger.warning("[DATASET] Formato de categorias inválido em %s", ann_path)
+        return None, []
+
+    coco_cat_ids: list[int] = []
+    for cat in categories:
+        try:
+            coco_cat_ids.append(int(cat["id"]))
+        except Exception:
+            logging_logger.warning("[DATASET] Categoria sem id válida detectada no split %s: %s", split, cat)
+
+    coco_cat_ids = sorted(coco_cat_ids)
+    dataset_num_classes = len(categories)
+    logging_logger.info("[DATASET] COCO categories=%d ids=%s", dataset_num_classes, coco_cat_ids)
+    return dataset_num_classes, coco_cat_ids
+
+
 def _is_visdrone_dataset(dataset_dir: Path, dataset: Any) -> bool:
     def _matches(path_like: Any) -> bool:
         if isinstance(path_like, (str, Path)):
@@ -678,15 +707,31 @@ def _build_val_loader_and_classes(
     configured_dataset_classes = getattr(config, "dataset_num_classes", None)
     configured_model_num_classes = getattr(config, "num_classes", None)
 
+    ann_dataset_classes, _ = _infer_dataset_classes_from_annotations(val_ann, "val", logging_logger)
     inferred_train_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(train_ds_full))
     inferred_val_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(val_ds_full))
 
-    dataset_num_classes = configured_dataset_classes if configured_dataset_classes is not None else inferred_train_classes
+    dataset_num_classes: Optional[int] = None
+    if configured_dataset_classes is not None:
+        dataset_num_classes = configured_dataset_classes
+    elif configured_model_num_classes is not None and configured_model_num_classes > 0:
+        dataset_num_classes = max(1, configured_model_num_classes - 1)
+    elif ann_dataset_classes is not None:
+        dataset_num_classes = ann_dataset_classes
+    else:
+        dataset_num_classes = inferred_train_classes
 
     looks_like_visdrone = _is_visdrone_dataset(dataset_dir, train_ds_full) or _is_visdrone_dataset(dataset_dir, val_ds_full)
 
-    if dataset_num_classes is None and configured_model_num_classes is not None and configured_model_num_classes > 0:
-        dataset_num_classes = max(1, configured_model_num_classes - 1)
+    if dataset_num_classes is None:
+        dataset_num_classes = inferred_val_classes
+
+    if ann_dataset_classes is not None and dataset_num_classes is not None and dataset_num_classes != ann_dataset_classes:
+        logging_logger.warning(
+            "[AUDIT] num_classes configurado/inferido (%s) difere do COCO (val=%s); usando configurado/inferido.",
+            dataset_num_classes,
+            ann_dataset_classes,
+        )
 
     if dataset_num_classes is None:
         raise ValueError("Não foi possível inferir num_classes a partir do dataset; verifique as categorias.")
@@ -706,6 +751,8 @@ def _build_val_loader_and_classes(
             configured_model_num_classes,
             expected_model_classes,
         )
+
+    logging_logger.info("[MODEL] Faster R-CNN num_classes=%d (inclui background)", model_num_classes)
 
     if looks_like_visdrone:
         logging_logger.info(
@@ -842,7 +889,7 @@ def run_val_coco_metrics(
     logging_logger.info("%s Ground truth annotations: %s", tag, val_ann)
     coco_cat_ids = sorted(int(cat_id) for cat_id in coco_gt.getCatIds())
     dataset_num_classes = len(coco_cat_ids)
-    logging_logger.info("%s GT categories=%d ids=%s", tag, dataset_num_classes, coco_cat_ids)
+    logging_logger.info("%s [DATASET] COCO categories=%d ids=%s", tag, dataset_num_classes, coco_cat_ids)
 
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1168,17 +1215,36 @@ def train_torchvision_detector(
         configured_dataset_classes = getattr(config, "dataset_num_classes", None)
         configured_model_num_classes = getattr(config, "num_classes", None)
 
+        train_ann_classes, train_cat_ids = _infer_dataset_classes_from_annotations(train_ann, "train", logging_logger)
+        val_ann_classes, val_cat_ids = _infer_dataset_classes_from_annotations(val_ann, "val", logging_logger)
+        ann_dataset_classes = train_ann_classes or val_ann_classes
+
         inferred_train_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(train_ds_full))
         inferred_val_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(val_ds_full))
 
-        dataset_num_classes = configured_dataset_classes if configured_dataset_classes is not None else inferred_train_classes
+        dataset_num_classes: Optional[int] = None
+        if configured_dataset_classes is not None:
+            dataset_num_classes = configured_dataset_classes
+        elif configured_model_num_classes is not None and configured_model_num_classes > 0:
+            dataset_num_classes = max(1, configured_model_num_classes - 1)
+        elif ann_dataset_classes is not None:
+            dataset_num_classes = ann_dataset_classes
+        else:
+            dataset_num_classes = inferred_train_classes
 
         looks_like_visdrone = _is_visdrone_dataset(dataset_dir, train_ds_full) or _is_visdrone_dataset(
             dataset_dir, val_ds_full
         )
 
-        if dataset_num_classes is None and configured_model_num_classes is not None and configured_model_num_classes > 0:
-            dataset_num_classes = max(1, configured_model_num_classes - 1)
+        if dataset_num_classes is None:
+            dataset_num_classes = inferred_val_classes
+
+        if ann_dataset_classes is not None and dataset_num_classes is not None and dataset_num_classes != ann_dataset_classes:
+            logging_logger.warning(
+                "[AUDIT] num_classes configurado/inferido (%s) difere do COCO (json=%s); usando configurado/inferido.",
+                dataset_num_classes,
+                ann_dataset_classes,
+            )
 
         if dataset_num_classes is None:
             raise ValueError("Não foi possível inferir num_classes a partir do dataset; verifique as categorias.")
@@ -1198,6 +1264,8 @@ def train_torchvision_detector(
                 configured_model_num_classes,
                 expected_model_classes,
             )
+
+        logging_logger.info("[MODEL] Faster R-CNN num_classes=%d (inclui background)", model_num_classes)
 
         if looks_like_visdrone:
             logging_logger.info(
