@@ -311,6 +311,25 @@ def _infer_dataset_classes_from_annotations(
     return dataset_num_classes, coco_cat_ids
 
 
+def _log_label_range_from_annotations(
+    annotations: dict, split: str, logging_logger: logging.Logger
+) -> None:
+    labels: list[int] = []
+    for ann in annotations.get("annotations", []):
+        try:
+            labels.append(int(ann.get("category_id")))
+        except Exception:
+            continue
+
+    if not labels:
+        logging_logger.info("[AUDIT][%s] Nenhum label encontrado nas anotações.", split)
+        return
+
+    logging_logger.info(
+        "[AUDIT][%s] Range de labels observado: min=%d max=%d", split, min(labels), max(labels)
+    )
+
+
 def _is_visdrone_dataset(dataset_dir: Path, dataset: Any) -> bool:
     def _matches(path_like: Any) -> bool:
         if isinstance(path_like, (str, Path)):
@@ -841,11 +860,14 @@ def _build_val_loader_and_classes(
     *,
     override_val_ratio: Optional[float] = None,
     expects_background: bool = True,
+    force_dataset_num_classes: Optional[int] = None,
 ) -> tuple[DataLoader, int, int, int]:
     transform = _build_detection_transforms(config.imgsz, logging_logger)
     logging_logger.info("[SETUP] Construindo datasets COCO para validação pós-treinamento")
     train_ds_full = CocoDetectionDataset(dataset_dir / "images" / "train", train_ann, transforms=transform)
     val_ds_full = CocoDetectionDataset(dataset_dir / "images" / "val", val_ann, transforms=transform)
+
+    _log_label_range_from_annotations(getattr(val_ds_full, "annotations", {}), "val", logging_logger)
 
     val_ratio = config.val_ratio if override_val_ratio is None else override_val_ratio
     if val_ratio and val_ratio > 0:
@@ -856,15 +878,20 @@ def _build_val_loader_and_classes(
     describe_dataloader(train_ds_full, logging_logger.info)
     logging_logger.info("[SETUP] Tamanho train=%d | val=%d", len(train_ds_full), len(val_ds_full))
 
-    configured_dataset_classes = getattr(config, "dataset_num_classes", None)
-    configured_model_num_classes = getattr(config, "num_classes", None)
+    configured_dataset_classes = None if force_dataset_num_classes is not None else getattr(config, "dataset_num_classes", None)
+    configured_model_num_classes = None if force_dataset_num_classes is not None else getattr(config, "num_classes", None)
 
     ann_dataset_classes, _ = _infer_dataset_classes_from_annotations(val_ann, "val", logging_logger)
     inferred_train_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(train_ds_full))
     inferred_val_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(val_ds_full))
 
     dataset_num_classes: Optional[int] = None
-    if ann_dataset_classes is not None:
+    if force_dataset_num_classes is not None:
+        dataset_num_classes = force_dataset_num_classes
+        logging_logger.info(
+            "[DATASET] Forçando dataset_num_classes do COCO JSON (split val): %s", dataset_num_classes
+        )
+    elif ann_dataset_classes is not None:
         dataset_num_classes = ann_dataset_classes
     elif configured_dataset_classes is not None:
         dataset_num_classes = configured_dataset_classes
@@ -899,7 +926,7 @@ def _build_val_loader_and_classes(
 
     expected_model_classes = dataset_num_classes + 1 if expects_background and dataset_num_classes > 0 else dataset_num_classes
     model_num_classes = expected_model_classes
-    if configured_model_num_classes is not None and configured_model_num_classes > 0:
+    if force_dataset_num_classes is None and configured_model_num_classes is not None and configured_model_num_classes > 0:
         model_num_classes = configured_model_num_classes
         if configured_model_num_classes != expected_model_classes:
             logging_logger.warning(
@@ -1325,8 +1352,28 @@ def run_post_training_validation(
     ensure_weights_size(weights_path, logger=_emit)
 
     expects_background = getattr(config, "num_classes", None) != getattr(config, "dataset_num_classes", None)
+    val_mode_requested = getattr(config, "val_mode", "loss")
+    if val_mode_requested not in {"loss", "metrics"}:
+        logging_logger.warning("[VAL] val_mode desconhecido %s; forçando 'loss'", val_mode_requested)
+        val_mode_requested = "loss"
+    val_mode = val_mode_requested
+    metrics_valid = True
+
+    force_dataset_classes = None
+    if run_tag == "faster_rcnn" and val_mode in {"loss", "metrics"}:
+        force_dataset_classes, _ = _infer_dataset_classes_from_annotations(val_ann, "val", logging_logger)
+        if force_dataset_classes is None:
+            raise ValueError("[VAL] Não foi possível derivar dataset_num_classes do COCO JSON (categories).")
+        expects_background = True
+
     val_loader, model_num_classes, dataset_num_classes, num_workers = _build_val_loader_and_classes(
-        dataset_dir, train_ann, val_ann, config, logging_logger, expects_background=expects_background
+        dataset_dir,
+        train_ann,
+        val_ann,
+        config,
+        logging_logger,
+        expects_background=expects_background,
+        force_dataset_num_classes=force_dataset_classes,
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1340,13 +1387,6 @@ def run_post_training_validation(
         if log_cb:
             log_cb(message)
         logging_logger.warning(message)
-
-    val_mode_requested = getattr(config, "val_mode", "loss")
-    if val_mode_requested not in {"loss", "metrics"}:
-        logging_logger.warning("[VAL] val_mode desconhecido %s; forçando 'loss'", val_mode_requested)
-        val_mode_requested = "loss"
-    val_mode = val_mode_requested
-    metrics_valid = True
 
     loaded = torch.load(weights_path.expanduser().resolve(), map_location="cpu")
     state_dict, checkpoint_format = _extract_state_dict(loaded)
@@ -1372,6 +1412,14 @@ def run_post_training_validation(
         model_num_classes,
         strict_load,
     )
+    if head_mismatch and val_mode in {"loss", "metrics"} and isinstance(model, FasterRCNN):
+        message = (
+            f"Checkpoint incompatível: ckpt_num_classes={ckpt_num_classes}, esperado={model_num_classes}. "
+            "Retreine para gerar pesos compatíveis."
+        )
+        logging_logger.error(message)
+        raise RuntimeError(message)
+
     if head_mismatch:
         metrics_valid = False
         logging_logger.error(
