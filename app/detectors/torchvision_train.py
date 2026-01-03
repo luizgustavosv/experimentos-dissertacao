@@ -8,6 +8,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -815,6 +816,16 @@ def _extract_image_id(target: dict) -> int:
     return int(image_id_val)
 
 
+def _extract_file_name(target: dict) -> str | None:
+    file_name = target.get("file_name") or target.get("image_path") or target.get("img_path")
+    if file_name is None:
+        return None
+    try:
+        return Path(str(file_name)).name
+    except Exception:
+        return str(file_name)
+
+
 def _coco_box_from_xyxy(box: torch.Tensor) -> list[float]:
     xmin, ymin, xmax, ymax = box.tolist()
     return [float(xmin), float(ymin), float(xmax - xmin), float(ymax - ymin)]
@@ -1038,9 +1049,30 @@ def run_val_coco_metrics(
     coco_gt = COCO(str(val_ann))
 
     logging_logger.info("%s Ground truth annotations: %s", tag, val_ann)
-    coco_cat_ids = sorted(int(cat_id) for cat_id in coco_gt.getCatIds())
-    dataset_num_classes = len(coco_cat_ids)
-    logging_logger.info("%s [DATASET] COCO categories=%d ids=%s", tag, dataset_num_classes, coco_cat_ids)
+    gt_img_ids = set(int(cat_id) for cat_id in coco_gt.getImgIds())
+    gt_cat_ids = set(int(cat_id) for cat_id in coco_gt.getCatIds())
+    gt_dict = coco_gt.dataset or {}
+    gt_images = gt_dict.get("images", [])
+    gt_filename_to_id: dict[str, int] = {}
+    gt_id_to_filename: dict[int, str | None] = {}
+    for img in gt_images:
+        img_id = img.get("id")
+        file_name = img.get("file_name")
+        if img_id is None:
+            continue
+        int_img_id = int(img_id)
+        gt_id_to_filename[int_img_id] = file_name
+        if file_name:
+            gt_filename_to_id[file_name] = int_img_id
+            gt_filename_to_id[Path(str(file_name)).name] = int_img_id
+
+    dataset_num_classes = len(gt_cat_ids)
+    logging_logger.info("%s [AUDIT] GT imagens=%d categorias=%d", tag, len(gt_img_ids), len(gt_cat_ids))
+    if gt_img_ids:
+        logging_logger.info("%s [AUDIT] img_id range=[%s, %s]", tag, min(gt_img_ids), max(gt_img_ids))
+    if gt_cat_ids:
+        logging_logger.info("%s [AUDIT] cat_id set=%s", tag, sorted(gt_cat_ids))
+
     is_retinanet = isinstance(model, RetinaNet)
 
     output_dir = output_dir.expanduser().resolve()
@@ -1052,28 +1084,73 @@ def run_val_coco_metrics(
     if dataset_num_classes <= 0:
         raise RuntimeError(f"{tag} Não há categorias no GT para gerar métricas COCO.")
 
-    predictions: list[dict[str, float | int | list[float]]] = []
-    if is_retinanet:
-        logging_logger.info(
-            "%s [RETINANET] Exportando category_id como pred_label+1 | coco_ids=%s", tag, coco_cat_ids
-        )
-    else:
-        label_mapping: dict[int, int] = {i: coco_cat_ids[i - 1] for i in range(1, dataset_num_classes + 1)}
-        logging_logger.info("%s label->category_id mapping (foreground): %s", tag, label_mapping)
+    categories = gt_dict.get("categories", [])
+    class_to_cat_id = [int(cat["id"]) for cat in categories if "id" in cat]
+    if not class_to_cat_id:
+        class_to_cat_id = sorted(gt_cat_ids)
+    logging_logger.info("%s [AUDIT] class_to_cat_id mapping=%s", tag, class_to_cat_id)
 
+    predictions: list[dict[str, float | int | list[float]]] = []
     model.eval()
     predicted_image_ids: set[int] = set()
     predicted_category_ids: set[int] = set()
     max_label_observed = 0
     invalid_label_count = 0
     invalid_label_examples: list[dict[str, float | int]] = []
+    missing_image_mappings: list[dict[str, Any]] = []
+    smoke_checked = 0
+    smoke_invalid: list[dict[str, Any]] = []
+
+    def _map_label_to_category(raw_label: int) -> int | None:
+        nonlocal invalid_label_count
+        nonlocal invalid_label_examples
+        if is_retinanet:
+            idx = raw_label
+        else:
+            idx = raw_label - 1
+        if idx < 0 or idx >= len(class_to_cat_id):
+            invalid_label_count += 1
+            if len(invalid_label_examples) < 5:
+                invalid_label_examples.append({"label": raw_label})
+            return None
+        category_id = class_to_cat_id[idx]
+        if category_id not in gt_cat_ids:
+            invalid_label_count += 1
+            if len(invalid_label_examples) < 5:
+                invalid_label_examples.append({"label": raw_label, "category_id": category_id})
+            return None
+        return category_id
+
     with torch.no_grad():
-        for images, targets in val_loader:
+        for batch_idx, (images, targets) in enumerate(val_loader):
             images = [img.to(device_str) for img in images]
             outputs = model(images)
 
             for output, target in zip(outputs, targets):
-                image_id = _extract_image_id(target)
+                target_image_id = target.get("image_id")
+                file_name = _extract_file_name(target)
+                pred_image_id: int | None = None
+                if target_image_id is not None:
+                    candidate = _extract_image_id(target)
+                    if candidate in gt_img_ids:
+                        pred_image_id = candidate
+                if pred_image_id is None and file_name is not None:
+                    pred_image_id = gt_filename_to_id.get(file_name) or gt_filename_to_id.get(Path(file_name).name)
+
+                if pred_image_id is None:
+                    if len(missing_image_mappings) < 5:
+                        missing_image_mappings.append({
+                            "file_name": file_name,
+                            "raw_image_id": target_image_id,
+                            "batch_idx": batch_idx,
+                        })
+                    continue
+
+                if smoke_checked < 5:
+                    smoke_checked += 1
+                    if pred_image_id not in gt_img_ids:
+                        smoke_invalid.append({"pred_image_id": pred_image_id, "file_name": file_name})
+
                 boxes = output.get("boxes")
                 scores = output.get("scores")
                 labels = output.get("labels")
@@ -1090,95 +1167,68 @@ def run_val_coco_metrics(
 
                 for box, score, label in zip(boxes_cpu, scores_cpu, labels_cpu):
                     raw_label = int(label)
-                    if is_retinanet:
-                        if raw_label < 0 or raw_label >= dataset_num_classes:
-                            invalid_label_count += 1
-                            if len(invalid_label_examples) < 5:
-                                invalid_label_examples.append(
-                                    {
-                                        "label": raw_label,
-                                        "score": float(score),
-                                        "image_id": int(image_id),
-                                    }
-                                )
-                            continue
-                        category_id = raw_label + 1
-                        if category_id not in coco_cat_ids:
-                            raise RuntimeError(
-                                f"{tag} category_id inválido após remap: {category_id} não está em {coco_cat_ids}"
-                            )
-                    else:
-                        if raw_label <= 0 or raw_label > dataset_num_classes:
-                            invalid_label_count += 1
-                            if len(invalid_label_examples) < 5:
-                                invalid_label_examples.append(
-                                    {
-                                        "label": raw_label,
-                                        "score": float(score),
-                                        "image_id": int(image_id),
-                                    }
-                                )
-                            continue
+                    category_id = _map_label_to_category(raw_label)
+                    if category_id is None:
+                        continue
 
-                        category_id = label_mapping.get(raw_label)
-                        if category_id is None:
-                            raise RuntimeError(
-                                f"label {raw_label} não encontrado no mapping; revise categorias ou mapeamento."
-                            )
-                    predicted_image_ids.add(int(image_id))
+                    prediction = {
+                        "image_id": int(pred_image_id),
+                        "category_id": int(category_id),
+                        "bbox": _coco_box_from_xyxy(box),
+                        "score": float(score),
+                    }
+                    predictions.append(prediction)
+                    predicted_image_ids.add(int(pred_image_id))
                     predicted_category_ids.add(int(category_id))
-                    predictions.append(
-                        {
-                            "image_id": int(image_id),
-                            "category_id": category_id,
-                            "bbox": _coco_box_from_xyxy(box),
-                            "score": float(score),
-                        }
-                    )
 
-    logging_logger.info("%s Maior label previsto (raw)=%s", tag, max_label_observed)
-    if invalid_label_count:
-        if is_retinanet:
-            logging_logger.warning(
-                "%s Labels fora do intervalo (0..%d) encontrados: %d descartados. Exemplos: %s",
-                tag,
-                dataset_num_classes - 1,
-                invalid_label_count,
-                invalid_label_examples,
-            )
-        else:
-            logging_logger.warning(
-                "%s Labels fora do intervalo (1..%d) encontrados: %d descartados. Exemplos: %s",
-                tag,
-                dataset_num_classes,
-                invalid_label_count,
-                invalid_label_examples,
-            )
+    if smoke_invalid:
+        raise AssertionError(f"{tag} Smoke test falhou: image_ids fora do GT: {smoke_invalid}")
 
-    predictions_path.write_text(json.dumps(predictions, ensure_ascii=False), encoding="utf-8")
-    gt_image_ids = set(int(x) for x in coco_gt.getImgIds())
-    gt_category_ids = set(coco_cat_ids)
+    logging_logger.info("%s Máximo label observado: %d", tag, max_label_observed)
+    if invalid_label_count > 0:
+        logging_logger.warning("%s [AUDIT] Labels inválidos detectados: %d. Exemplos: %s", tag, invalid_label_count, invalid_label_examples)
+    if missing_image_mappings:
+        logging_logger.error("%s [AUDIT] Falha ao mapear image_id para GT: exemplos=%s", tag, missing_image_mappings)
 
-    invalid_image_ids = sorted(predicted_image_ids - gt_image_ids)
-    invalid_category_ids = sorted(predicted_category_ids - gt_category_ids)
-
-    if invalid_image_ids:
-        raise RuntimeError(
-            (
-                f"{tag} image_id inválidos detectados: {len(invalid_image_ids)} fora do conjunto GT. "
-                f"Exemplos: {invalid_image_ids[:5]} | GT={val_ann} | preds={predictions_path}"
-            )
+    total_preds = len(predictions)
+    unique_pred_img_ids = set(int(p["image_id"]) for p in predictions)
+    unique_pred_cat_ids = set(int(p["category_id"]) for p in predictions)
+    invalid_img_ids = sorted(list(unique_pred_img_ids - gt_img_ids))
+    invalid_cat_ids = sorted(list(unique_pred_cat_ids - gt_cat_ids))
+    num_invalid_img_ids = len(invalid_img_ids)
+    num_invalid_cat_ids = len(invalid_cat_ids)
+    logging_logger.info("%s [VAL-METRICS][AUDIT] detecções=%d unique_img_ids=%d unique_cat_ids=%d", tag, total_preds, len(unique_pred_img_ids), len(unique_pred_cat_ids))
+    if invalid_img_ids:
+        logging_logger.warning(
+            "%s [VAL-METRICS][AUDIT] image_id inválidos detectados (exemplos=%s)", tag, invalid_img_ids[:5]
         )
-    logging_logger.info("%s image_id check OK (%d imgs)", tag, len(predicted_image_ids))
-
-    if invalid_category_ids:
-        raise RuntimeError(
-            (
-                f"{tag} category_id inválidos detectados: {len(invalid_category_ids)} fora do conjunto GT. "
-                f"Exemplos: {invalid_category_ids[:5]} | GT={val_ann} | preds={predictions_path}"
-            )
+    if invalid_cat_ids:
+        logging_logger.warning(
+            "%s [VAL-METRICS][AUDIT] category_id inválidos detectados (exemplos=%s)",
+            tag,
+            invalid_cat_ids[:5],
         )
-    logging_logger.info("%s category_id check OK (%d cats)", tag, len(predicted_category_ids))
+
+    filtered_predictions = [p for p in predictions if int(p["image_id"]) in gt_img_ids and int(p["category_id"]) in gt_cat_ids]
+    if len(filtered_predictions) != total_preds:
+        logging_logger.info("%s [VAL-METRICS][AUDIT] Filtro aplicado: antes=%d depois=%d", tag, total_preds, len(filtered_predictions))
+
+    predictions_path.write_text(json.dumps(filtered_predictions, indent=2), encoding="utf-8")
+
+    valid_pred_img_ids = set(int(p["image_id"]) for p in filtered_predictions)
+    valid_pred_cat_ids = set(int(p["category_id"]) for p in filtered_predictions)
+    if not filtered_predictions:
+        raise RuntimeError(f"{tag} Nenhuma predição válida após auditoria. Abortando COCOeval.")
+    if num_invalid_img_ids > 0:
+        logging_logger.info(
+            "%s [VAL-METRICS][AUDIT] %d image_id(s) inválidos foram filtrados", tag, num_invalid_img_ids
+        )
+    if num_invalid_cat_ids > 0:
+        logging_logger.info(
+            "%s [VAL-METRICS][AUDIT] %d category_id(s) inválidos foram filtrados", tag, num_invalid_cat_ids
+        )
+    if not valid_pred_cat_ids <= gt_cat_ids:
+        raise RuntimeError(f"{tag} category_id inválidos após filtro: {sorted(list(valid_pred_cat_ids - gt_cat_ids))}")
 
     logging_logger.info("%s Executando COCOeval...", tag)
 
@@ -1204,19 +1254,37 @@ def run_val_coco_metrics(
         "ARl": stats[11],
     }
 
-    logging_logger.info(
-        "%s AP=%.4f, AP50=%.4f, AP75=%.4f, AR100=%.4f",
-        tag,
-        metrics["AP"],
-        metrics["AP50"],
-        metrics["AP75"],
-        metrics["AR100"],
-    )
+    precisions = coco_eval.eval.get("precision")
+    per_class: dict[str, dict[str, float | str]] = {}
+    if precisions is not None:
+        for idx, cat_id in enumerate(coco_eval.params.catIds):
+            cls_prec = precisions[:, :, idx, 0, 2]
+            cls_prec = cls_prec[cls_prec > -1]
+            ap = float(cls_prec.mean()) if cls_prec.size else float("nan")
+            per_class[str(cat_id)] = {"name": coco_gt.cats.get(cat_id, {}).get("name", str(cat_id)), "AP": ap}
+
+    logging_logger.info("%s AP=%.4f, AP50=%.4f, AP75=%.4f, AR100=%.4f", tag, metrics["AP"], metrics["AP50"], metrics["AP75"], metrics["AR100"])
+
+    gt_summary = {
+        "num_images": len(gt_img_ids),
+        "num_categories": len(gt_cat_ids),
+        "min_image_id": min(gt_img_ids) if gt_img_ids else None,
+        "max_image_id": max(gt_img_ids) if gt_img_ids else None,
+    }
+    pred_summary = {
+        "num_detections": len(filtered_predictions),
+        "unique_image_ids": len(valid_pred_img_ids),
+        "unique_category_ids": len(valid_pred_cat_ids),
+    }
 
     return {
         "coco_metrics": metrics,
         "coco_stats": stats,
         "predictions_coco_json": str(predictions_path),
+        "per_class": per_class,
+        "gt_summary": gt_summary,
+        "pred_summary": pred_summary,
+        "gt_annotations": str(val_ann),
     }
 
 
@@ -1299,24 +1367,50 @@ def run_post_training_validation(
     elif head_mismatch:
         _emit(f"[{run_tag.upper()}][VAL-POST] Head incompatível; ignorados: {ignored_keys}")
 
-    if val_mode == "metrics":
-        results = run_val_coco_metrics(
-            model,
-            val_loader,
-            device_str,
-            val_ann,
-            logging_logger,
-            tag="[VAL-METRICS]",
-            output_dir=out_dir,
-        )
-    else:
-        results = run_val_loss_loop(
-            model,
-            val_loader,
-            device_str,
-            num_classes=model_num_classes,
-            logging_logger=logging_logger,
-        )
+    try:
+        if val_mode == "metrics":
+            results = run_val_coco_metrics(
+                model,
+                val_loader,
+                device_str,
+                val_ann,
+                logging_logger,
+                tag="[VAL-METRICS]",
+                output_dir=out_dir,
+            )
+        else:
+            results = run_val_loss_loop(
+                model,
+                val_loader,
+                device_str,
+                num_classes=model_num_classes,
+                logging_logger=logging_logger,
+            )
+    except Exception as exc:
+        error_payload = {
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "timestamp": datetime.now().isoformat(),
+            "val_annotations": str(val_ann),
+        }
+        try:
+            COCO, _ = _ensure_pycocotools()
+            coco_gt = COCO(str(val_ann))
+            img_ids = list(int(x) for x in coco_gt.getImgIds())
+            cat_ids = list(int(x) for x in coco_gt.getCatIds())
+            error_payload["gt_summary"] = {
+                "num_images": len(img_ids),
+                "min_image_id": min(img_ids) if img_ids else None,
+                "max_image_id": max(img_ids) if img_ids else None,
+                "num_categories": len(cat_ids),
+            }
+        except Exception as inner_exc:  # pragma: no cover - tentativa auxiliar de debug
+            error_payload["gt_summary_error"] = str(inner_exc)
+
+        results_error_path = out_dir / "results_error.json"
+        results_error_path.write_text(json.dumps(error_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        _emit_warning(f"[{run_tag.upper()}][VAL-POST] Falha; detalhes em {results_error_path}")
+        raise
 
     results_payload = {
         "dataset": str(dataset_dir),

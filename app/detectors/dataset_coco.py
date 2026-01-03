@@ -24,6 +24,7 @@ class CocoDetectionDataset(Dataset):
             self.id_to_anns.setdefault(ann["image_id"], []).append(ann)
 
         self.images = self.annotations.get("images", [])
+        self.ids = [img.get("id") for img in self.images]
         self.class_id_to_name = {cat["id"]: cat["name"] for cat in self.annotations.get("categories", [])}
         self.num_classes = len(self.annotations.get("categories", [])) + 1  # +1 background
 
@@ -33,6 +34,7 @@ class CocoDetectionDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         img_info = self.images[idx]
         img_path = self.images_dir / img_info["file_name"].split("/")[-1]
+        file_name = img_info.get("file_name")
         image = Image.open(img_path).convert("RGB")
 
         anns = self.id_to_anns.get(img_info["id"], [])
@@ -54,8 +56,12 @@ class CocoDetectionDataset(Dataset):
             "area": torch.tensor(areas, dtype=torch.float32),
             "iscrowd": torch.tensor(iscrowd, dtype=torch.int64),
             "img_path": str(img_path),
+            "file_name": file_name if file_name is not None else str(img_path.name),
             "orig_size": torch.tensor([image.height, image.width], dtype=torch.int64),
         }
+
+        if file_name is not None:
+            target["image_path"] = str(img_path)
 
         if not boxes:
             target["boxes"] = torch.zeros((0, 4), dtype=torch.float32)
