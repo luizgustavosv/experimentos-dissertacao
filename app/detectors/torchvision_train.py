@@ -757,7 +757,7 @@ def _load_frcnn_weights_with_head_guard(
     emit_info: Callable[[str], None],
     emit_warning: Callable[[str], None],
     logging_logger: logging.Logger,
-) -> tuple[list[str], list[str], Optional[int], bool, list[str]]:
+) -> tuple[list[str], list[str], Optional[int], bool, list[str], bool]:
     ckpt_num_classes = _detect_checkpoint_num_classes(state_dict)
     head_mismatch = ckpt_num_classes is not None and ckpt_num_classes != model_num_classes
     filtered_state_dict = state_dict
@@ -779,6 +779,7 @@ def _load_frcnn_weights_with_head_guard(
         )
         filtered_state_dict, ignored_keys = _strip_box_predictor_head(state_dict)
         head_mismatch = True
+        strict_load = False
         missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
         if ckpt_num_classes is None:
             ckpt_num_classes = _detect_checkpoint_num_classes(state_dict)
@@ -792,7 +793,7 @@ def _load_frcnn_weights_with_head_guard(
         ignored_keys = ["roi_heads.box_predictor.cls_score", "roi_heads.box_predictor.bbox_pred"]
         logging_logger.debug("[WEIGHTS] Nenhuma chave do head presente para ignorar; registrando padrões")
 
-    return missing, unexpected, ckpt_num_classes, head_mismatch, ignored_keys
+    return missing, unexpected, ckpt_num_classes, head_mismatch, ignored_keys, strict_load
 
 
 def _ensure_pycocotools() -> tuple[type, type]:
@@ -863,14 +864,14 @@ def _build_val_loader_and_classes(
     inferred_val_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(val_ds_full))
 
     dataset_num_classes: Optional[int] = None
-    if configured_dataset_classes is not None:
+    if ann_dataset_classes is not None:
+        dataset_num_classes = ann_dataset_classes
+    elif configured_dataset_classes is not None:
         dataset_num_classes = configured_dataset_classes
     elif configured_model_num_classes is not None and configured_model_num_classes > 0:
         dataset_num_classes = (
             max(1, configured_model_num_classes - 1) if expects_background else configured_model_num_classes
         )
-    elif ann_dataset_classes is not None:
-        dataset_num_classes = ann_dataset_classes
     else:
         dataset_num_classes = inferred_train_classes
 
@@ -908,10 +909,9 @@ def _build_val_loader_and_classes(
             )
 
     logging_logger.info(
-        "[MODEL] num_classes configurado=%d (esperado%s=%s)",
+        "[MODEL] dataset_num_classes=%d model_num_classes=%d (incluindo background)",
+        dataset_num_classes,
         model_num_classes,
-        " c/ background" if expects_background else " foreground",
-        expected_model_classes,
     )
 
     if looks_like_visdrone:
@@ -1341,15 +1341,24 @@ def run_post_training_validation(
             log_cb(message)
         logging_logger.warning(message)
 
-    val_mode = getattr(config, "val_mode", "loss")
-    if val_mode not in {"loss", "metrics"}:
-        logging_logger.warning("[VAL] val_mode desconhecido %s; forçando 'loss'", val_mode)
-        val_mode = "loss"
+    val_mode_requested = getattr(config, "val_mode", "loss")
+    if val_mode_requested not in {"loss", "metrics"}:
+        logging_logger.warning("[VAL] val_mode desconhecido %s; forçando 'loss'", val_mode_requested)
+        val_mode_requested = "loss"
+    val_mode = val_mode_requested
+    metrics_valid = True
 
     loaded = torch.load(weights_path.expanduser().resolve(), map_location="cpu")
     state_dict, checkpoint_format = _extract_state_dict(loaded)
     _emit(f"[{run_tag.upper()}][VAL-POST] Formato de checkpoint: {checkpoint_format}")
-    missing, unexpected, ckpt_num_classes, head_mismatch, ignored_keys = _load_frcnn_weights_with_head_guard(
+    (
+        missing,
+        unexpected,
+        ckpt_num_classes,
+        head_mismatch,
+        ignored_keys,
+        strict_load,
+    ) = _load_frcnn_weights_with_head_guard(
         model,
         state_dict,
         model_num_classes=model_num_classes,
@@ -1357,15 +1366,30 @@ def run_post_training_validation(
         emit_warning=_emit_warning,
         logging_logger=logging_logger,
     )
-    if head_mismatch and val_mode == "metrics":
-        warning_msg = (
-            "Pesos carregados sem head compatível; métricas podem ser inválidas. "
-            "Recomenda-se retreinar/fine-tunar com dataset_num_classes correto."
+    logging_logger.info(
+        "[WEIGHTS] ckpt_num_classes=%s model_num_classes=%s strict_load=%s",
+        ckpt_num_classes,
+        model_num_classes,
+        strict_load,
+    )
+    if head_mismatch:
+        metrics_valid = False
+        logging_logger.error(
+            "[WEIGHTS] ckpt_num_classes=%s model_num_classes=%s -> head incompatível; métricas COCO inválidas.",
+            ckpt_num_classes,
+            model_num_classes,
         )
-        _emit_warning(warning_msg)
-        _emit(f"[{run_tag.upper()}][VAL-POST] Ignorados do checkpoint: {ignored_keys}")
-    elif head_mismatch:
+        if val_mode_requested == "metrics":
+            warning_msg = (
+                "Pesos carregados sem head compatível; métricas COCO não serão executadas. "
+                "Recomenda-se retreinar/fine-tunar com dataset_num_classes correto."
+            )
+            _emit_warning(warning_msg)
+            val_mode = "loss"
         _emit(f"[{run_tag.upper()}][VAL-POST] Head incompatível; ignorados: {ignored_keys}")
+
+    if isinstance(model, FasterRCNN):
+        _ensure_frcnn_head(model, model_num_classes, logging_logger)
 
     try:
         if val_mode == "metrics":
@@ -1429,7 +1453,9 @@ def run_post_training_validation(
         "model_num_classes": model_num_classes,
         "ckpt_num_classes": ckpt_num_classes,
         "weights_head_mismatch": head_mismatch,
+        "metrics_valid": metrics_valid,
         "ignored_head_keys": ignored_keys,
+        "val_mode_requested": val_mode_requested,
         "val_mode": val_mode,
         **results,
     }
@@ -1530,14 +1556,14 @@ def train_torchvision_detector(
         inferred_val_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(val_ds_full))
 
         dataset_num_classes: Optional[int] = None
-        if configured_dataset_classes is not None:
+        if ann_dataset_classes is not None:
+            dataset_num_classes = ann_dataset_classes
+        elif configured_dataset_classes is not None:
             dataset_num_classes = configured_dataset_classes
         elif configured_model_num_classes is not None and configured_model_num_classes > 0:
             dataset_num_classes = (
                 max(1, configured_model_num_classes - 1) if use_background else configured_model_num_classes
             )
-        elif ann_dataset_classes is not None:
-            dataset_num_classes = ann_dataset_classes
         else:
             dataset_num_classes = inferred_train_classes
 
@@ -1577,10 +1603,9 @@ def train_torchvision_detector(
                 )
 
         logging_logger.info(
-            "[MODEL] num_classes configurado=%d (esperado%s=%s)",
+            "[MODEL] dataset_num_classes=%d model_num_classes=%d (incluindo background)",
+            dataset_num_classes,
             model_num_classes,
-            " c/ background" if use_background else " foreground",
-            expected_model_classes,
         )
 
         if looks_like_visdrone:
