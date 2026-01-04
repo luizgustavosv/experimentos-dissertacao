@@ -33,9 +33,23 @@ class ExperimentController:
         logger: Optional[Logger] = None,
         images_dir: Optional[Path] = None,
         annotations_path: Optional[Path] = None,
+        max_epochs: Optional[int] = None,
+        early_stop_enabled: bool = False,
+        early_stop_patience: int = 10,
+        early_stop_min_delta: float = 0.0,
+        early_stop_min_epochs: int = 10,
+        early_stop_ema_alpha: float = 0.2,
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
         metrics: Optional[Metrics]
+
+        if hasattr(detector, "config"):
+            detector.config.max_epochs = max_epochs
+            detector.config.early_stop_enabled = early_stop_enabled
+            detector.config.early_stop_patience = early_stop_patience
+            detector.config.early_stop_min_delta = early_stop_min_delta
+            detector.config.early_stop_min_epochs = early_stop_min_epochs
+            detector.config.early_stop_ema_alpha = early_stop_ema_alpha
 
         if algorithm_key == "YOLO":
             dataset_yaml = dataset_path.expanduser().resolve()

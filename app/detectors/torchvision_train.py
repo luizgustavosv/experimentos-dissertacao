@@ -4,6 +4,7 @@ import faulthandler
 import importlib.util
 import json
 import logging
+import math
 from collections import Counter
 import signal
 import sys
@@ -38,6 +39,7 @@ from app.detectors.utils import (
     seed_everything,
 )
 from app.metrics import Metrics
+from app.training.early_stopping import TrainLossEMAStopper
 
 try:
     from tqdm import tqdm
@@ -1757,6 +1759,9 @@ def train_torchvision_detector(
     seed_everything(config.seed)
     logging_logger.info("Dispositivo: %s | torch=%s | cuda_available=%s", device_str, torch.__version__, torch.cuda.is_available())
     logging_logger.info("Configuração: %s", config)
+    epochs_to_run = config.epochs if config.max_epochs is None else min(config.epochs, config.max_epochs)
+    if config.max_epochs is not None:
+        logging_logger.info("[TRAIN] max_epochs ativo=%s -> epochs_to_run=%s", config.max_epochs, epochs_to_run)
 
     ckpt_dir = Path(checkpoint_dir) if checkpoint_dir else Path(weights_out).expanduser().resolve().parent
     ckpt_dir = ckpt_dir.expanduser().resolve()
@@ -1918,6 +1923,27 @@ def train_torchvision_detector(
         val_loader = DataLoader(val_ds_full, shuffle=False, **dataloader_kwargs)
         logging_logger.info("DataLoader construído. num_batches=%d", len(train_loader))
 
+        stopper: Optional[TrainLossEMAStopper] = None
+        best_by_trainloss_path = ckpt_dir / "best_by_trainloss.pth"
+        if config.early_stop_enabled:
+            try:
+                stopper = TrainLossEMAStopper(
+                    patience=config.early_stop_patience,
+                    min_delta=config.early_stop_min_delta,
+                    min_epochs=config.early_stop_min_epochs,
+                    ema_alpha=config.early_stop_ema_alpha,
+                )
+                logging_logger.info(
+                    "[EARLY] Early stopping ativado: patience=%d min_delta=%.4f min_epochs=%d ema_alpha=%.3f",
+                    config.early_stop_patience,
+                    config.early_stop_min_delta,
+                    config.early_stop_min_epochs,
+                    config.early_stop_ema_alpha,
+                )
+            except Exception:
+                logging_logger.exception("[EARLY] Falha ao inicializar early stopping; desabilitando por segurança.")
+                stopper = None
+
         if config.smoke_test_val_loss:
             _run_smoke_test_val_loss(
                 model,
@@ -1953,20 +1979,22 @@ def train_torchvision_detector(
         logged_loss_structure = False
         heartbeat_seconds = 10
         log_every_batches = max(1, config.log_every)
+        stop_training_flag = False
 
-        for epoch in range(1, config.epochs + 1):
+        epochs_completed = 0
+        for epoch in range(1, epochs_to_run + 1):
             model.train()
             running_loss = 0.0
             epoch_wall_start = time.perf_counter()
             last_heartbeat = time.perf_counter()
             total_batches = len(train_loader)
-            logging_logger.info("Epoch %d/%d | num_batches=%d", epoch, config.epochs, total_batches)
+            logging_logger.info("Epoch %d/%d | num_batches=%d", epoch, epochs_to_run, total_batches)
             progress = None
             if tqdm:
                 try:
                     progress = tqdm(
                         total=total_batches,
-                        desc=f"Epoch {epoch}/{config.epochs}",
+                        desc=f"Epoch {epoch}/{epochs_to_run}",
                         leave=False,
                         file=safe_stderr,
                         dynamic_ncols=False,
@@ -2096,7 +2124,7 @@ def train_torchvision_detector(
             logging_logger.info(
                 "[TRAIN] Época %d/%d concluída | lr=%.6f | loss=%.4f | tempo=%.2fs",
                 epoch,
-                config.epochs,
+                epochs_to_run,
                 lr_scheduler.get_last_lr()[0],
                 avg_loss,
                 time.perf_counter() - epoch_wall_start,
@@ -2232,6 +2260,38 @@ def train_torchvision_detector(
                 if breakdown_mean:
                     logging_logger.info("[VAL] Breakdown médio por batch: %s", breakdown_mean)
 
+            if stopper:
+                if not math.isfinite(avg_loss):
+                    logging_logger.warning(
+                        "[EARLY] avg_train_loss não finito (%.4f); desativando early stopping para segurança.", avg_loss
+                    )
+                    stopper = None
+                else:
+                    try:
+                        should_stop, ema_loss, best_ema, bad_epochs = stopper.update(epoch, avg_loss)
+                        logging_logger.info(
+                            "[EARLY] epoch=%d avg_loss=%.4f ema_loss=%.4f best_ema=%.4f bad_epochs=%d/%d",
+                            epoch,
+                            avg_loss,
+                            ema_loss,
+                            best_ema if best_ema is not None else float("nan"),
+                            bad_epochs,
+                            stopper.patience,
+                        )
+                        if best_ema is not None and best_ema == ema_loss:
+                            with _watchdog_paused(last_progress, watchdog_pause):
+                                atomic_torch_save(model.state_dict(), best_by_trainloss_path)
+                            logging_logger.info("[EARLY] Novo melhor ema_loss; checkpoint salvo em %s", best_by_trainloss_path)
+                        if should_stop:
+                            logging_logger.info(
+                                "[EARLY] Critério de paciência alcançado após min_epochs=%d; encerrando treinamento.",
+                                stopper.min_epochs,
+                            )
+                            stop_training_flag = True
+                    except Exception:
+                        logging_logger.exception("[EARLY] Falha ao processar early stopping; desabilitando.")
+                        stopper = None
+
             with _watchdog_paused(last_progress, watchdog_pause):
                 epoch_ckpt = ckpt_dir / f"epoch_{epoch:03d}.pth"
                 atomic_torch_save(
@@ -2244,6 +2304,10 @@ def train_torchvision_detector(
                     epoch_ckpt,
                 )
                 logging_logger.info("Checkpoint da época %d salvo em %s", epoch, epoch_ckpt)
+
+            epochs_completed = epoch
+            if stop_training_flag:
+                break
 
         watchdog_stop.set()
         watchdog_thread.join(timeout=1)
@@ -2270,7 +2334,7 @@ def train_torchvision_detector(
             map50=0.0,
             map50_95=0.0,
             loss_final=last_loss,
-            epochs=config.epochs,
+            epochs=epochs_completed or epochs_to_run,
             train_images=len(train_ds_full),
             device=device_str,
             weights_path=weights_out,
@@ -2282,7 +2346,7 @@ def train_torchvision_detector(
     finally:
         try:
             with _watchdog_paused(last_progress, watchdog_pause):
-                final_epoch = epoch if epoch else 0
+                final_epoch = epochs_completed if epochs_completed else 0
                 last_ckpt = ckpt_dir / "last.pth"
                 atomic_torch_save(
                     {

@@ -94,6 +94,12 @@ class TorchvisionDetector(DetectionAlgorithm):
                 val_mode=self.config.val_mode,
                 dataset_num_classes=dataset_num_classes,
                 num_classes=model_num_classes,
+                max_epochs=self.config.max_epochs,
+                early_stop_enabled=self.config.early_stop_enabled,
+                early_stop_patience=self.config.early_stop_patience,
+                early_stop_min_delta=self.config.early_stop_min_delta,
+                early_stop_min_epochs=self.config.early_stop_min_epochs,
+                early_stop_ema_alpha=self.config.early_stop_ema_alpha,
             ),
             logger=logger,
         )
