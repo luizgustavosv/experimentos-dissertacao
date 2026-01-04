@@ -4,6 +4,7 @@ import faulthandler
 import importlib.util
 import json
 import logging
+from collections import Counter
 import signal
 import sys
 import threading
@@ -16,7 +17,7 @@ from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRCNN
 from torchvision.models.detection.retinanet import RetinaNet
 
@@ -851,6 +852,89 @@ def _coco_box_from_xyxy(box: torch.Tensor) -> list[float]:
     return [float(xmin), float(ymin), float(xmax - xmin), float(ymax - ymin)]
 
 
+def _flatten_subset_indices(dataset) -> tuple[Any, list[int] | None]:
+    indices: list[int] | None = None
+    base = dataset
+    while isinstance(base, Subset):
+        current_indices = list(base.indices)
+        if indices is None:
+            indices = current_indices
+        else:  # handle nested subsets
+            indices = [indices[i] for i in current_indices]
+        base = base.dataset
+    return base, indices
+
+
+def _extract_coco_subset_from_dataset(dataset: Any) -> dict[str, Any] | None:
+    base_ds, indices = _flatten_subset_indices(dataset)
+    images = getattr(base_ds, "images", None)
+    annotations = getattr(base_ds, "annotations", None)
+    if images is None or annotations is None:
+        return None
+
+    images_list = images
+    if indices is not None:
+        images_list = [images[i] for i in indices]
+
+    image_ids = [img.get("id") for img in images_list if img.get("id") is not None]
+    image_id_set = set(int(img_id) for img_id in image_ids)
+    filtered_annotations = [
+        ann for ann in annotations.get("annotations", []) if int(ann.get("image_id", -1)) in image_id_set
+    ]
+
+    file_name_to_id = {}
+    for img in images_list:
+        img_id = img.get("id")
+        file_name = img.get("file_name")
+        if img_id is None or file_name is None:
+            continue
+        try:
+            file_name_to_id[Path(str(file_name)).name] = int(img_id)
+        except Exception:
+            continue
+
+    return {
+        "images": images_list,
+        "annotations": filtered_annotations,
+        "categories": annotations.get("categories", []),
+        "image_ids": image_id_set,
+        "file_name_to_id": file_name_to_id,
+    }
+
+
+def _rescale_boxes_to_original(
+    boxes: torch.Tensor, target: dict[str, Any], current_size: tuple[int, int], logger: logging.Logger, *, tag: str
+) -> torch.Tensor:
+    orig_size = target.get("orig_size")
+    if torch.is_tensor(orig_size):
+        orig_h, orig_w = int(orig_size[0]), int(orig_size[1])
+    elif isinstance(orig_size, (list, tuple)) and len(orig_size) >= 2:
+        orig_h, orig_w = int(orig_size[0]), int(orig_size[1])
+    else:
+        logger.warning("%s [AUDIT] orig_size ausente para image_id=%s; boxes não serão reescaladas.", tag, target.get("image_id"))
+        return boxes
+
+    cur_h, cur_w = current_size
+    if cur_h <= 0 or cur_w <= 0:
+        logger.warning(
+            "%s [AUDIT] current_size inválido (%s, %s) para image_id=%s; boxes não serão reescaladas.",
+            tag,
+            cur_h,
+            cur_w,
+            target.get("image_id"),
+        )
+        return boxes
+
+    scale_x = float(orig_w) / float(cur_w)
+    scale_y = float(orig_h) / float(cur_h)
+    scaled = boxes.clone()
+    scaled[:, 0] = boxes[:, 0] * scale_x
+    scaled[:, 2] = boxes[:, 2] * scale_x
+    scaled[:, 1] = boxes[:, 1] * scale_y
+    scaled[:, 3] = boxes[:, 3] * scale_y
+    return scaled
+
+
 def _build_val_loader_and_classes(
     dataset_dir: Path,
     train_ann: Path,
@@ -1073,9 +1157,38 @@ def run_val_coco_metrics(
     output_dir: Path,
 ) -> dict:
     COCO, COCOeval = _ensure_pycocotools()
+    val_dataset = getattr(val_loader, "dataset", None)
+    val_dataset_info = _extract_coco_subset_from_dataset(val_dataset)
+    expected_val_images = len(val_dataset) if val_dataset is not None else None
+    gt_source = "original"
+
     coco_gt = COCO(str(val_ann))
 
-    logging_logger.info("%s Ground truth annotations: %s", tag, val_ann)
+    if val_dataset_info is not None:
+        val_image_ids = set(int(x) for x in val_dataset_info.get("image_ids", set()))
+        gt_image_ids_from_loader = set(int(x) for x in coco_gt.getImgIds())
+        if val_image_ids and val_image_ids != gt_image_ids_from_loader:
+            effective_gt = {
+                "images": val_dataset_info.get("images", []),
+                "annotations": val_dataset_info.get("annotations", []),
+                "categories": val_dataset_info.get("categories", []),
+            }
+            output_dir = output_dir.expanduser().resolve()
+            output_dir.mkdir(parents=True, exist_ok=True)
+            effective_gt_path = output_dir / "gt_instances_val_effective.json"
+            effective_gt_path.write_text(json.dumps(effective_gt, indent=2), encoding="utf-8")
+            logging_logger.warning(
+                "%s [AUDIT] ImageId mismatch (dataset=%d GT=%d). Usando GT efetivo: %s",
+                tag,
+                len(val_image_ids),
+                len(gt_image_ids_from_loader),
+                effective_gt_path,
+            )
+            coco_gt = COCO(str(effective_gt_path))
+            val_ann = effective_gt_path
+            gt_source = "effective_subset"
+
+    logging_logger.info("%s Ground truth annotations: %s (source=%s)", tag, val_ann, gt_source)
     gt_img_ids = set(int(cat_id) for cat_id in coco_gt.getImgIds())
     gt_cat_ids = set(int(cat_id) for cat_id in coco_gt.getCatIds())
     gt_dict = coco_gt.dataset or {}
@@ -1099,6 +1212,8 @@ def run_val_coco_metrics(
         logging_logger.info("%s [AUDIT] img_id range=[%s, %s]", tag, min(gt_img_ids), max(gt_img_ids))
     if gt_cat_ids:
         logging_logger.info("%s [AUDIT] cat_id set=%s", tag, sorted(gt_cat_ids))
+    if not val_image_ids_set:
+        val_image_ids_set = gt_img_ids
 
     is_retinanet = isinstance(model, RetinaNet)
 
@@ -1127,6 +1242,9 @@ def run_val_coco_metrics(
     missing_image_mappings: list[dict[str, Any]] = []
     smoke_checked = 0
     smoke_invalid: list[dict[str, Any]] = []
+    processed_images = 0
+    val_image_ids_set = set(int(x) for x in val_dataset_info.get("image_ids", set())) if val_dataset_info else set()
+    dataset_file_name_to_id = val_dataset_info.get("file_name_to_id", {}) if val_dataset_info else {}
 
     def _map_label_to_category(raw_label: int) -> int | None:
         nonlocal invalid_label_count
@@ -1152,17 +1270,27 @@ def run_val_coco_metrics(
         for batch_idx, (images, targets) in enumerate(val_loader):
             images = [img.to(device_str) for img in images]
             outputs = model(images)
+            processed_images += len(images)
 
-            for output, target in zip(outputs, targets):
+            for output, target, image_tensor in zip(outputs, targets, images):
                 target_image_id = target.get("image_id")
                 file_name = _extract_file_name(target)
                 pred_image_id: int | None = None
                 if target_image_id is not None:
                     candidate = _extract_image_id(target)
-                    if candidate in gt_img_ids:
+                    if candidate in val_image_ids_set:
                         pred_image_id = candidate
                 if pred_image_id is None and file_name is not None:
-                    pred_image_id = gt_filename_to_id.get(file_name) or gt_filename_to_id.get(Path(file_name).name)
+                    pred_image_id = (
+                        dataset_file_name_to_id.get(file_name)
+                        or dataset_file_name_to_id.get(Path(file_name).name)
+                        or gt_filename_to_id.get(file_name)
+                        or gt_filename_to_id.get(Path(file_name).name)
+                    )
+                if pred_image_id is None and target_image_id is not None:
+                    candidate = _extract_image_id(target)
+                    if candidate in gt_img_ids:
+                        pred_image_id = candidate
 
                 if pred_image_id is None:
                     if len(missing_image_mappings) < 5:
@@ -1188,6 +1316,13 @@ def run_val_coco_metrics(
                 boxes_cpu = boxes.detach().cpu()
                 scores_cpu = scores.detach().cpu()
                 labels_cpu = labels.detach().cpu()
+                boxes_cpu = _rescale_boxes_to_original(
+                    boxes_cpu,
+                    target,
+                    (int(image_tensor.shape[-2]), int(image_tensor.shape[-1])),
+                    logging_logger,
+                    tag=tag,
+                )
 
                 if labels_cpu.numel() > 0:
                     max_label_observed = max(max_label_observed, int(labels_cpu.max()))
@@ -1217,6 +1352,20 @@ def run_val_coco_metrics(
     if missing_image_mappings:
         logging_logger.error("%s [AUDIT] Falha ao mapear image_id para GT: exemplos=%s", tag, missing_image_mappings)
 
+    logging_logger.info(
+        "%s [AUDIT] expected_val_images=%s processed_images=%d",
+        tag,
+        expected_val_images,
+        processed_images,
+    )
+    if expected_val_images is not None and processed_images < expected_val_images:
+        logging_logger.warning(
+            "%s [AUDIT] processed_images (%d) menor que esperado (%d)",
+            tag,
+            processed_images,
+            expected_val_images,
+        )
+
     total_preds = len(predictions)
     unique_pred_img_ids = set(int(p["image_id"]) for p in predictions)
     unique_pred_cat_ids = set(int(p["category_id"]) for p in predictions)
@@ -1224,7 +1373,32 @@ def run_val_coco_metrics(
     invalid_cat_ids = sorted(list(unique_pred_cat_ids - gt_cat_ids))
     num_invalid_img_ids = len(invalid_img_ids)
     num_invalid_cat_ids = len(invalid_cat_ids)
-    logging_logger.info("%s [VAL-METRICS][AUDIT] detecções=%d unique_img_ids=%d unique_cat_ids=%d", tag, total_preds, len(unique_pred_img_ids), len(unique_pred_cat_ids))
+    cat_counter = Counter(int(p["category_id"]) for p in predictions)
+    top_categories = cat_counter.most_common(10)
+    logging_logger.info(
+        "%s [VAL-METRICS][AUDIT] detecções=%d unique_img_ids=%d unique_cat_ids=%d",
+        tag,
+        total_preds,
+        len(unique_pred_img_ids),
+        len(unique_pred_cat_ids),
+    )
+    if unique_pred_img_ids:
+        logging_logger.info(
+            "%s [VAL-METRICS][AUDIT] img_id range=[%s, %s]",
+            tag,
+            min(unique_pred_img_ids),
+            max(unique_pred_img_ids),
+        )
+    missing_pred_ids = set(int(x) for x in val_image_ids_set) - unique_pred_img_ids
+    logging_logger.info("%s [VAL-METRICS][AUDIT] missing_pred_ids (primeiros 20)=%s", tag, sorted(list(missing_pred_ids))[:20])
+    if expected_val_images is not None and expected_val_images > 0 and len(unique_pred_img_ids) < expected_val_images * 0.9:
+        logging_logger.warning(
+            "%s [AUDIT] Cobertura de image_id baixa: %d/%d",
+            tag,
+            len(unique_pred_img_ids),
+            expected_val_images,
+        )
+    logging_logger.info("%s [VAL-METRICS][AUDIT] top categorias (id, count)=%s", tag, top_categories)
     if invalid_img_ids:
         logging_logger.warning(
             "%s [VAL-METRICS][AUDIT] image_id inválidos detectados (exemplos=%s)", tag, invalid_img_ids[:5]
