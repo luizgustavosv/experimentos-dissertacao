@@ -73,6 +73,13 @@ class DetectorApp(tk.Tk):
         self.yolo_batch_var = tk.IntVar(value=16)
         self.yolo_device_var = tk.StringVar(value="cpu")
         self.val_mode_var = tk.StringVar(value="loss")
+        self.max_epochs_enabled_var = tk.BooleanVar(value=False)
+        self.max_epochs_var = tk.IntVar(value=10)
+        self.early_stop_enabled_var = tk.BooleanVar(value=False)
+        self.early_patience_var = tk.IntVar(value=10)
+        self.early_min_delta_var = tk.DoubleVar(value=0.0)
+        self.early_min_epochs_var = tk.IntVar(value=10)
+        self.early_ema_alpha_var = tk.DoubleVar(value=0.2)
         self.run_button_text = tk.StringVar(value="Executar")
         self._variable_traces: list[tuple[tk.Variable, str]] = []
 
@@ -200,6 +207,8 @@ class DetectorApp(tk.Tk):
             )
             self._add_path_selector("Pasta para salvar os pesos treinados", "weights", is_dir=True)
             self._add_epoch_selector()
+            self._add_max_epoch_selector()
+            self._add_early_stopping_controls()
         elif action == "Inferir":
             self._add_path_selector("Pesos para inferência", "inference_weights")
             self._add_path_selector("Imagens para inferência", "images", is_dir=True)
@@ -437,6 +446,76 @@ class DetectorApp(tk.Tk):
         spinbox = tk.Spinbox(frame, from_=1, to=500, textvariable=self.epochs_var, width=8)
         spinbox.pack(anchor="w")
 
+    def _add_max_epoch_selector(self) -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        row = tk.Frame(frame, bg="#12233d")
+        row.pack(anchor="w")
+        check = tk.Checkbutton(
+            row,
+            text="Ativar limite superior de épocas (max_epochs)",
+            variable=self.max_epochs_enabled_var,
+            onvalue=True,
+            offvalue=False,
+            bg="#12233d",
+            fg="white",
+            selectcolor="#0b172a",
+            activebackground="#12233d",
+            activeforeground="white",
+            command=lambda: spin.config(state="normal" if self.max_epochs_enabled_var.get() else "disabled"),
+        )
+        check.pack(side="left")
+        spin = tk.Spinbox(
+            row,
+            from_=1,
+            to=1000,
+            textvariable=self.max_epochs_var,
+            width=8,
+            state="disabled",
+        )
+        spin.pack(side="left", padx=(10, 0))
+
+    def _add_early_stopping_controls(self) -> None:
+        frame = tk.LabelFrame(self.dynamic_frame, text="Early stopping (loss + EMA)", bg="#12233d", fg="white")
+        frame.pack(fill="x", padx=10, pady=6)
+
+        def _toggle(state: bool) -> None:
+            new_state = "normal" if state else "disabled"
+            for widget in controls:
+                widget.configure(state=new_state)
+
+        header = tk.Checkbutton(
+            frame,
+            text="Habilitar early stopping",
+            variable=self.early_stop_enabled_var,
+            onvalue=True,
+            offvalue=False,
+            bg="#12233d",
+            fg="white",
+            selectcolor="#0b172a",
+            activebackground="#12233d",
+            activeforeground="white",
+            command=lambda: _toggle(self.early_stop_enabled_var.get()),
+        )
+        header.pack(anchor="w", padx=6, pady=(4, 6))
+
+        controls: list[tk.Widget] = []
+
+        def _spinbox(label: str, variable: tk.Variable, from_: float, to: float, increment: float = 1.0) -> None:
+            row = tk.Frame(frame, bg="#12233d")
+            row.pack(fill="x", padx=10, pady=2)
+            tk.Label(row, text=label, bg="#12233d", fg="white").pack(side="left")
+            spin = tk.Spinbox(row, from_=from_, to=to, increment=increment, textvariable=variable, width=8)
+            spin.pack(side="left", padx=(6, 0))
+            controls.append(spin)
+
+        _spinbox("Paciência (épocas)", self.early_patience_var, 1, 500, 1)
+        _spinbox("min_delta", self.early_min_delta_var, 0.0, 10.0, 0.1)
+        _spinbox("min_epochs", self.early_min_epochs_var, 0, 500, 1)
+        _spinbox("ema_alpha", self.early_ema_alpha_var, 0.01, 1.0, 0.01)
+
+        _toggle(self.early_stop_enabled_var.get())
+
     def _add_pedestrian_filter_selector(self) -> None:
         frame = tk.Frame(self.dynamic_frame, bg="#12233d")
         frame.pack(fill="x", padx=10, pady=6)
@@ -517,6 +596,12 @@ class DetectorApp(tk.Tk):
                 pretrained_raw = self.path_vars["pretrained"].get().strip()
                 pretrained = Path(pretrained_raw) if pretrained_raw else None
                 epochs = int(self.epochs_var.get())
+                max_epochs = int(self.max_epochs_var.get()) if self.max_epochs_enabled_var.get() else None
+                early_stop_enabled = bool(self.early_stop_enabled_var.get())
+                patience = int(self.early_patience_var.get())
+                min_delta = float(self.early_min_delta_var.get())
+                min_epochs = int(self.early_min_epochs_var.get())
+                ema_alpha = float(self.early_ema_alpha_var.get())
 
                 if pretrained and not pretrained.exists():
                     messagebox.showerror("Erro", "O arquivo de pesos pré-treinados não existe.")
@@ -547,6 +632,8 @@ class DetectorApp(tk.Tk):
                             "pesos_out": weights,
                             "pretreinados": pretrained or "padrão",
                             "epocas": epochs,
+                            **({"max_epochs": max_epochs} if max_epochs else {}),
+                            **({"early_stop": "on"} if early_stop_enabled else {}),
                             **({"imagens": exec_kwargs.get("images_dir")} if exec_kwargs.get("images_dir") else {}),
                         },
                     )
@@ -560,6 +647,12 @@ class DetectorApp(tk.Tk):
                         epochs=epochs,
                         logger=prompt_logger,
                         **exec_kwargs,
+                        max_epochs=max_epochs,
+                        early_stop_enabled=early_stop_enabled,
+                        early_stop_patience=patience,
+                        early_stop_min_delta=min_delta,
+                        early_stop_min_epochs=min_epochs,
+                        early_stop_ema_alpha=ema_alpha,
                     )
 
             elif action == "Inferir":

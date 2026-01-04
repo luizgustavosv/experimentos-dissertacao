@@ -34,3 +34,9 @@ class TrainConfig:
     num_classes: Optional[int] = None
     val_mode: Literal["loss", "metrics"] = "loss"
     val_ratio: float = 0.1
+    max_epochs: Optional[int] = None
+    early_stop_enabled: bool = False
+    early_stop_patience: int = 10
+    early_stop_min_delta: float = 0.0
+    early_stop_min_epochs: int = 10
+    early_stop_ema_alpha: float = 0.2
