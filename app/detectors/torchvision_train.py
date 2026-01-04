@@ -1157,7 +1157,14 @@ def run_val_coco_metrics(
     output_dir: Path,
 ) -> dict:
     COCO, COCOeval = _ensure_pycocotools()
+    val_image_ids_set: set[int] = set()
     val_dataset = getattr(val_loader, "dataset", None)
+    try:
+        val_coco_imgs = getattr(getattr(val_dataset, "coco", None), "imgs", None)
+        if val_coco_imgs:
+            val_image_ids_set = set(int(x) for x in val_coco_imgs.keys())
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logging_logger.warning("%s [AUDIT] Falha ao obter image_ids do val_dataset: %s", tag, exc)
     val_dataset_info = _extract_coco_subset_from_dataset(val_dataset)
     expected_val_images = len(val_dataset) if val_dataset is not None else None
     gt_source = "original"
@@ -1213,6 +1220,8 @@ def run_val_coco_metrics(
     if gt_cat_ids:
         logging_logger.info("%s [AUDIT] cat_id set=%s", tag, sorted(gt_cat_ids))
     if not val_image_ids_set:
+        val_image_ids_set = set(int(x) for x in val_dataset_info.get("image_ids", set())) if val_dataset_info else set()
+    if not val_image_ids_set:
         val_image_ids_set = gt_img_ids
 
     is_retinanet = isinstance(model, RetinaNet)
@@ -1243,7 +1252,7 @@ def run_val_coco_metrics(
     smoke_checked = 0
     smoke_invalid: list[dict[str, Any]] = []
     processed_images = 0
-    val_image_ids_set = set(int(x) for x in val_dataset_info.get("image_ids", set())) if val_dataset_info else set()
+    fallback_target_image_ids: set[int] = set()
     dataset_file_name_to_id = val_dataset_info.get("file_name_to_id", {}) if val_dataset_info else {}
 
     def _map_label_to_category(raw_label: int) -> int | None:
@@ -1273,6 +1282,9 @@ def run_val_coco_metrics(
             processed_images += len(images)
 
             for output, target, image_tensor in zip(outputs, targets, images):
+                raw_target_image_id = target.get("image_id")
+                if raw_target_image_id is not None:
+                    fallback_target_image_ids.add(int(raw_target_image_id))
                 target_image_id = target.get("image_id")
                 file_name = _extract_file_name(target)
                 pred_image_id: int | None = None
@@ -1343,6 +1355,14 @@ def run_val_coco_metrics(
                     predicted_image_ids.add(int(pred_image_id))
                     predicted_category_ids.add(int(category_id))
 
+    if not val_image_ids_set and fallback_target_image_ids:
+        val_image_ids_set = set(fallback_target_image_ids)
+        logging_logger.warning(
+            "%s [AUDIT] val_image_ids_set recuperado dos targets após falha no dataset (total=%d)",
+            tag,
+            len(val_image_ids_set),
+        )
+
     if smoke_invalid:
         raise AssertionError(f"{tag} Smoke test falhou: image_ids fora do GT: {smoke_invalid}")
 
@@ -1388,6 +1408,13 @@ def run_val_coco_metrics(
             tag,
             min(unique_pred_img_ids),
             max(unique_pred_img_ids),
+        )
+    if not val_image_ids_set:
+        val_image_ids_set = set(predicted_image_ids)
+        logging_logger.warning(
+            "%s [AUDIT] val_image_ids_set vazio; usando ids das predições (total=%d)",
+            tag,
+            len(val_image_ids_set),
         )
     missing_pred_ids = set(int(x) for x in val_image_ids_set) - unique_pred_img_ids
     logging_logger.info("%s [VAL-METRICS][AUDIT] missing_pred_ids (primeiros 20)=%s", tag, sorted(list(missing_pred_ids))[:20])
