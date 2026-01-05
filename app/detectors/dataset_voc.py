@@ -81,7 +81,50 @@ class PascalVOCDataset(Dataset):
                 "%s imagem lida shape=%sx%s dtype=%s", stage_base, height, width, getattr(image, "dtype", "PIL")
             )
 
-        boxes_list, labels_list, clamp_count = self._parse_annotation(annotation_path, width, height, meta_hint)
+        try:
+            parsed = self._parse_annotation(annotation_path, width, height, meta_hint)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{stage_base}{meta_hint} falha ao parsear anotação idx={idx} ann_path={annotation_path} img_path={image_path}: {exc}"
+            ) from exc
+
+        if isinstance(parsed, (tuple, list)):
+            if len(parsed) >= 3:
+                boxes_list, labels_list = parsed[0], parsed[1]
+                clamp_count = parsed[2]
+                extras = list(parsed[3:]) if len(parsed) > 3 else []
+                if len(parsed) >= 4 and not isinstance(clamp_count, (int, float)) and isinstance(parsed[3], (int, float)):
+                    extras.insert(0, clamp_count)
+                    clamp_count = parsed[3]
+            else:
+                raise ValueError(
+                    f"{stage_base}{meta_hint} parse_annotation retornou menos de 3 itens (idx={idx} ann_path={annotation_path} img_path={image_path})"
+                )
+        else:
+            raise TypeError(
+                f"{stage_base}{meta_hint} parse_annotation deve retornar tuple/list (idx={idx} ann_path={annotation_path} img_path={image_path})"
+            )
+
+        if extras and self.logger and self.logger.isEnabledFor(logging.DEBUG):
+            try:
+                extras_info = []
+                for extra in extras:
+                    if isinstance(extra, dict):
+                        extras_info.append(f"dict_keys={list(extra.keys())}")
+                    else:
+                        extras_info.append(type(extra).__name__)
+                self.logger.debug(
+                    "%s extras adicionais em parse_annotation: num_extras=%d detalhes=%s", stage_base, len(extras), extras_info
+                )
+            except Exception:
+                self.logger.debug("%s extras adicionais em parse_annotation: num_extras=%d", stage_base, len(extras))
+
+        try:
+            clamp_count = int(clamp_count) if clamp_count is not None else 0
+        except Exception:
+            if self.logger and self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("%s clamp_count não numérico; forçando para 0 (valor=%s)", stage_base, clamp_count)
+            clamp_count = 0
 
         if len(boxes_list) == 0:
             boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
