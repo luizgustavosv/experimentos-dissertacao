@@ -1806,6 +1806,7 @@ def train_torchvision_detector(
     watchdog_thread: Optional[threading.Thread] = None
     last_progress = [time.monotonic()]
     epoch = 0
+    epochs_completed = 0
     optimizer: Optional[torch.optim.Optimizer] = None
     try:
         val_ratio_to_use = config.val_ratio if val_ratio is None else val_ratio
