@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -33,7 +35,20 @@ class SSDDetector(TorchvisionDetector):
     ):
         from torchvision import transforms
 
-        dataset_root, class_names, train_ids, val_ids = validate_voc_dataset(dataset_dir)
+        ssd_debug = bool(int(os.getenv("SSD_DEBUG", "0")))
+        diag_logger = logging.getLogger("train.ssd")
+
+        dataset_root, class_names, train_split, val_split = validate_voc_dataset(
+            dataset_dir, logger=diag_logger.info if ssd_debug else None, with_metadata=True
+        )
+        if isinstance(train_split, tuple):
+            train_ids, train_meta = train_split
+        else:  # pragma: no cover - compatibilidade
+            train_ids, train_meta = train_split, []
+        if isinstance(val_split, tuple):
+            val_ids, val_meta = val_split
+        else:
+            val_ids, val_meta = val_split, []
         class_to_idx = {"human": 1}
         device_str = resolve_device(self.config.device)
         num_classes = 2
@@ -46,8 +61,26 @@ class SSDDetector(TorchvisionDetector):
             logger("[SSD] num_classes_experiment=2 (background+human)")
 
         transform = transforms.Compose([transforms.ToTensor()])
-        train_dataset = PascalVOCDataset(dataset_root, train_ids, class_to_idx, transforms=transform)
-        val_dataset = PascalVOCDataset(dataset_root, val_ids, class_to_idx, transforms=transform)
+        train_dataset = PascalVOCDataset(
+            dataset_root,
+            train_ids,
+            class_to_idx,
+            transforms=transform,
+            logger=diag_logger if ssd_debug else None,
+            debug=ssd_debug,
+            split_metadata=train_meta,
+            num_classes=num_classes,
+        )
+        val_dataset = PascalVOCDataset(
+            dataset_root,
+            val_ids,
+            class_to_idx,
+            transforms=transform,
+            logger=diag_logger if ssd_debug else None,
+            debug=False,
+            split_metadata=val_meta,
+            num_classes=num_classes,
+        )
 
         model = self._build_ssd_model(num_classes, pretrained_weights, logger)
         metrics = train_torchvision_detector(

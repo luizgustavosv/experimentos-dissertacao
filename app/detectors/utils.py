@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import logging
 import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -12,6 +13,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from app.detectors.base import Logger
+
+_VALID_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
 
 def resolve_device(preferred: Optional[str] = None) -> str:
@@ -64,7 +67,12 @@ def validate_coco_dataset(dataset_dir: Path) -> Tuple[Path, Path]:
     return train_ann, val_ann
 
 
-def validate_voc_dataset(dataset_dir: Path) -> Tuple[Path, List[str], List[str], List[str]]:
+def validate_voc_dataset(
+    dataset_dir: Path,
+    *,
+    logger: Optional[Logger] = None,
+    with_metadata: bool = False,
+) -> Tuple[Path, List[str], List[str], List[str]]:
     dataset_dir = dataset_dir.expanduser().resolve()
     candidate_roots = [
         dataset_dir / "VOC2007",
@@ -96,12 +104,26 @@ def validate_voc_dataset(dataset_dir: Path) -> Tuple[Path, List[str], List[str],
             f"Faltando: {', '.join(str(p) for p in missing_splits)}"
         )
 
-    train_ids = _read_split_file(split_files["train"])
-    val_ids = _read_split_file(split_files["val"])
+    train_result = _read_split_file(
+        split_files["train"],
+        images_dir=dataset_root / "JPEGImages",
+        logger=logger,
+        return_metadata=with_metadata,
+    )
+    val_result = _read_split_file(
+        split_files["val"],
+        images_dir=dataset_root / "JPEGImages",
+        logger=logger,
+        return_metadata=with_metadata,
+    )
+    train_ids, train_meta = (train_result if with_metadata else (train_result, []))
+    val_ids, val_meta = (val_result if with_metadata else (val_result, []))
     if not train_ids or not val_ids:
         raise ValueError("Arquivos de split do Pascal VOC estão vazios ou inválidos (train.txt / val.txt).")
 
     class_names = _load_voc_classes(dataset_root)
+    if with_metadata:
+        return dataset_root, class_names, (train_ids, train_meta), (val_ids, val_meta)
     return dataset_root, class_names, train_ids, val_ids
 
 
@@ -187,6 +209,34 @@ def coco_collate(batch: Iterable) -> Tuple[List, List]:
     return tuple(zip(*batch))
 
 
+def ssd_collate_with_diagnostics(batch: Iterable, logger: Optional[Logger] = None) -> Tuple[List, List]:
+    batch_list = list(batch)
+    diag_logger = logger or logging.getLogger("train.ssd")
+    try:
+        images, targets = tuple(zip(*batch_list))
+    except Exception as exc:  # pragma: no cover - proteção extra
+        raise RuntimeError(f"[STAGE=collate] falha ao desempacotar batch: {exc}") from exc
+
+    if diag_logger:
+        try:
+            diag_logger.debug(
+                "[STAGE=collate] batch_size=%d itens=%s",
+                len(batch_list),
+                [
+                    {
+                        "shape": getattr(img, "shape", None),
+                        "boxes": int(t.get("boxes").shape[0]) if isinstance(t, dict) and "boxes" in t else None,
+                        "img_path": t.get("img_path") if isinstance(t, dict) else None,
+                    }
+                    for img, t in batch_list
+                ],
+            )
+        except Exception:
+            diag_logger.debug("[STAGE=collate] falha ao logar shapes")
+
+    return list(images), list(targets)
+
+
 def log_config(logger: Optional[Logger], message: str) -> None:
     if logger:
         logger(message)
@@ -201,9 +251,70 @@ def read_json(path: Path) -> Dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _read_split_file(split_file: Path) -> List[str]:
-    lines = [line.strip() for line in split_file.read_text(encoding="utf-8").splitlines()]
-    return [line for line in lines if line]
+def _read_split_file(
+    split_file: Path,
+    *,
+    images_dir: Optional[Path] = None,
+    logger: Optional[Logger] = None,
+    sample_preview: int = 5,
+    return_metadata: bool = False,
+) -> List[str]:
+    """Lê arquivos de split (train.txt/val.txt) com validação extra.
+
+    Esta função mantém o comportamento padrão quando ``logger`` é ``None`` e
+    ``return_metadata`` é ``False`` para não interferir em pipelines que não
+    precisam de diagnósticos adicionais (ex.: validação/inferência).
+    """
+
+    raw_text = split_file.read_text(encoding="utf-8")
+    raw_lines = raw_text.splitlines()
+    cleaned: List[str] = []
+    metadata: List[dict] = []
+
+    if logger:
+        logger(
+            f"[STAGE=split_load] arquivo={split_file} encoding=utf-8 linhas_total={len(raw_lines)}"
+        )
+
+    for line_no, raw_line in enumerate(raw_lines, start=1):
+        normalized = raw_line.replace("\ufeff", "").strip()
+        if not normalized:
+            if logger and line_no <= sample_preview:
+                logger(
+                    f"[STAGE=split_load][SKIP] linha_vazia idx={line_no} raw={raw_line!r}"
+                )
+            continue
+        if "," in normalized:
+            raise ValueError(
+                f"[STAGE=split_load] Linha inesperada com vírgula em {split_file} linha={line_no}: {raw_line!r}"
+            )
+        resolved_path = None
+        if images_dir is not None:
+            candidates = [images_dir / f"{normalized}{ext}" for ext in _VALID_IMAGE_EXTENSIONS]
+            resolved_path = next((c for c in candidates if c.exists()), candidates[0]) if candidates else None
+
+        entry = {
+            "line_no": line_no,
+            "raw": raw_line,
+            "cleaned": normalized,
+            "resolved": str(resolved_path) if resolved_path else None,
+        }
+        if logger and line_no <= sample_preview:
+            logger(
+                f"[STAGE=split_load][EX] idx={line_no} raw={raw_line!r} cleaned={normalized!r} resolved={entry['resolved']}"
+            )
+        cleaned.append(normalized)
+        metadata.append(entry)
+
+    if logger:
+        logger(
+            f"[STAGE=split_load] arquivo={split_file} linhas_validas={len(cleaned)}"
+        )
+
+    if return_metadata:
+        return cleaned, metadata
+
+    return cleaned
 
 
 def _load_voc_classes(dataset_root: Path) -> List[str]:

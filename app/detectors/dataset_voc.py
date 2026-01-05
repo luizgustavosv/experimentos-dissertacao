@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
+import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 from PIL import Image
@@ -15,27 +16,72 @@ _VALID_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 class PascalVOCDataset(Dataset):
     """Dataset mínimo para treino de detecção usando anotações Pascal VOC."""
 
-    def __init__(self, dataset_root: Path, image_ids: Sequence[str], class_to_idx: Mapping[str, int], transforms=None) -> None:
+    def __init__(
+        self,
+        dataset_root: Path,
+        image_ids: Sequence[str],
+        class_to_idx: Mapping[str, int],
+        transforms=None,
+        *,
+        logger: Optional[logging.Logger] = None,
+        debug: bool = False,
+        split_metadata: Optional[Sequence[Mapping[str, Any]]] = None,
+        num_classes: Optional[int] = None,
+    ) -> None:
         self.dataset_root = dataset_root.expanduser().resolve()
         self.images_dir = self.dataset_root / "JPEGImages"
         self.annotations_dir = self.dataset_root / "Annotations"
         self.image_ids = [img_id.strip() for img_id in image_ids if img_id.strip()]
         self.class_to_idx = {name: int(idx) for name, idx in dict(class_to_idx).items()}
         self.transforms = transforms
+        self.logger = logger
+        self.debug = debug
+        self.num_classes = num_classes or (max(self.class_to_idx.values()) + 1 if self.class_to_idx else None)
+        self.split_metadata = list(split_metadata) if split_metadata else []
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return len(self.image_ids)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        stage_base = f"[STAGE=dataset][idx={idx}]"
+        meta = self.split_metadata[idx] if idx < len(self.split_metadata) else {}
+        line_no = meta.get("line_no") if isinstance(meta, dict) else None
+        meta_hint = f" line_no={line_no}" if line_no is not None else ""
         image_id = self.image_ids[idx]
-        image_path = self._resolve_image_path(image_id)
+        try:
+            image_path = self._resolve_image_path(image_id)
+        except Exception as exc:  # pragma: no cover - proteção extra
+            raise FileNotFoundError(
+                f"{stage_base}{meta_hint} Falha ao resolver imagem id={image_id}: {exc}"
+            ) from exc
+
         annotation_path = self.annotations_dir / f"{image_id}.xml"
         if not annotation_path.exists():
-            raise FileNotFoundError(f"Anotação VOC não encontrada: {annotation_path}")
+            raise FileNotFoundError(
+                f"{stage_base}{meta_hint} Anotação VOC não encontrada: {annotation_path}"
+            )
 
-        image = Image.open(image_path).convert("RGB")
+        if self.debug and self.logger:
+            self.logger.debug(
+                "%s raw_id=%s img_resolved=%s ann_resolved=%s", stage_base, image_id, image_path, annotation_path
+            )
+
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except Exception as exc:  # pragma: no cover - robustez de IO
+            raise RuntimeError(
+                f"{stage_base}{meta_hint} erro ao ler imagem {image_path}: {exc}"
+            ) from exc
+
         width, height = image.size
-        boxes_list, labels_list, _ = self._parse_annotation(annotation_path)
+        if width <= 0 or height <= 0:
+            raise ValueError(f"{stage_base}{meta_hint} imagem com dimensões inválidas: {width}x{height} em {image_path}")
+        if self.debug and self.logger:
+            self.logger.debug(
+                "%s imagem lida shape=%sx%s dtype=%s", stage_base, height, width, getattr(image, "dtype", "PIL")
+            )
+
+        boxes_list, labels_list, clamp_count = self._parse_annotation(annotation_path, width, height, meta_hint)
 
         if len(boxes_list) == 0:
             boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
@@ -87,7 +133,25 @@ class PascalVOCDataset(Dataset):
         }
 
         if self.transforms:
+            if self.debug and self.logger:
+                self.logger.debug(
+                    "%s antes_transform shape=%s boxes=%d", stage_base, tuple(image.size)[::-1], boxes_tensor.shape[0]
+                )
             image = self.transforms(image)
+            if self.debug and self.logger:
+                self.logger.debug(
+                    "%s depois_transform shape=%s boxes=%d", stage_base, tuple(image.shape), target["boxes"].shape[0]
+                )
+
+        if self.num_classes and (target["labels"] >= self.num_classes).any():
+            raise ValueError(
+                f"{stage_base}{meta_hint} classe fora do intervalo (num_classes={self.num_classes}) em {annotation_path}"
+            )
+
+        if clamp_count > 0 and self.logger:
+            self.logger.warning(
+                "%s boxes foram clampadas %d vez(es) para ficar dentro da imagem %s", stage_base, clamp_count, image_path
+            )
 
         return image, target
 
@@ -102,12 +166,18 @@ class PascalVOCDataset(Dataset):
             candidates = matches
         return candidates[0]
 
-    def _parse_annotation(self, annotation_path: Path):
+    def _parse_annotation(self, annotation_path: Path, width: int, height: int, meta_hint: str = ""):
         tree = ET.parse(annotation_path)
         root = tree.getroot()
         boxes = []
         labels = []
         areas = []
+        clamp_count = 0
+
+        if self.debug and self.logger:
+            self.logger.debug(
+                "[STAGE=annotation%s] parsing=%s format=VOC", meta_hint, annotation_path
+            )
 
         for obj in root.findall("object"):
             name = obj.findtext("name")
@@ -129,11 +199,31 @@ class PascalVOCDataset(Dataset):
             except (TypeError, ValueError):
                 continue
 
-            if xmax <= xmin or ymax <= ymin:
-                continue
+            if not all(math.isfinite(v) for v in (xmin, ymin, xmax, ymax)):
+                raise ValueError(
+                    f"[STAGE=annotation{meta_hint}] coordenadas não finitas em {annotation_path}: {(xmin, ymin, xmax, ymax)}"
+                )
 
+            if xmax <= xmin or ymax <= ymin:
+                raise ValueError(
+                    f"[STAGE=annotation{meta_hint}] box inválida (ordem) em {annotation_path}: {(xmin, ymin, xmax, ymax)}"
+                )
+
+            if xmax > width or ymax > height or xmin < 0 or ymin < 0:
+                clamp_count += 1
             boxes.append([xmin, ymin, xmax, ymax])
             labels.append(1)  # background=0, person=1
             areas.append(max(0.0, (xmax - xmin) * (ymax - ymin)))
 
-        return boxes, labels, areas
+        if self.debug and self.logger:
+            self.logger.debug(
+                "[STAGE=annotation%s] num_boxes=%d classes=%s minmax=%s", meta_hint, len(boxes),
+                sorted(set(labels)) if labels else [],
+                (
+                    (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+                    if boxes
+                    else "<empty>"
+                ),
+            )
+
+        return boxes, labels, areas, clamp_count

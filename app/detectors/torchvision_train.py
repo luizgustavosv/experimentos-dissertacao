@@ -5,6 +5,7 @@ import importlib.util
 import json
 import logging
 import math
+import os
 from collections import Counter
 import signal
 import sys
@@ -36,6 +37,7 @@ from app.detectors.utils import (
     describe_dataloader,
     ensure_weights_size,
     resolve_device,
+    ssd_collate_with_diagnostics,
     seed_everything,
 )
 from app.metrics import Metrics
@@ -283,6 +285,29 @@ def _normalize_dataset_class_count(raw_num_classes: Optional[int]) -> Optional[i
     if isinstance(raw_num_classes, int) and raw_num_classes > 0:
         return raw_num_classes - 1 if raw_num_classes > 1 else raw_num_classes
     return None
+
+
+def _run_ssd_probe(dataloader: DataLoader, logger: logging.Logger, limit: int = 50) -> None:
+    logger.info("[STAGE=probe] Iniciando verificação de %d amostras antes do treino.", limit)
+    processed = 0
+    for batch_idx, (images, targets) in enumerate(dataloader, start=1):
+        processed += len(images)
+        logger.debug(
+            "[STAGE=probe] batch=%d tamanho=%d primeiro_img_shape=%s",
+            batch_idx,
+            len(images),
+            getattr(images[0], "shape", None) if images else None,
+        )
+        if processed >= limit:
+            break
+    logger.info("[STAGE=probe] Finalizado. Amostras processadas=%d", processed)
+
+
+def _dump_ssd_debug_snapshot(out_dir: Path, payload: dict, logger: logging.Logger) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = out_dir / f"failure_{int(time.time())}.json"
+    snapshot_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.error("[STAGE=debug] Snapshot salvo em %s", snapshot_path)
 
 
 def _infer_dataset_classes_from_annotations(
@@ -1736,7 +1761,22 @@ def train_torchvision_detector(
     log_dir = Path(config.log_dir).expanduser().resolve()
     safe_stdout = _safe_stream("stdout", log_dir)
     safe_stderr = _safe_stream("stderr", log_dir)
-    logging_logger, log_path = _configure_logging(config.verbose, log_dir, logger, stream_override=safe_stdout)
+    algorithm_name = None
+    model_label = getattr(model, "__class__", type("Obj", (), {})).__name__
+    if isinstance(model, FasterRCNN):
+        algorithm_name = "Faster R-CNN"
+    elif isinstance(model, RetinaNet):
+        algorithm_name = "RetinaNet"
+    else:
+        algorithm_name = "SSD"
+
+    ssd_debug = bool(int(os.getenv("SSD_DEBUG", "0"))) if algorithm_name == "SSD" else False
+    logger_name = "train.ssd" if algorithm_name == "SSD" else "ssd_train"
+    log_prefix = "train_ssd" if algorithm_name == "SSD" else "ssd_train"
+
+    logging_logger, log_path = _configure_logging(
+        config.verbose or ssd_debug, log_dir, logger, stream_override=safe_stdout, logger_name=logger_name, log_prefix=log_prefix
+    )
     try:
         faulthandler.enable(file=safe_stderr)
     except Exception as exc:  # pragma: no cover - compatibilidade com ambientes sem fileno
@@ -1745,13 +1785,6 @@ def train_torchvision_detector(
         signal.signal(signal.SIGTERM, lambda _sig, _frame: sys.exit(1))
     except Exception:  # pragma: no cover - compatibilidade com ambientes sem suporte
         logging_logger.warning("Não foi possível registrar handler de SIGTERM neste ambiente.")
-
-    if isinstance(model, FasterRCNN):
-        algorithm_name = "Faster R-CNN"
-    elif isinstance(model, RetinaNet):
-        algorithm_name = "RetinaNet"
-    else:
-        algorithm_name = "SSD"
 
     logging_logger.info("Iniciando setup de treinamento do %s...", algorithm_name)
     device_str = resolve_device(config.device)
@@ -1882,9 +1915,10 @@ def train_torchvision_detector(
             _audit_dataset(train_ds_full, "train", num_classes=model_num_classes, logger=logging_logger)
             _audit_dataset(val_ds_full, "val", num_classes=model_num_classes, logger=logging_logger)
 
+        collate_fn = ssd_collate_with_diagnostics if algorithm_name == "SSD" else coco_collate
         dataloader_kwargs = dict(
             batch_size=config.batch_size,
-            collate_fn=coco_collate,
+            collate_fn=collate_fn,
             drop_last=config.drop_last,
         )
         train_workers = config.num_workers
@@ -1922,6 +1956,9 @@ def train_torchvision_detector(
         train_loader = DataLoader(train_ds_full, shuffle=True, **dataloader_kwargs)
         val_loader = DataLoader(val_ds_full, shuffle=False, **dataloader_kwargs)
         logging_logger.info("DataLoader construído. num_batches=%d", len(train_loader))
+
+        if algorithm_name == "SSD" and ssd_debug:
+            _run_ssd_probe(train_loader, logging_logger, limit=50)
 
         stopper: Optional[TrainLossEMAStopper] = None
         best_by_trainloss_path = ckpt_dir / "best_by_trainloss.pth"
@@ -1980,6 +2017,7 @@ def train_torchvision_detector(
         heartbeat_seconds = 10
         log_every_batches = max(1, config.log_every)
         stop_training_flag = False
+        last_ok_sample: list[str] = []
 
         epochs_completed = 0
         for epoch in range(1, epochs_to_run + 1):
@@ -2009,8 +2047,32 @@ def train_torchvision_detector(
                     for t in targets
                 ]
 
+                if algorithm_name == "SSD":
+                    logging_logger.debug(
+                        "[STAGE=forward_prep] epoch=%d step=%d batch_size=%d", epoch, step, len(images)
+                    )
+                    for img_idx, img in enumerate(images):
+                        if img.device.type != torch.device(device_str).type:
+                            raise RuntimeError(
+                                f"[STAGE=forward_prep] imagem no device incorreto (esperado {device_str}) no batch {step}"
+                            )
+                        if not torch.is_floating_point(img):
+                            raise TypeError(
+                                f"[STAGE=forward_prep] dtype inesperado para imagem {img_idx} no batch {step}: {img.dtype}"
+                            )
+                        if not torch.isfinite(img).all():
+                            raise ValueError(
+                                f"[STAGE=forward_prep] valores não finitos detectados na imagem {img_idx} batch {step}"
+                            )
+
                 image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
                 _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
+
+                if algorithm_name == "SSD":
+                    last_ok_sample = [t.get("img_path", "<desconhecido>") for t in targets]
+                    logging_logger.debug(
+                        "[LAST_OK_SAMPLE] epoch=%d step=%d paths=%s", epoch, step, last_ok_sample
+                    )
 
                 _maybe_remap_retinanet_targets(model, targets, num_classes=num_classes, logger=logging_logger)
                 loss_out = model(images, targets)
@@ -2045,7 +2107,11 @@ def train_torchvision_detector(
                         "image_ids": image_ids,
                         "paths": file_paths,
                         "targets": target_dump,
+                        "loss_items": loss_items,
                     }
+                    if algorithm_name == "SSD":
+                        bad_batch["last_ok_sample"] = last_ok_sample
+                        _dump_ssd_debug_snapshot(ckpt_dir / "ssd_debug", bad_batch, logging_logger)
                     try:
                         bad_path_json = ckpt_dir / "bad_batch.json"
                         bad_path_txt = ckpt_dir / "bad_batch.txt"
