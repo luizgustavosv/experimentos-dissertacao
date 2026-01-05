@@ -245,6 +245,40 @@ class ExperimentController:
         message = f"Validação concluída. Resultados salvos em {output_dir}"
         return OperationResult(metrics=None, message=message)
 
+    def execute_validate_retinanet(
+        self,
+        algorithm_key: str,
+        train_annotations: Path,
+        images_dir: Path,
+        weights_path: Path,
+        val_annotations: Optional[Path] = None,
+        logger: Optional[Logger] = None,
+        log_cb: Optional[Callable[[str], None]] = None,
+    ) -> OperationResult:
+        if algorithm_key != "RetinaNet":
+            raise ValueError("Selecione o algoritmo RetinaNet para executar a validação pós-treinamento.")
+
+        coco_ann = self._validate_coco_annotation_path(train_annotations)
+        images_root = self._validate_coco_images_root(images_dir)
+        val_ann = self._validate_coco_annotation_path(val_annotations) if val_annotations else self._resolve_coco_val_annotation(
+            coco_ann, images_root
+        )
+        dataset_root = images_root.parent if images_root.name.lower() == "images" else images_root
+
+        detector = self._get_detector(algorithm_key)
+        result = detector.validate_trained_weights(
+            dataset_root,
+            weights_path.expanduser().resolve(),
+            train_ann=coco_ann,
+            val_ann=val_ann,
+            logger=logger,
+            log_cb=log_cb,
+        )
+
+        output_dir = result.get("output_dir") or Path(weights_path).expanduser().resolve().parent
+        message = f"Validação concluída. Resultados salvos em {output_dir}"
+        return OperationResult(metrics=None, message=message)
+
     def _get_detector(self, algorithm_key: str) -> DetectionAlgorithm:
         if algorithm_key not in self.detectors:
             raise KeyError(f"Algoritmo desconhecido: {algorithm_key}")

@@ -37,7 +37,7 @@ class DetectorApp(tk.Tk):
             "YOLO": ["Treinar", "Inferir", "Avaliar YOLO", "Normalizar dataset"],
             "SSD": ["Treinar", "Inferir", "Avaliar SSD", "Normalizar dataset"],
             "Faster R-CNN": ["Treinar", "Inferir", "Validar", "Normalizar dataset"],
-            "RetinaNet": ["Treinar", "Inferir", "Normalizar dataset"],
+            "RetinaNet": ["Treinar", "Inferir", "Validar", "Normalizar dataset"],
         }
         self.algorithm_var = tk.StringVar(value="YOLO")
         self.action_var = tk.StringVar(value=self.algorithm_actions["YOLO"][0])
@@ -252,10 +252,10 @@ class DetectorApp(tk.Tk):
                 self._add_device_selector()
                 self._register_yolo_eval_traces()
         elif action == "Validar":
-            if algorithm != "Faster R-CNN":
+            if algorithm not in {"Faster R-CNN", "RetinaNet"}:
                 tk.Label(
                     self.dynamic_frame,
-                    text="A validação pós-treinamento está disponível apenas para o algoritmo Faster R-CNN.",
+                    text="A validação pós-treinamento está disponível apenas para os algoritmos Faster R-CNN e RetinaNet.",
                     bg="#12233d",
                     fg="white",
                     wraplength=760,
@@ -269,11 +269,12 @@ class DetectorApp(tk.Tk):
                 )
                 self._add_path_selector("Pasta de imagens COCO (deve conter train/ e val/)", "images", is_dir=True)
                 self._add_path_selector(
-                    "Pesos do Faster R-CNN",
+                    f"Pesos do {algorithm}",
                     "validation_weights",
                     filetypes=get_weights_filetypes(algorithm),
                 )
-                self._add_val_mode_selector()
+                if algorithm == "Faster R-CNN":
+                    self._add_val_mode_selector()
         elif action == "Normalizar dataset":
             self._add_dataset_type_selector()
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
@@ -756,8 +757,8 @@ class DetectorApp(tk.Tk):
                     )
 
             elif action == "Validar":
-                if algorithm_key != "Faster R-CNN":
-                    raise ValueError("Selecione o algoritmo Faster R-CNN para executar a validação pós-treinamento.")
+                if algorithm_key not in {"Faster R-CNN", "RetinaNet"}:
+                    raise ValueError("Selecione o algoritmo suportado para executar a validação pós-treinamento.")
 
                 train_annotations = Path(self.path_vars["annotations"].get())
                 images_dir = Path(self.path_vars["images"].get())
@@ -779,13 +780,23 @@ class DetectorApp(tk.Tk):
                 )
 
                 def run_action() -> OperationResult:
-                    return self.controller.execute_validate_faster_rcnn(
+                    if algorithm_key == "Faster R-CNN":
+                        return self.controller.execute_validate_faster_rcnn(
+                            algorithm_key,
+                            train_annotations=train_annotations,
+                            images_dir=images_dir,
+                            weights_path=weights,
+                            val_annotations=val_annotations,
+                            val_mode=self.val_mode_var.get(),
+                            logger=prompt_logger,
+                            log_cb=lambda msg: self._emit_gui(msg, stdout=False),
+                        )
+                    return self.controller.execute_validate_retinanet(
                         algorithm_key,
                         train_annotations=train_annotations,
                         images_dir=images_dir,
                         weights_path=weights,
                         val_annotations=val_annotations,
-                        val_mode=self.val_mode_var.get(),
                         logger=prompt_logger,
                         log_cb=lambda msg: self._emit_gui(msg, stdout=False),
                     )
