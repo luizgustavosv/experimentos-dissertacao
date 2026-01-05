@@ -14,7 +14,6 @@ from app.detectors.config import TrainConfig
 from app.detectors.torchvision_train import (
     _build_val_loader_and_classes,
     _configure_logging,
-    _ensure_pycocotools,
     _extract_state_dict,
     _safe_stream,
     ensure_weights_size,
@@ -111,46 +110,115 @@ def _load_retinanet_weights_with_head_guard(
     return missing, unexpected, ckpt_num_classes, head_mismatch, ignored_keys, strict_load
 
 
-def _compute_precision_recall_from_coco(
+def _bbox_xywh_to_xyxy(box: list[float] | tuple[float, ...]) -> torch.Tensor:
+    x, y, w, h = box
+    return torch.tensor([x, y, x + w, y + h], dtype=torch.float32)
+
+
+def _compute_iou_xyxy(box_a: torch.Tensor, box_b: torch.Tensor) -> float:
+    xa1, ya1, xa2, ya2 = box_a
+    xb1, yb1, xb2, yb2 = box_b
+    inter_x1 = max(float(xa1), float(xb1))
+    inter_y1 = max(float(ya1), float(yb1))
+    inter_x2 = min(float(xa2), float(xb2))
+    inter_y2 = min(float(ya2), float(yb2))
+
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = max(0.0, float(xa2 - xa1)) * max(0.0, float(ya2 - ya1))
+    area_b = max(0.0, float(xb2 - xb1)) * max(0.0, float(yb2 - yb1))
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+    return inter_area / union
+
+
+def _compute_classic_pr_metrics(
     predictions_path: Path,
     gt_annotations: Path,
     logging_logger: logging.Logger,
     *,
     iou_threshold: float = 0.5,
+    score_threshold: float | None = None,
 ) -> dict[str, float]:
-    # Reutiliza o COCOeval para derivar precisão/recall globais usando apenas IoU>=iou_threshold.
-    # A matriz de precisão já contém o mapeamento entre predições e GT após o matching greedy do COCOeval.
-    COCO, COCOeval = _ensure_pycocotools()
-    coco_gt = COCO(str(gt_annotations))
-    coco_dt = coco_gt.loadRes(str(predictions_path))
-    coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
-    coco_eval.params.iouThrs = [iou_threshold]
-    coco_eval.evaluate()
-    coco_eval.accumulate()
-    coco_eval.summarize()
+    predictions = json.loads(Path(predictions_path).read_text(encoding="utf-8"))
+    gt_data = json.loads(Path(gt_annotations).read_text(encoding="utf-8"))
 
-    precisions = coco_eval.eval.get("precision")
-    recalls = coco_eval.eval.get("recall")
-    precision_mean = 0.0
-    recall_mean = 0.0
-    if precisions is not None:
-        precision_slice = precisions[0, :, :, 0, -1]
-        precision_slice = precision_slice[precision_slice > -1]
-        precision_mean = float(precision_slice.mean()) if precision_slice.size else 0.0
-    if recalls is not None:
-        recall_slice = recalls[0, :, 0, -1]
-        recall_slice = recall_slice[recall_slice > -1]
-        recall_mean = float(recall_slice.mean()) if recall_slice.size else 0.0
+    preds_by_image: dict[int, dict[int, list[tuple[float, torch.Tensor]]]] = {}
+    for pred in predictions:
+        try:
+            image_id = int(pred["image_id"])
+            category_id = int(pred["category_id"])
+            score = float(pred.get("score", 0.0))
+            if score_threshold is not None and score < score_threshold:
+                continue
+            box_xyxy = _bbox_xywh_to_xyxy(pred["bbox"])
+        except Exception:
+            continue
 
-    f1 = (2 * precision_mean * recall_mean) / (precision_mean + recall_mean) if (precision_mean + recall_mean) > 0 else 0.0
+        preds_by_image.setdefault(image_id, {}).setdefault(category_id, []).append((score, box_xyxy))
+
+    gts_by_image: dict[int, dict[int, list[torch.Tensor]]] = {}
+    for ann in gt_data.get("annotations", []):
+        try:
+            image_id = int(ann["image_id"])
+            category_id = int(ann["category_id"])
+            box_xyxy = _bbox_xywh_to_xyxy(ann["bbox"])
+        except Exception:
+            continue
+
+        gts_by_image.setdefault(image_id, {}).setdefault(category_id, []).append(box_xyxy)
+
+    all_image_ids = set(preds_by_image.keys()) | set(gts_by_image.keys())
+    tp = fp = fn = 0
+
+    for image_id in all_image_ids:
+        preds_per_class = preds_by_image.get(image_id, {})
+        gts_per_class = gts_by_image.get(image_id, {})
+        all_classes = set(preds_per_class.keys()) | set(gts_per_class.keys())
+
+        for cls in all_classes:
+            preds = sorted(preds_per_class.get(cls, []), key=lambda item: item[0], reverse=True)
+            gts = gts_per_class.get(cls, [])
+            matched = [False] * len(gts)
+
+            for _, pred_box in preds:
+                best_iou = 0.0
+                best_gt_idx: int | None = None
+                for gt_idx, gt_box in enumerate(gts):
+                    if matched[gt_idx]:
+                        continue
+                    iou = _compute_iou_xyxy(pred_box, gt_box)
+                    if iou >= iou_threshold and iou > best_iou:
+                        best_iou = iou
+                        best_gt_idx = gt_idx
+
+                if best_gt_idx is not None:
+                    matched[best_gt_idx] = True
+                    tp += 1
+                else:
+                    fp += 1
+
+            fn += matched.count(False)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
     logging_logger.info(
-        "[RETINANET][VAL] IoU@%.2f precision=%.4f recall=%.4f f1=%.4f",
+        "[RETINANET][VAL] IoU@%.2f score_threshold=%s TP=%d FP=%d FN=%d precision=%.4f recall=%.4f f1=%.4f",
         iou_threshold,
-        precision_mean,
-        recall_mean,
+        score_threshold if score_threshold is not None else "none",
+        tp,
+        fp,
+        fn,
+        precision,
+        recall,
         f1,
     )
-    return {"precision": precision_mean, "recall": recall_mean, "f1": f1}
+    return {"precision": precision, "recall": recall, "f1": f1}
 
 
 def validate_retinanet_post_train(
@@ -249,7 +317,7 @@ def validate_retinanet_post_train(
         output_dir=out_dir,
     )
 
-    pr_metrics = _compute_precision_recall_from_coco(
+    pr_metrics = _compute_classic_pr_metrics(
         Path(results["predictions_coco_json"]),
         Path(results["gt_annotations"]),
         logging_logger,
