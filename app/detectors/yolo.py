@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import yaml
 from ultralytics import YOLO
@@ -120,16 +121,36 @@ def train_yolo(
                 logger("[YOLO][EARLY] Erro ao atualizar early stopping; desativando recurso.")
             stopper = None
 
-    callbacks = {"on_train_epoch_end": _on_train_epoch_end} if stopper else None
+    ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
 
-    model.train(
-        data=str(dataset_yaml),
-        epochs=epochs_to_run,
-        project=str(output_dir),
-        name="yolo_visdrone",
-        verbose=True,
-        callbacks=callbacks,
-    )
+    def _strip_ansi(value: str) -> str:
+        """Remove códigos ANSI de uma string para evitar poluir o CLI."""
+
+        return ansi_escape.sub("", value)
+
+    train_kwargs: Dict[str, object] = {
+        "data": str(dataset_yaml),
+        "epochs": epochs_to_run,
+        "project": str(output_dir),
+        "name": "yolo_visdrone",
+        "verbose": True,
+    }
+
+    if stopper:
+        model.add_callback("on_train_epoch_end", _on_train_epoch_end)
+
+    train_kwargs = {
+        key: _strip_ansi(str(value)) if isinstance(value, str) else value
+        for key, value in train_kwargs.items()
+    }
+
+    cli_cmd = ["yolo", "train"] + [f"{key}={value}" for key, value in train_kwargs.items()]
+    cli_cmd = [_strip_ansi(str(part)) for part in cli_cmd]
+
+    if logger:
+        logger(f"[YOLO][CLI] Comando final: {cli_cmd}")
+
+    model.train(**train_kwargs)
 
 
 class YoloDetector(DetectionAlgorithm):
