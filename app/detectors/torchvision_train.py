@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import subprocess
 from collections import Counter
 import signal
 import sys
@@ -23,6 +24,7 @@ from torch.utils.data import DataLoader, Subset, random_split
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRCNN
 from torchvision.models.detection.retinanet import RetinaNet
 
+from app.datasets.class_mapping import summarize_class_mapping
 from app.detectors.base import Logger
 from app.detectors.config import TrainConfig
 from app.detectors.dataset_coco import (
@@ -250,6 +252,19 @@ def _configure_logging(
     return logger, log_path
 
 
+def _current_git_commit() -> str | None:
+    try:
+        root = Path(__file__).resolve().parent.parent
+        commit = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, stderr=subprocess.DEVNULL)
+            .decode()
+            .strip()
+        )
+        return commit or None
+    except Exception:
+        return None
+
+
 def _infer_num_classes_from_model(model: torch.nn.Module) -> Optional[int]:
     candidates = [
         getattr(model, "num_classes", None),
@@ -269,10 +284,6 @@ def _infer_num_classes_from_model(model: torch.nn.Module) -> Optional[int]:
 
 def _infer_num_classes_from_dataset(dataset: Any) -> Optional[int]:
     candidates = [getattr(dataset, "num_classes", None)]
-    if hasattr(dataset, "annotations") and isinstance(getattr(dataset, "annotations"), dict):
-        categories = dataset.annotations.get("categories", [])
-        if isinstance(categories, list):
-            candidates.append(len(categories) + 1)
     for cand in candidates:
         if isinstance(cand, int) and cand > 0:
             return cand
@@ -283,7 +294,7 @@ def _normalize_dataset_class_count(raw_num_classes: Optional[int]) -> Optional[i
     if raw_num_classes is None:
         return None
     if isinstance(raw_num_classes, int) and raw_num_classes > 0:
-        return raw_num_classes - 1 if raw_num_classes > 1 else raw_num_classes
+        return raw_num_classes
     return None
 
 
@@ -421,14 +432,7 @@ def _remap_retinanet_labels(
     for target in targets:
         labels = target.get("labels") if isinstance(target, dict) else None
         if torch.is_tensor(labels):
-            if expects_background:
-                offset = label_offset
-                if offset == 0 and labels.numel() > 0 and int(labels.min()) == 0:
-                    offset = 1
-                    logger.info("[RETINANET][CLASSES] Aplicando offset +1 para alinhar labels com background explícito.")
-                target["labels"] = labels + offset
-            else:
-                target["labels"] = labels - 1
+            target["labels"] = labels.to(torch.int64)
 
     labels_after: list[torch.Tensor] = []
     for target in targets:
@@ -438,12 +442,8 @@ def _remap_retinanet_labels(
 
     if labels_after:
         merged = torch.cat(labels_after)
-        if expects_background:
-            lower_bound = 1
-            upper_bound = num_classes - 1
-        else:
-            lower_bound = 0
-            upper_bound = num_classes - 1
+        lower_bound = 0
+        upper_bound = num_classes - 1
         if (merged < lower_bound).any() or (merged > upper_bound).any():
             raise ValueError(
                 (
@@ -552,13 +552,14 @@ def _validate_targets_batch(
 
         lower_bound = 0 if allow_zero_label else 1
         if num_classes is not None and num_classes > 0:
+            upper_bound = num_classes - 1 if allow_zero_label else num_classes
             if (labels < lower_bound).any():
                 raise ValueError(
                     f"Labels fora do intervalo no índice {idx}{path_label}: mínimo {int(labels.min())} (esperado >={lower_bound})"
                 )
-            if (labels > num_classes).any():
+            if (labels > upper_bound).any():
                 raise ValueError(
-                    f"Labels fora do intervalo no índice {idx}{path_label}: máximo {int(labels.max())} > num_classes ({num_classes})"
+                    f"Labels fora do intervalo no índice {idx}{path_label}: máximo {int(labels.max())} > limite ({upper_bound})"
                 )
         else:
             if (labels < lower_bound).any():
@@ -768,7 +769,8 @@ def _run_smoke_test_val_loss(
     component_sum: dict[str, float] = {}
     batches = 0
     model.eval()
-    expects_background = isinstance(model, RetinaNet)
+    expects_background = isinstance(model, FasterRCNN)
+    allow_zero_label = isinstance(model, RetinaNet)
     label_offset = 0
     with torch.no_grad():
         for images, targets in val_loader:
@@ -782,14 +784,14 @@ def _run_smoke_test_val_loss(
                 targets,
                 num_classes=num_classes,
                 image_sizes=image_sizes,
-                allow_zero_label=expects_background,
+                allow_zero_label=allow_zero_label,
                 logger=logger,
             )
             _maybe_remap_retinanet_targets(
                 model,
                 targets,
                 num_classes=num_classes or 0,
-                expects_background=expects_background,
+                expects_background=False,
                 label_offset=label_offset,
                 logger=logger,
             )
@@ -817,6 +819,44 @@ def _run_smoke_test_val_loss(
     avg_loss = total_loss / batches
     comp_mean = {k: v / batches for k, v in component_sum.items()}
     logger.info("[SMOKE] loss médio/batch=%.4f componentes=%s", avg_loss, comp_mean)
+
+
+def run_detection_sanity_check(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    logger: logging.Logger,
+    *,
+    num_classes: int,
+    threshold: float = 0.25,
+    max_images: int = 5,
+) -> None:
+    model.eval()
+    checked = 0
+    detections = 0
+    with torch.no_grad():
+        for images, targets in loader:
+            images = [img.to(device) for img in images]
+            outputs = model(images)
+            for output in outputs:
+                if not all(key in output for key in ("boxes", "scores", "labels")):
+                    raise RuntimeError("[SANITY] Saída do modelo não contém boxes/scores/labels.")
+                labels = output.get("labels")
+                if torch.is_tensor(labels) and labels.numel() > 0:
+                    if labels.min() < 0 or labels.max() > num_classes - 1:
+                        raise RuntimeError(
+                            f"[SANITY] Labels fora do intervalo [0,{num_classes-1}]: min={int(labels.min())} max={int(labels.max())}"
+                        )
+                    detections += int((output.get("scores") > threshold).sum().item())
+            checked += len(images)
+            if checked >= max_images:
+                break
+    logger.info(
+        "[SANITY] Verificação rápida: imagens=%d detecções_acima_threshold=%d threshold=%.2f",
+        checked,
+        detections,
+        threshold,
+    )
 
 
 @contextmanager
@@ -876,6 +916,14 @@ def _extract_state_dict(loaded: Any) -> tuple[Dict[str, torch.Tensor], str]:
         if loaded and all(torch.is_tensor(v) for v in loaded.values()):
             return loaded, "state_dict"
     raise ValueError("Formato de checkpoint não suportado para carregamento de pesos.")
+
+
+def _extract_checkpoint_meta(loaded: Any) -> dict:
+    if isinstance(loaded, dict):
+        meta = loaded.get("meta")
+        if isinstance(meta, dict):
+            return meta
+    return {}
 
 
 def _detect_checkpoint_num_classes(state_dict: Dict[str, torch.Tensor]) -> Optional[int]:
@@ -1080,6 +1128,31 @@ def _build_val_loader_and_classes(
     logging_logger.info("[SETUP] Construindo datasets COCO para validação pós-treinamento")
     train_ds_full = CocoDetectionDataset(dataset_dir / "images" / "train", train_ann, transforms=transform)
     val_ds_full = CocoDetectionDataset(dataset_dir / "images" / "val", val_ann, transforms=transform)
+
+    def _sample_labels(ds: Any, limit: int = 32) -> list[int]:
+        labels: list[int] = []
+        for idx in range(min(len(ds), limit)):
+            try:
+                _, tgt = ds[idx]
+            except Exception:
+                continue
+            tensor_labels = tgt.get("labels") if isinstance(tgt, dict) else None
+            if torch.is_tensor(tensor_labels):
+                labels.extend(int(x) for x in tensor_labels.detach().cpu().tolist())
+        return labels
+
+    if hasattr(train_ds_full, "cat_id_to_label"):
+        logging_logger.info(
+            summarize_class_mapping(
+                dataset_name=getattr(train_ds_full, "dataset_name", None),
+                k=getattr(train_ds_full, "num_classes", 0),
+                class_names=getattr(train_ds_full, "class_names", []),
+                categories=getattr(train_ds_full, "annotations", {}).get("categories", []),
+                cat_id_to_label=getattr(train_ds_full, "cat_id_to_label", {}),
+                label_to_cat_id=getattr(train_ds_full, "label_to_cat_id", {}),
+                observed_labels=_sample_labels(train_ds_full),
+            )
+        )
 
     _log_label_range_from_annotations(getattr(val_ds_full, "annotations", {}), "val", logging_logger)
 
@@ -1300,6 +1373,8 @@ def run_val_coco_metrics(
     *,
     tag: str = "[VAL-METRICS]",
     output_dir: Path,
+    label_to_cat_id: dict[int, int] | None = None,
+    legacy_drop_label: int | None = None,
 ) -> dict:
     COCO, COCOeval = _ensure_pycocotools()
     val_image_ids_set: set[int] = set()
@@ -1370,7 +1445,7 @@ def run_val_coco_metrics(
         val_image_ids_set = gt_img_ids
 
     is_retinanet = isinstance(model, RetinaNet)
-    retinanet_uses_background = is_retinanet
+    retinanet_uses_background = False
 
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1385,7 +1460,12 @@ def run_val_coco_metrics(
     class_to_cat_id = [int(cat["id"]) for cat in categories if "id" in cat]
     if not class_to_cat_id:
         class_to_cat_id = sorted(gt_cat_ids)
-    logging_logger.info("%s [AUDIT] class_to_cat_id mapping=%s", tag, class_to_cat_id)
+    mapping_override = label_to_cat_id if label_to_cat_id else None
+    if legacy_drop_label is not None and mapping_override and len(mapping_override) == 1:
+        only_cat = next(iter(mapping_override.values()))
+        mapping_override = dict(mapping_override)
+        mapping_override[legacy_drop_label + 1] = only_cat
+    logging_logger.info("%s [AUDIT] class_to_cat_id mapping=%s override=%s", tag, class_to_cat_id, mapping_override)
 
     predictions: list[dict[str, float | int | list[float]]] = []
     model.eval()
@@ -1404,16 +1484,21 @@ def run_val_coco_metrics(
     def _map_label_to_category(raw_label: int) -> int | None:
         nonlocal invalid_label_count
         nonlocal invalid_label_examples
-        if is_retinanet:
-            idx = raw_label - 1 if retinanet_uses_background else raw_label
+        if legacy_drop_label is not None and raw_label == legacy_drop_label:
+            return None
+        if mapping_override is not None:
+            category_id = mapping_override.get(int(raw_label))
+            idx = None
         else:
-            idx = raw_label - 1
-        if idx < 0 or idx >= len(class_to_cat_id):
+            idx = raw_label - 1 if not is_retinanet else raw_label
+            category_id = None
+        if idx is not None and (idx < 0 or idx >= len(class_to_cat_id)):
             invalid_label_count += 1
             if len(invalid_label_examples) < 5:
                 invalid_label_examples.append({"label": raw_label})
             return None
-        category_id = class_to_cat_id[idx]
+        if category_id is None:
+            category_id = class_to_cat_id[idx] if idx is not None else None
         if category_id not in gt_cat_ids:
             invalid_label_count += 1
             if len(invalid_label_examples) < 5:
@@ -1978,6 +2063,7 @@ def train_torchvision_detector(
     epoch = 0
     epochs_completed = 0
     optimizer: Optional[torch.optim.Optimizer] = None
+    meta: dict[str, Any] = {}
     try:
         val_ratio_to_use = config.val_ratio if val_ratio is None else val_ratio
 
@@ -1999,15 +2085,41 @@ def train_torchvision_detector(
             train_ds_full = train_dataset
             val_ds_full = val_dataset
 
+        def _sample_labels(ds: Any, limit: int = 32) -> list[int]:
+            labels: list[int] = []
+            for idx in range(min(len(ds), limit)):
+                try:
+                    _, tgt = ds[idx]
+                except Exception:
+                    continue
+                tensor_labels = tgt.get("labels") if isinstance(tgt, dict) else None
+                if torch.is_tensor(tensor_labels):
+                    labels.extend(int(x) for x in tensor_labels.detach().cpu().tolist())
+            return labels
+
+        if hasattr(train_ds_full, "cat_id_to_label"):
+            logging_logger.info(
+                summarize_class_mapping(
+                    dataset_name=getattr(train_ds_full, "dataset_name", None),
+                    k=getattr(train_ds_full, "num_classes", 0),
+                    class_names=getattr(train_ds_full, "class_names", []),
+                    categories=getattr(train_ds_full, "annotations", {}).get("categories", []),
+                    cat_id_to_label=getattr(train_ds_full, "cat_id_to_label", {}),
+                    label_to_cat_id=getattr(train_ds_full, "label_to_cat_id", {}),
+                    observed_labels=_sample_labels(train_ds_full),
+                )
+            )
+
         describe_dataloader(train_ds_full, logging_logger.info)
         logging_logger.info("[SETUP] Tamanho train=%d | val=%d", len(train_ds_full), len(val_ds_full))
 
         configured_dataset_classes = getattr(config, "dataset_num_classes", None)
         configured_model_num_classes = getattr(config, "num_classes", None)
         use_background = not is_retinanet
-        retinanet_expects_background = is_retinanet
-        retinanet_label_offset = 0
+        retinanet_expects_background = False
         retinanet_label_stats: dict[str, Any] = {}
+        allow_zero_label = is_retinanet
+        retinanet_label_offset = 0
 
         train_ann_classes, train_cat_ids = _infer_dataset_classes_from_annotations(train_ann, "train", logging_logger)
         val_ann_classes, val_cat_ids = _infer_dataset_classes_from_annotations(val_ann, "val", logging_logger)
@@ -2052,6 +2164,18 @@ def train_torchvision_detector(
                 dataset_num_classes,
             )
 
+        class_names = getattr(train_ds_full, "class_names", [])
+        cat_id_to_label = getattr(train_ds_full, "cat_id_to_label", {})
+        label_to_cat_id = getattr(train_ds_full, "label_to_cat_id", {})
+        meta = {
+            "num_classes": dataset_num_classes,
+            "class_names": class_names,
+            "cat_id_to_label": cat_id_to_label,
+            "label_to_cat_id": label_to_cat_id,
+            "dataset_name": getattr(train_ds_full, "dataset_name", None),
+            "git_commit": _current_git_commit(),
+        }
+
         if is_retinanet:
             retinanet_label_stats = _audit_retinanet_label_distribution(train_ds_full, "train", logging_logger)
             val_label_stats = _audit_retinanet_label_distribution(val_ds_full, "val", logging_logger)
@@ -2065,11 +2189,8 @@ def train_torchvision_detector(
                 for x in (retinanet_label_stats.get("max"), val_label_stats.get("max"))
                 if x is not None
             ) if any(x is not None for x in (retinanet_label_stats.get("max"), val_label_stats.get("max"))) else None
-            retinanet_label_offset = 0
-            if combined_min == 0:
-                retinanet_label_offset = 1
-                logging_logger.info(
-                    "[RETINANET][CLASSES] Detectado label mínimo 0; aplicando offset +1 somente para RetinaNet.")
+            if combined_min is not None and combined_min < 0:
+                raise ValueError("[RETINANET][CLASSES] Labels negativos detectados; esperados labels 0-based sem background.")
             retinanet_inferred_from_labels = (combined_max + 1) if combined_max is not None else None
             logging_logger.info(
                 "[RETINANET][CLASSES] dataset_num_classes=%s inferred_from_labels=%s",
@@ -2078,8 +2199,8 @@ def train_torchvision_detector(
             )
 
         if is_retinanet:
-            use_background = True
-            retinanet_expects_background = True
+            use_background = False
+            retinanet_expects_background = False
         expected_model_classes = dataset_num_classes + 1 if use_background and dataset_num_classes > 0 else dataset_num_classes
         model_num_classes = expected_model_classes
         if configured_model_num_classes is not None and configured_model_num_classes > 0:
@@ -2092,23 +2213,19 @@ def train_torchvision_detector(
                 )
 
         logging_logger.info(
-            "[MODEL] dataset_num_classes=%d model_num_classes=%d (incluindo background)",
+            "[MODEL] dataset_num_classes=%d model_num_classes=%d (%s)",
             dataset_num_classes,
             model_num_classes,
+            "incluindo background" if use_background else "foreground only",
         )
 
         if is_retinanet:
             cls_head = getattr(getattr(getattr(model, "head", None), "classification_head", None), "cls_logits", None)
             head_shape = tuple(cls_head.weight.shape) if getattr(cls_head, "weight", None) is not None else None
             logging_logger.info(
-                "[RETINANET][CLASSES] model_num_classes=%d (inclui background) head_cls_shape=%s",
+                "[RETINANET][CLASSES] model_num_classes=%d (foreground only) head_cls_shape=%s",
                 model_num_classes,
                 head_shape,
-            )
-            logging_logger.info(
-                "[RETINANET][CLASSES] expects_background=%s label_offset=%d",
-                retinanet_expects_background,
-                retinanet_label_offset,
             )
 
         if looks_like_visdrone:
@@ -2133,14 +2250,14 @@ def train_torchvision_detector(
                 "train",
                 num_classes=model_num_classes,
                 logger=logging_logger,
-                allow_zero_label=retinanet_expects_background,
+                allow_zero_label=allow_zero_label,
             )
             _audit_dataset(
                 val_ds_full,
                 "val",
                 num_classes=model_num_classes,
                 logger=logging_logger,
-                allow_zero_label=retinanet_expects_background,
+                allow_zero_label=allow_zero_label,
             )
 
         collate_fn = ssd_collate_with_diagnostics if algorithm_name == "SSD" else coco_collate
@@ -2184,6 +2301,15 @@ def train_torchvision_detector(
         train_loader = DataLoader(train_ds_full, shuffle=True, **dataloader_kwargs)
         val_loader = DataLoader(val_ds_full, shuffle=False, **dataloader_kwargs)
         logging_logger.info("DataLoader construído. num_batches=%d", len(train_loader))
+
+        if is_retinanet:
+            run_detection_sanity_check(
+                model,
+                val_loader,
+                device,
+                logging_logger,
+                num_classes=model_num_classes,
+            )
 
         if algorithm_name == "SSD" and ssd_debug:
             _run_ssd_probe(train_loader, logging_logger, limit=50)
@@ -2596,7 +2722,7 @@ def train_torchvision_detector(
                         )
                         if best_ema is not None and best_ema == ema_loss:
                             with _watchdog_paused(last_progress, watchdog_pause):
-                                atomic_torch_save(model.state_dict(), best_by_trainloss_path)
+                                atomic_torch_save({"model": model.state_dict(), "meta": meta}, best_by_trainloss_path)
                             logging_logger.info("[EARLY] Novo melhor ema_loss; checkpoint salvo em %s", best_by_trainloss_path)
                         if should_stop:
                             logging_logger.info(
@@ -2616,6 +2742,7 @@ def train_torchvision_detector(
                         "model_state": model.state_dict(),
                         "optimizer_state": optimizer.state_dict() if optimizer else None,
                         "loss": float(avg_loss),
+                        "meta": meta,
                     },
                     epoch_ckpt,
                 )
@@ -2639,7 +2766,7 @@ def train_torchvision_detector(
 
         with _watchdog_paused(last_progress, watchdog_pause):
             logging_logger.info("Salvando pesos em %s", out)
-            atomic_torch_save(model.state_dict(), out)
+            atomic_torch_save({"model": model.state_dict(), "meta": meta}, out)
             ensure_weights_size(out, logger=logging_logger.info)
             weights_out = out
             logging_logger.info("Treinamento finalizado com sucesso.")
@@ -2669,6 +2796,7 @@ def train_torchvision_detector(
                         "epoch": final_epoch,
                         "model_state": model.state_dict(),
                         "optimizer_state": optimizer.state_dict() if optimizer else None,
+                        "meta": meta,
                     },
                     last_ckpt,
                 )

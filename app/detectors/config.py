@@ -40,3 +40,4 @@ class TrainConfig:
     early_stop_min_delta: float = 0.0
     early_stop_min_epochs: int = 10
     early_stop_ema_alpha: float = 0.2
+    legacy_retinanet_compat: bool = False

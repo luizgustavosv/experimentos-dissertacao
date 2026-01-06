@@ -8,6 +8,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.transforms import functional as F
 
+from app.datasets.class_mapping import build_coco_class_mapping, map_coco_target_to_internal
 from app.detectors.utils import read_json
 
 
@@ -19,6 +20,11 @@ class CocoDetectionDataset(Dataset):
         self.annotations = read_json(ann_path)
         self.transforms = transforms
 
+        categories = self.annotations.get("categories", [])
+        self.num_classes, self.class_names, self.cat_id_to_label, self.label_to_cat_id = build_coco_class_mapping(categories)
+        info = self.annotations.get("info", {}) if isinstance(self.annotations, dict) else {}
+        self.dataset_name = info.get("description") or info.get("dataset") or Path(ann_path).stem
+
         self.id_to_anns: Dict[int, List[Dict[str, Any]]] = {}
         for ann in self.annotations.get("annotations", []):
             self.id_to_anns.setdefault(ann["image_id"], []).append(ann)
@@ -26,7 +32,6 @@ class CocoDetectionDataset(Dataset):
         self.images = self.annotations.get("images", [])
         self.ids = [img.get("id") for img in self.images]
         self.class_id_to_name = {cat["id"]: cat["name"] for cat in self.annotations.get("categories", [])}
-        self.num_classes = len(self.annotations.get("categories", [])) + 1  # +1 background
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return len(self.images)
@@ -51,7 +56,7 @@ class CocoDetectionDataset(Dataset):
 
         target: Dict[str, Any] = {
             "boxes": torch.tensor(boxes, dtype=torch.float32),
-            "labels": torch.tensor(labels, dtype=torch.int64),
+            "labels_coco": torch.tensor(labels, dtype=torch.int64),
             "image_id": torch.tensor([img_info["id"]]),
             "area": torch.tensor(areas, dtype=torch.float32),
             "iscrowd": torch.tensor(iscrowd, dtype=torch.int64),
@@ -75,6 +80,7 @@ class CocoDetectionDataset(Dataset):
             except TypeError:
                 image = self.transforms(image)
 
+        target = map_coco_target_to_internal(target, self.cat_id_to_label)
         target = self._clip_boxes_to_image(image, target)
 
         return image, target

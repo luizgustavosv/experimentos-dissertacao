@@ -15,6 +15,7 @@ from app.detectors.torchvision_train import (
     _build_val_loader_and_classes,
     _configure_logging,
     _extract_state_dict,
+    _extract_checkpoint_meta,
     _safe_stream,
     ensure_weights_size,
     resolve_device,
@@ -274,12 +275,29 @@ def validate_retinanet_post_train(
     out_dir = Path(config.log_dir).expanduser().resolve() / "retinanet" / "val_post" / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    model = model_builder(model_num_classes)
-    model.to(device)
-
     loaded = torch.load(weights_path.expanduser().resolve(), map_location="cpu")
+    meta = _extract_checkpoint_meta(loaded)
     state_dict, checkpoint_format = _extract_state_dict(loaded)
     _emit(f"[RETINANET][VAL-POST] Formato de checkpoint: {checkpoint_format}")
+
+    meta_num_classes = meta.get("num_classes") if isinstance(meta, dict) else None
+    ckpt_inferred = _infer_retinanet_num_classes(state_dict, logging_logger)
+    ckpt_num_classes = meta_num_classes if isinstance(meta_num_classes, int) else ckpt_inferred
+    legacy_mode = False
+    if ckpt_num_classes is not None and ckpt_num_classes != dataset_num_classes:
+        if config.legacy_retinanet_compat and ckpt_num_classes == dataset_num_classes + 1 and dataset_num_classes == 1:
+            legacy_mode = True
+            _emit_warning(
+                "[RETINANET][VAL-POST] LEGACY COMPAT: ckpt_num_classes inclui background fantasma; mapeando label=1->human e descartando label=0. Recomenda-se retreinar."
+            )
+        else:
+            raise RuntimeError(
+                f"[RETINANET][VAL-POST] Mismatch de classes: ckpt_num_classes={ckpt_num_classes} dataset_num_classes={dataset_num_classes}. Habilite legacy_retinanet_compat ou retreine."
+            )
+
+    effective_model_classes = ckpt_num_classes or model_num_classes
+    model = model_builder(effective_model_classes)
+    model.to(device)
 
     (
         missing,
@@ -307,6 +325,17 @@ def validate_retinanet_post_train(
 
     # run_val_coco_metrics converte boxes xyxy -> COCO [x, y, w, h] já reescalando para o tamanho original
     # (orig_size) e preservando o image_id real vindo do target. Isso garante compatibilidade com COCOeval.
+    label_map = meta.get("label_to_cat_id") if isinstance(meta, dict) else None
+    if not label_map and hasattr(getattr(val_loader, "dataset", None), "label_to_cat_id"):
+        try:
+            label_map = dict(getattr(val_loader.dataset, "label_to_cat_id"))
+        except Exception:
+            label_map = None
+    if legacy_mode and label_map and len(label_map) == 1:
+        only_cat = next(iter(label_map.values()))
+        label_map = dict(label_map)
+        label_map[1] = only_cat
+
     results = run_val_coco_metrics(
         model,
         val_loader,
@@ -315,6 +344,8 @@ def validate_retinanet_post_train(
         logging_logger,
         tag="[RETINANET][VAL]",
         output_dir=out_dir,
+        label_to_cat_id=label_map,
+        legacy_drop_label=0 if legacy_mode else None,
     )
 
     metrics_valid = metrics_valid and results.get("metrics_valid", True)
