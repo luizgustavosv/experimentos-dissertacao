@@ -317,6 +317,8 @@ def validate_retinanet_post_train(
         output_dir=out_dir,
     )
 
+    metrics_valid = metrics_valid and results.get("metrics_valid", True)
+
     pr_metrics = _compute_classic_pr_metrics(
         Path(results["predictions_coco_json"]),
         Path(results["gt_annotations"]),

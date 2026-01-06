@@ -1473,7 +1473,54 @@ def run_val_coco_metrics(
     valid_pred_img_ids = set(int(p["image_id"]) for p in filtered_predictions)
     valid_pred_cat_ids = set(int(p["category_id"]) for p in filtered_predictions)
     if not filtered_predictions:
-        raise RuntimeError(f"{tag} Nenhuma predição válida após auditoria. Abortando COCOeval.")
+        if not is_retinanet:
+            raise RuntimeError(f"{tag} Nenhuma predição válida após auditoria. Abortando COCOeval.")
+
+        logging_logger.warning(
+            "%s No predictions to evaluate (likely undertrained in early epochs). Skipping COCOeval.",
+            tag,
+        )
+
+        stats = [0.0] * 12
+        metrics = {
+            "AP": 0.0,
+            "AP50": 0.0,
+            "AP75": 0.0,
+            "APs": 0.0,
+            "APm": 0.0,
+            "APl": 0.0,
+            "AR1": 0.0,
+            "AR10": 0.0,
+            "AR100": 0.0,
+            "ARs": 0.0,
+            "ARm": 0.0,
+            "ARl": 0.0,
+        }
+
+        gt_summary = {
+            "num_images": len(gt_img_ids),
+            "num_categories": len(gt_cat_ids),
+            "min_image_id": min(gt_img_ids) if gt_img_ids else None,
+            "max_image_id": max(gt_img_ids) if gt_img_ids else None,
+        }
+        pred_summary = {
+            "num_detections": 0,
+            "unique_image_ids": 0,
+            "unique_category_ids": 0,
+        }
+
+        return {
+            "coco_metrics": metrics,
+            "coco_stats": stats,
+            "predictions_coco_json": str(predictions_path),
+            "per_class": {},
+            "gt_summary": gt_summary,
+            "pred_summary": pred_summary,
+            "gt_annotations": str(val_ann),
+            "num_predictions": 0,
+            "reason": "no_predictions",
+            "metrics_valid": False,
+        }
     if num_invalid_img_ids > 0:
         logging_logger.info(
             "%s [VAL-METRICS][AUDIT] %d image_id(s) inválidos foram filtrados", tag, num_invalid_img_ids
@@ -1540,6 +1587,7 @@ def run_val_coco_metrics(
         "gt_summary": gt_summary,
         "pred_summary": pred_summary,
         "gt_annotations": str(val_ann),
+        "num_predictions": len(filtered_predictions),
     }
 
 
