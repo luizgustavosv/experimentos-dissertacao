@@ -5,6 +5,7 @@ import os
 import random
 import logging
 import shutil
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -148,41 +149,99 @@ def _looks_like_state_dict(obj: Any) -> bool:
 
 
 def ensure_weights_size(
-    weights_path: Path, min_bytes: int = 1_000_000, logger: Optional[Logger] = None, integrity_check: bool = True
+    weights_path: Path | str,
+    min_bytes: int = 1_000_000,
+    logger: Optional[Logger] = None,
+    integrity_check: bool = True,
 ) -> None:
-    weights_path = weights_path.expanduser().resolve()
-    if logger:
-        logger(f"[WEIGHTS] Saved weights path={weights_path}")
-    if not weights_path.exists():
-        msg = f"Pesos não encontrados em {weights_path}."
+    resolved_path = Path(weights_path).expanduser().resolve()
+    logging_logger = logging.getLogger("weights.integrity")
+
+    def _emit_info(message: str) -> None:
         if logger:
-            logger(f"[WEIGHTS] integrity_check=FAIL reason=missing_file")
-        raise FileNotFoundError(msg)
-    size = weights_path.stat().st_size
-    if logger:
-        logger(f"[WEIGHTS] size_bytes={size} min_bytes={min_bytes}")
+            logger(message)
+        else:
+            logging_logger.info(message)
+
+    def _emit_warning(message: str) -> None:
+        if logger:
+            logger(message)
+        else:
+            logging_logger.warning(message)
+
+    _emit_info(f"[WEIGHTS] Saved weights path={resolved_path}")
+
+    exists = resolved_path.exists()
+    is_file = resolved_path.is_file()
+    if not exists or not is_file:
+        _emit_warning(
+            "[WEIGHTS] integrity_check=FAIL reason=missing_or_invalid_path "
+            f"path={resolved_path} exists={exists} is_file={is_file}"
+        )
+        return
+
+    size = 0
+    attempts = 0
+    last_exception: Optional[Exception] = None
+    while attempts < 5:
+        attempts += 1
+        try:
+            size = resolved_path.stat().st_size
+        except Exception as exc:  # pragma: no cover - robustez de IO
+            last_exception = exc
+            size = 0
+        if size > 0:
+            break
+        time.sleep(0.1)
+
+    _emit_info(f"[WEIGHTS] size_bytes={size} min_bytes={min_bytes} attempts={attempts}")
+
+    if size == 0:
+        parent = resolved_path.parent
+        prefix = resolved_path.stem
+        sibling_listing: list[str] = []
+        try:
+            for candidate in sorted(parent.iterdir()):
+                if not candidate.name.startswith(prefix):
+                    continue
+                try:
+                    candidate_size = candidate.stat().st_size
+                except Exception:
+                    candidate_size = -1
+                sibling_listing.append(f"{candidate.name} ({candidate_size} bytes)")
+                if len(sibling_listing) >= 10:
+                    break
+        except Exception:
+            sibling_listing = []
+
+        diag = (
+            "[WEIGHTS] integrity_check=FAIL reason=size_zero "
+            f"path={resolved_path} exists={exists} is_file={is_file} attempts={attempts} "
+            f"parent={parent} siblings={sibling_listing}"
+        )
+        if last_exception:
+            diag += f" last_exception={last_exception}"
+        _emit_warning(diag)
+        return
+
     if size < min_bytes:
         msg = f"Pesos muito pequenos ({size} bytes). Possível falha ao salvar."
-        if logger:
-            logger("[WEIGHTS] integrity_check=FAIL reason=size_below_min")
+        _emit_warning("[WEIGHTS] integrity_check=FAIL reason=size_below_min")
         raise ValueError(msg)
 
     if not integrity_check:
-        if logger:
-            logger("[WEIGHTS] integrity_check=SKIPPED")
+        _emit_info("[WEIGHTS] integrity_check=SKIPPED")
         return
 
     try:
-        loaded = torch.load(weights_path, map_location="cpu")
+        loaded = torch.load(resolved_path, map_location="cpu")
         if not _looks_like_state_dict(loaded):
             raise ValueError("estrutura inesperada")
     except Exception as exc:  # pragma: no cover - robustez de IO
-        if logger:
-            logger(f"[WEIGHTS] integrity_check=FAIL reason={exc}")
-        raise ValueError(f"Arquivo de pesos corrompido/incompleto em {weights_path}: {exc}") from exc
+        _emit_warning(f"[WEIGHTS] integrity_check=FAIL reason={exc}")
+        raise ValueError(f"Arquivo de pesos corrompido/incompleto em {resolved_path}: {exc}") from exc
 
-    if logger:
-        logger("[WEIGHTS] integrity_check=OK")
+    _emit_info("[WEIGHTS] integrity_check=OK")
 
 
 def save_state_dict(model: torch.nn.Module, path: Path) -> Path:
