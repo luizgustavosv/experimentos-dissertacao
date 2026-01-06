@@ -53,6 +53,7 @@ except Exception:  # pragma: no cover - fallback silencioso se tqdm não estiver
 
 _retinanet_label_log_before = False
 _retinanet_label_log_after = False
+_retinanet_label_mode_logged = False
 
 
 def _describe_structure(obj: Any, depth: int = 0, max_depth: int = 4) -> str:
@@ -396,44 +397,100 @@ def _is_visdrone_dataset(dataset_dir: Path, dataset: Any) -> bool:
 def _remap_retinanet_labels(
     targets: list[dict[str, torch.Tensor]], *, num_classes: int, expects_background: bool, label_offset: int, logger: logging.Logger
 ) -> None:
-    global _retinanet_label_log_before, _retinanet_label_log_after
+    global _retinanet_label_log_before, _retinanet_label_log_after, _retinanet_label_mode_logged
 
     if num_classes <= 0:
         raise ValueError("[RETINANET] num_classes inválido para remapeamento de labels.")
 
+    observed_keys: set[str] = set()
+    for target in targets:
+        if isinstance(target, dict):
+            observed_keys.update(target.keys())
+
+    def _log_mode(mode: str) -> None:
+        nonlocal observed_keys
+        if not _retinanet_label_mode_logged:
+            _retinanet_label_mode_logged = True
+            logger.info(
+                "[RETINANET][REMAP] mode=%s keys=%s", mode, sorted(observed_keys)
+            )
+
     labels_before: list[torch.Tensor] = []
+    labels_present = False
+    zero_based_ok = True
     for target in targets:
         labels = target.get("labels") if isinstance(target, dict) else None
         if not torch.is_tensor(labels):
+            zero_based_ok = False
             continue
+        labels_present = True
+        if labels.dtype != torch.int64:
+            zero_based_ok = False
         if labels.numel() > 0:
             labels_before.append(labels)
-            if expects_background:
-                if (labels < 0).any():
-                    bad_example = int(labels.min())
-                    raise ValueError(
-                        f"[RETINANET] category_id inválido (<0) detectado antes do remap. Exemplo: {bad_example}."
-                    )
-            else:
-                if (labels <= 0).any():
-                    bad_example = int(labels.min())
-                    raise ValueError(
-                        f"[RETINANET] category_id inválido (<=0) detectado antes do remap. Exemplo: {bad_example}."
-                    )
+            min_label = int(labels.min())
+            max_label = int(labels.max())
+            if min_label < 0 or max_label >= num_classes:
+                zero_based_ok = False
 
     if labels_before and not _retinanet_label_log_before:
         merged = torch.cat(labels_before)
         _retinanet_label_log_before = True
         logger.info(
-            "[RETINANET] label range before remap: min=%d max=%d",
-            int(merged.min()),
-            int(merged.max()),
+            "[RETINANET] label range before remap: min=%d max=%d num_classes=%d", int(merged.min()), int(merged.max()), num_classes
         )
 
+    if zero_based_ok and labels_present:
+        for target in targets:
+            labels = target.get("labels") if isinstance(target, dict) else None
+            if torch.is_tensor(labels):
+                target["labels"] = labels.to(torch.int64)
+        _log_mode("SKIP_ALREADY_0_BASED")
+        if labels_before and not _retinanet_label_log_after:
+            merged = torch.cat(labels_before)
+            _retinanet_label_log_after = True
+            logger.info(
+                "[RETINANET] label range after remap: min=%d max=%d num_classes=%d (background=%s)",
+                int(merged.min()),
+                int(merged.max()),
+                num_classes,
+                "sim" if expects_background else "não",
+            )
+        return
+
+    fallback_warned = False
     for target in targets:
-        labels = target.get("labels") if isinstance(target, dict) else None
-        if torch.is_tensor(labels):
-            target["labels"] = labels.to(torch.int64)
+        if not isinstance(target, dict):
+            continue
+        labels_coco = target.get("labels_coco")
+        if not torch.is_tensor(labels_coco):
+            labels_coco = target.get("category_id_coco")
+        if not torch.is_tensor(labels_coco):
+            category_id = target.get("category_id")
+            if torch.is_tensor(category_id) and category_id.numel() > 0 and (category_id >= 1).all():
+                labels_coco = category_id
+                if not fallback_warned:
+                    fallback_warned = True
+                    logger.warning(
+                        "[RETINANET][REMAP] labels_coco ausente; usando category_id como fallback (presumindo formato COCO)."
+                    )
+        if not torch.is_tensor(labels_coco):
+            raise ValueError(
+                "[RETINANET] labels_coco/category_id_coco ausente para remapeamento; verifique o dataset COCO."
+            )
+
+        labels_coco = labels_coco.to(torch.int64)
+        target["labels_coco"] = labels_coco
+
+        if labels_coco.numel() > 0 and (labels_coco <= 0).any():
+            bad_example = int(labels_coco.min())
+            raise ValueError(
+                f"[RETINANET] category_id COCO inválido (<=0) detectado no remap. Exemplo: {bad_example}."
+            )
+
+        target["labels"] = labels_coco.to(torch.int64) - label_offset
+
+    _log_mode("REMAP_FROM_COCO")
 
     labels_after: list[torch.Tensor] = []
     for target in targets:
