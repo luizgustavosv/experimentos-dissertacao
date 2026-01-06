@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import random
 import subprocess
 from collections import Counter
 import signal
@@ -20,7 +21,7 @@ from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, Subset
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRCNN
 from torchvision.models.detection.retinanet import RetinaNet
 
@@ -899,10 +900,53 @@ def _start_watchdog(
     return thread
 
 
-def _split_dataset(dataset, val_ratio: float, seed: int):
-    val_size = max(1, int(len(dataset) * val_ratio))
-    train_size = len(dataset) - val_size
-    return random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed))
+def _split_dataset(dataset, val_ratio: float, seed: int, logging_logger: Optional[logging.Logger] = None):
+    """Split determinístico de train/val por índices com auditoria rigorosa."""
+
+    if val_ratio <= 0:
+        return dataset, None
+
+    logger = logging_logger or logging.getLogger("ssd_train")
+
+    total_indices = list(range(len(dataset)))
+    rng = random.Random(seed)
+    rng.shuffle(total_indices)
+
+    n_val = int(round(len(total_indices) * val_ratio))
+    n_val = min(max(n_val, 0), len(total_indices))
+
+    val_indices = sorted(total_indices[:n_val])
+    train_indices = sorted(total_indices[n_val:])
+
+    train_subset = Subset(dataset, train_indices)
+    val_subset = Subset(dataset, val_indices)
+
+    train_set = set(train_indices)
+    val_set = set(val_indices)
+    intersection = train_set & val_set
+    union = train_set | val_set
+
+    if intersection:
+        raise RuntimeError(f"[SPLIT] Interseção não vazia entre train e val (size={len(intersection)}).")
+    if len(union) != len(dataset):
+        raise RuntimeError(
+            f"[SPLIT] União train/val ({len(union)}) difere do total do dataset ({len(dataset)})."
+        )
+
+    train_min = min(train_indices) if train_indices else None
+    train_max = max(train_indices) if train_indices else None
+    val_min = min(val_indices) if val_indices else None
+    val_max = max(val_indices) if val_indices else None
+
+    logger.info("[SPLIT] Total samples: %d", len(dataset))
+    logger.info("[SPLIT] Train samples: %d", len(train_indices))
+    logger.info("[SPLIT] Val samples: %d", len(val_indices))
+    logger.info("[SPLIT] Intersection(train,val)=%d", len(intersection))
+    logger.info("[SPLIT] Union size=%d", len(union))
+    logger.info("[SPLIT] Train idx range: %s - %s", train_min, train_max)
+    logger.info("[SPLIT] Val idx range: %s - %s", val_min, val_max)
+
+    return train_subset, val_subset
 
 
 def _extract_state_dict(loaded: Any) -> tuple[Dict[str, torch.Tensor], str]:
@@ -1159,7 +1203,7 @@ def _build_val_loader_and_classes(
     val_ratio = config.val_ratio if override_val_ratio is None else override_val_ratio
     if val_ratio and val_ratio > 0:
         logging_logger.info("[SETUP] Aplicando split adicional train/val com val_ratio=%.3f seed=%s", val_ratio, config.seed)
-        train_ds_full, extra_val = _split_dataset(train_ds_full, val_ratio, config.seed)
+        train_ds_full, extra_val = _split_dataset(train_ds_full, val_ratio, config.seed, logging_logger)
         val_ds_full = extra_val
 
     describe_dataloader(train_ds_full, logging_logger.info)
@@ -2078,7 +2122,7 @@ def train_torchvision_detector(
                 logging_logger.info(
                     "[SETUP] Aplicando split adicional train/val com val_ratio=%.3f seed=%s", val_ratio_to_use, config.seed
                 )
-                train_ds_full, extra_val = _split_dataset(train_ds_full, val_ratio_to_use, config.seed)
+                train_ds_full, extra_val = _split_dataset(train_ds_full, val_ratio_to_use, config.seed, logging_logger)
                 val_ds_full = extra_val
         else:
             logging_logger.info("[SETUP] Usando datasets pré-construídos (train/val).")
