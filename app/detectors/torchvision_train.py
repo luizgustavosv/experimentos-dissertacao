@@ -443,6 +443,7 @@ def _remap_retinanet_labels(
 
     if labels_after:
         merged = torch.cat(labels_after)
+        # Internamente as classes são sempre 0-based e contíguas; background é implícito.
         lower_bound = 0
         upper_bound = num_classes - 1
         if (merged < lower_bound).any() or (merged > upper_bound).any():
@@ -551,21 +552,28 @@ def _validate_targets_batch(
         if not (y_max > y_min).all():
             raise ValueError(f"ymax <= ymin encontrado no índice {idx}{path_label}")
 
-        lower_bound = 0 if allow_zero_label else 1
+        # Internamente as classes são sempre 0-based e contíguas; background é implícito.
+        lower_bound = 0
         if num_classes is not None and num_classes > 0:
-            upper_bound = num_classes - 1 if allow_zero_label else num_classes
+            upper_bound = num_classes - 1
             if (labels < lower_bound).any():
                 raise ValueError(
-                    f"Labels fora do intervalo no índice {idx}{path_label}: mínimo {int(labels.min())} (esperado >={lower_bound})"
+                    (
+                        f"Labels fora do intervalo no índice {idx}{path_label}: mínimo {int(labels.min())}"
+                        f" < limite inferior ({lower_bound})"
+                    )
                 )
             if (labels > upper_bound).any():
                 raise ValueError(
-                    f"Labels fora do intervalo no índice {idx}{path_label}: máximo {int(labels.max())} > limite ({upper_bound})"
+                    (
+                        f"Labels fora do intervalo no índice {idx}{path_label}: máximo {int(labels.max())}"
+                        f" > limite superior ({upper_bound})"
+                    )
                 )
         else:
             if (labels < lower_bound).any():
                 raise ValueError(
-                    f"Labels devem ser >={lower_bound} quando num_classes é desconhecido (índice {idx}{path_label})"
+                    f"Labels fora do intervalo [0,+inf) quando num_classes é desconhecido (índice {idx}{path_label})"
                 )
 
         if not torch.isfinite(labels.float()).all():
