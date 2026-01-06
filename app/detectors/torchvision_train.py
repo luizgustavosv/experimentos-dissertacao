@@ -1200,13 +1200,34 @@ def _build_val_loader_and_classes(
 
     _log_label_range_from_annotations(getattr(val_ds_full, "annotations", {}), "val", logging_logger)
 
+    total_before_split = len(train_ds_full)
     val_ratio = config.val_ratio if override_val_ratio is None else override_val_ratio
-    if val_ratio and val_ratio > 0:
+    split_applied = bool(val_ratio and val_ratio > 0)
+    if split_applied:
         logging_logger.info("[SETUP] Aplicando split adicional train/val com val_ratio=%.3f seed=%s", val_ratio, config.seed)
         train_ds_full, extra_val = _split_dataset(train_ds_full, val_ratio, config.seed, logging_logger)
         val_ds_full = extra_val
 
-    describe_dataloader(train_ds_full, logging_logger.info)
+    train_after_split = len(train_ds_full)
+    val_after_split = len(val_ds_full) if split_applied else 0
+    total_after_split = train_after_split + val_after_split
+
+    if split_applied:
+        logging_logger.info("[DATA] Dataset base (antes do split): total=%d", total_before_split)
+        logging_logger.info(
+            "[DATA] Após split: train=%d | val=%d | total=%d",
+            train_after_split,
+            val_after_split,
+            total_after_split,
+        )
+    else:
+        logging_logger.info(
+            "[DATA] Sem split adicional: train=total=%d | val=%d",
+            train_after_split,
+            val_after_split,
+        )
+
+    describe_dataloader(train_ds_full, logging_logger.info, label="train subset")
     logging_logger.info("[SETUP] Tamanho train=%d | val=%d", len(train_ds_full), len(val_ds_full))
 
     configured_dataset_classes = None if force_dataset_num_classes is not None else getattr(config, "dataset_num_classes", None)
@@ -2117,8 +2138,11 @@ def train_torchvision_detector(
             train_ds_full = CocoDetectionDataset(dataset_dir / "images" / "train", train_ann, transforms=transform)
             val_ds_full = CocoDetectionDataset(dataset_dir / "images" / "val", val_ann, transforms=transform)
 
+            total_before_split = len(train_ds_full)
+            split_applied = bool(val_ratio_to_use and val_ratio_to_use > 0)
+
             # Dividir train em train/val adicionais se desejado
-            if val_ratio_to_use and val_ratio_to_use > 0:
+            if split_applied:
                 logging_logger.info(
                     "[SETUP] Aplicando split adicional train/val com val_ratio=%.3f seed=%s", val_ratio_to_use, config.seed
                 )
@@ -2128,6 +2152,27 @@ def train_torchvision_detector(
             logging_logger.info("[SETUP] Usando datasets pré-construídos (train/val).")
             train_ds_full = train_dataset
             val_ds_full = val_dataset
+            total_before_split = len(train_ds_full)
+            split_applied = False
+
+        train_after_split = len(train_ds_full)
+        val_after_split = len(val_ds_full) if split_applied else 0
+        total_after_split = train_after_split + val_after_split
+
+        if split_applied:
+            logging_logger.info("[DATA] Dataset base (antes do split): total=%d", total_before_split)
+            logging_logger.info(
+                "[DATA] Após split: train=%d | val=%d | total=%d",
+                train_after_split,
+                val_after_split,
+                total_after_split,
+            )
+        else:
+            logging_logger.info(
+                "[DATA] Sem split adicional: train=total=%d | val=%d",
+                train_after_split,
+                val_after_split,
+            )
 
         def _sample_labels(ds: Any, limit: int = 32) -> list[int]:
             labels: list[int] = []
@@ -2154,7 +2199,7 @@ def train_torchvision_detector(
                 )
             )
 
-        describe_dataloader(train_ds_full, logging_logger.info)
+        describe_dataloader(train_ds_full, logging_logger.info, label="train subset")
         logging_logger.info("[SETUP] Tamanho train=%d | val=%d", len(train_ds_full), len(val_ds_full))
 
         configured_dataset_classes = getattr(config, "dataset_num_classes", None)

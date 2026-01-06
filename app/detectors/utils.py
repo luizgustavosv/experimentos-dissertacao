@@ -301,9 +301,10 @@ def log_config(logger: Optional[Logger], message: str) -> None:
         logger(message)
 
 
-def describe_dataloader(dataset, logger: Optional[Logger]) -> None:
+def describe_dataloader(dataset, logger: Optional[Logger], *, label: Optional[str] = None) -> None:
     if logger:
-        logger(f"[DATA] Total de imagens: {len(dataset)}")
+        label_suffix = f" ({label})" if label else ""
+        logger(f"[DATA] Total de imagens{label_suffix}: {len(dataset)}")
 
 
 def read_json(path: Path) -> Dict:
