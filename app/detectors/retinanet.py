@@ -83,11 +83,11 @@ class RetinaNetDetector(FasterRCNNDetector):
         return model
 
     def _map_model_num_classes(self, dataset_num_classes: int) -> int:  # type: ignore[override]
-        return dataset_num_classes + 1  # background
+        return dataset_num_classes
 
     def _log_model_num_classes(self, model_num_classes: int, logger):  # type: ignore[override]
         if logger:
-            logger(f"[MODEL] RetinaNet num_classes={model_num_classes} (inclui background)")
+            logger(f"[MODEL] RetinaNet num_classes={model_num_classes} (foreground only)")
 
     def _infer_dataset_num_classes(self, ann_path, logger):  # type: ignore[override]
         dataset_num_classes = super()._infer_dataset_num_classes(ann_path, logger)
