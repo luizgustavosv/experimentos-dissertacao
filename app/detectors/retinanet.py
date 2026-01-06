@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from app.detectors.base import DetectorContext
 from app.detectors.faster_rcnn import FasterRCNNDetector
-from app.detectors.retinanet_eval import validate_retinanet_post_train
+from app.detectors.retinanet_eval import (
+    _load_retinanet_weights_with_head_guard,
+    validate_retinanet_post_train,
+)
 from app.detectors.torchvision_detectors import TorchvisionDetector
 from app.detectors.torchvision_models import build_retinanet
 from app.detectors.utils import validate_coco_dataset
@@ -48,24 +51,43 @@ class RetinaNetDetector(FasterRCNNDetector):
 
         if pretrained_weights:
             import torch
+            import logging
 
             weights_path = pretrained_weights.expanduser().resolve()
             if weights_path.is_file():
                 state_dict = torch.load(weights_path, map_location="cpu")
-                missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                logging_logger = logging.getLogger("retinanet.weights")
+                missing, unexpected, ckpt_num_classes, head_mismatch, ignored_keys, strict_load = (
+                    _load_retinanet_weights_with_head_guard(
+                        model,
+                        state_dict,
+                        model_num_classes=num_classes,
+                        emit_info=logger or (lambda msg: None),
+                        emit_warning=logger or (lambda msg: None),
+                        logging_logger=logging_logger,
+                    )
+                )
                 if logger:
                     if missing:
                         logger(f"[WEIGHTS] Chaves ausentes ao carregar RetinaNet: {missing}")
                     if unexpected:
                         logger(f"[WEIGHTS] Chaves ignoradas (head antigo): {unexpected}")
+                    if ignored_keys:
+                        logger(f"[WEIGHTS] Head cls_logits ignorado: {ignored_keys} (strict={strict_load})")
+                    if head_mismatch:
+                        logger(
+                            "[RETINANET][CLASSES] Checkpoint head mismatch due to num_classes change. Please retrain RetinaNet."
+                        )
+                    if ckpt_num_classes is not None:
+                        logger(f"[RETINANET][CLASSES] ckpt_num_classes={ckpt_num_classes}")
         return model
 
     def _map_model_num_classes(self, dataset_num_classes: int) -> int:  # type: ignore[override]
-        return dataset_num_classes
+        return dataset_num_classes + 1  # background
 
     def _log_model_num_classes(self, model_num_classes: int, logger):  # type: ignore[override]
         if logger:
-            logger(f"[MODEL] RetinaNet num_classes={model_num_classes} (foreground only)")
+            logger(f"[MODEL] RetinaNet num_classes={model_num_classes} (inclui background)")
 
     def _infer_dataset_num_classes(self, ann_path, logger):  # type: ignore[override]
         dataset_num_classes = super()._infer_dataset_num_classes(ann_path, logger)

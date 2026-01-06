@@ -382,7 +382,7 @@ def _is_visdrone_dataset(dataset_dir: Path, dataset: Any) -> bool:
 
 
 def _remap_retinanet_labels(
-    targets: list[dict[str, torch.Tensor]], *, num_classes: int, logger: logging.Logger
+    targets: list[dict[str, torch.Tensor]], *, num_classes: int, expects_background: bool, label_offset: int, logger: logging.Logger
 ) -> None:
     global _retinanet_label_log_before, _retinanet_label_log_after
 
@@ -396,11 +396,18 @@ def _remap_retinanet_labels(
             continue
         if labels.numel() > 0:
             labels_before.append(labels)
-            if (labels <= 0).any():
-                bad_example = int(labels.min())
-                raise ValueError(
-                    f"[RETINANET] category_id inválido (<=0) detectado antes do remap. Exemplo: {bad_example}."
-                )
+            if expects_background:
+                if (labels < 0).any():
+                    bad_example = int(labels.min())
+                    raise ValueError(
+                        f"[RETINANET] category_id inválido (<0) detectado antes do remap. Exemplo: {bad_example}."
+                    )
+            else:
+                if (labels <= 0).any():
+                    bad_example = int(labels.min())
+                    raise ValueError(
+                        f"[RETINANET] category_id inválido (<=0) detectado antes do remap. Exemplo: {bad_example}."
+                    )
 
     if labels_before and not _retinanet_label_log_before:
         merged = torch.cat(labels_before)
@@ -414,7 +421,14 @@ def _remap_retinanet_labels(
     for target in targets:
         labels = target.get("labels") if isinstance(target, dict) else None
         if torch.is_tensor(labels):
-            target["labels"] = labels - 1
+            if expects_background:
+                offset = label_offset
+                if offset == 0 and labels.numel() > 0 and int(labels.min()) == 0:
+                    offset = 1
+                    logger.info("[RETINANET][CLASSES] Aplicando offset +1 para alinhar labels com background explícito.")
+                target["labels"] = labels + offset
+            else:
+                target["labels"] = labels - 1
 
     labels_after: list[torch.Tensor] = []
     for target in targets:
@@ -424,28 +438,47 @@ def _remap_retinanet_labels(
 
     if labels_after:
         merged = torch.cat(labels_after)
-        if (merged < 0).any() or (merged >= num_classes).any():
+        if expects_background:
+            lower_bound = 1
+            upper_bound = num_classes - 1
+        else:
+            lower_bound = 0
+            upper_bound = num_classes - 1
+        if (merged < lower_bound).any() or (merged > upper_bound).any():
             raise ValueError(
                 (
-                    f"[RETINANET] Labels fora do intervalo após remap (esperado 0..{num_classes - 1}). "
+                    f"[RETINANET] Labels fora do intervalo após remap (esperado {lower_bound}..{upper_bound}). "
                     f"Exemplo min={int(merged.min())} max={int(merged.max())}"
                 )
             )
         if not _retinanet_label_log_after:
             _retinanet_label_log_after = True
             logger.info(
-                "[RETINANET] label range after remap: min=%d max=%d num_classes=%d",
+                "[RETINANET] label range after remap: min=%d max=%d num_classes=%d (background=%s)",
                 int(merged.min()),
                 int(merged.max()),
                 num_classes,
+                "sim" if expects_background else "não",
             )
 
 
 def _maybe_remap_retinanet_targets(
-    model: torch.nn.Module, targets: list[dict[str, torch.Tensor]], *, num_classes: int, logger: logging.Logger
+    model: torch.nn.Module,
+    targets: list[dict[str, torch.Tensor]],
+    *,
+    num_classes: int,
+    expects_background: bool,
+    label_offset: int,
+    logger: logging.Logger,
 ) -> None:
     if isinstance(model, RetinaNet):
-        _remap_retinanet_labels(targets, num_classes=num_classes, logger=logger)
+        _remap_retinanet_labels(
+            targets,
+            num_classes=num_classes,
+            expects_background=expects_background,
+            label_offset=label_offset,
+            logger=logger,
+        )
 
 
 def _validate_targets_batch(
@@ -453,6 +486,7 @@ def _validate_targets_batch(
     *,
     num_classes: Optional[int],
     image_sizes: Iterable[tuple[int, int]],
+    allow_zero_label: bool = False,
     logger: logging.Logger,
 ) -> None:
     sizes = list(image_sizes)
@@ -516,18 +550,21 @@ def _validate_targets_batch(
         if not (y_max > y_min).all():
             raise ValueError(f"ymax <= ymin encontrado no índice {idx}{path_label}")
 
+        lower_bound = 0 if allow_zero_label else 1
         if num_classes is not None and num_classes > 0:
-            if (labels < 1).any():
+            if (labels < lower_bound).any():
                 raise ValueError(
-                    f"Labels fora do intervalo no índice {idx}{path_label}: mínimo {int(labels.min())} (esperado >=1)"
+                    f"Labels fora do intervalo no índice {idx}{path_label}: mínimo {int(labels.min())} (esperado >={lower_bound})"
                 )
             if (labels > num_classes).any():
                 raise ValueError(
                     f"Labels fora do intervalo no índice {idx}{path_label}: máximo {int(labels.max())} > num_classes ({num_classes})"
                 )
         else:
-            if (labels < 1).any():
-                raise ValueError(f"Labels devem ser >=1 quando num_classes é desconhecido (índice {idx}{path_label})")
+            if (labels < lower_bound).any():
+                raise ValueError(
+                    f"Labels devem ser >={lower_bound} quando num_classes é desconhecido (índice {idx}{path_label})"
+                )
 
         if not torch.isfinite(labels.float()).all():
             raise ValueError(f"Labels não finitos no índice {idx}{path_label}")
@@ -615,7 +652,13 @@ def _build_detection_transforms(img_size: int, logger: logging.Logger):
 
 
 def _audit_dataset(
-    dataset: Any, phase: str, *, num_classes: Optional[int], logger: logging.Logger, limit: Optional[int] = None
+    dataset: Any,
+    phase: str,
+    *,
+    num_classes: Optional[int],
+    logger: logging.Logger,
+    limit: Optional[int] = None,
+    allow_zero_label: bool = False,
 ) -> None:
     logger.info("[AUDIT] Iniciando auditoria do dataset (%s)...", phase)
     total = len(dataset)
@@ -627,11 +670,56 @@ def _audit_dataset(
             image, target = dataset[idx]
             h, w = (int(image.shape[-2]), int(image.shape[-1])) if torch.is_tensor(image) else (image.height, image.width)
             try:
-                _validate_targets_batch([target], num_classes=num_classes, image_sizes=[(h, w)], logger=logger)
+                _validate_targets_batch(
+                    [target], num_classes=num_classes, image_sizes=[(h, w)], allow_zero_label=allow_zero_label, logger=logger
+                )
             except Exception as exc:
                 raise ValueError(f"[AUDIT] Falha no {phase} idx={idx} img={target.get('img_path', '<desconhecido>')}: {exc}")
             inspected += 1
     logger.info("[AUDIT] Auditoria concluída para %s: %d/%d amostras verificadas", phase, inspected, total)
+
+
+def _audit_retinanet_label_distribution(
+    dataset: Any, phase: str, logger: logging.Logger, *, max_samples: int = 50
+) -> dict[str, Any]:
+    labels_observed: list[int] = []
+    unique_sample: set[int] = set()
+    inspected = 0
+    with torch.no_grad():
+        for idx in range(len(dataset)):
+            if inspected >= max_samples:
+                break
+            try:
+                _, tgt = dataset[idx]
+            except Exception:
+                continue
+            labels = tgt.get("labels") if isinstance(tgt, dict) else None
+            if not torch.is_tensor(labels) or labels.numel() == 0:
+                continue
+            inspected += 1
+            labels_np = labels.detach().cpu()
+            labels_observed.extend(int(x) for x in labels_np.tolist())
+            unique_sample.update(int(x) for x in labels_np.unique().tolist())
+
+    summary: dict[str, Any] = {}
+    if labels_observed:
+        summary["min"] = min(labels_observed)
+        summary["max"] = max(labels_observed)
+        summary["unique_sample"] = sorted(unique_sample)[:20]
+        summary["starts_at_one"] = summary["min"] >= 1
+        summary["counted_images"] = inspected
+    else:
+        summary = {"min": None, "max": None, "unique_sample": [], "starts_at_one": None, "counted_images": inspected}
+
+    logger.info(
+        "[RETINANET][CLASSES] %s labels_observed: min=%s max=%s unique_sample=%s inspected=%d",
+        phase,
+        summary.get("min"),
+        summary.get("max"),
+        summary.get("unique_sample"),
+        inspected,
+    )
+    return summary
 
 
 def _ensure_frcnn_head(model: torch.nn.Module, num_classes: int, logger: logging.Logger) -> None:
@@ -680,6 +768,8 @@ def _run_smoke_test_val_loss(
     component_sum: dict[str, float] = {}
     batches = 0
     model.eval()
+    expects_background = isinstance(model, RetinaNet)
+    label_offset = 0
     with torch.no_grad():
         for images, targets in val_loader:
             images = [img.to(device) for img in images]
@@ -688,8 +778,21 @@ def _run_smoke_test_val_loss(
                 for t in targets
             ]
             image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
-            _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logger)
-            _maybe_remap_retinanet_targets(model, targets, num_classes=num_classes or 0, logger=logger)
+            _validate_targets_batch(
+                targets,
+                num_classes=num_classes,
+                image_sizes=image_sizes,
+                allow_zero_label=expects_background,
+                logger=logger,
+            )
+            _maybe_remap_retinanet_targets(
+                model,
+                targets,
+                num_classes=num_classes or 0,
+                expects_background=expects_background,
+                label_offset=label_offset,
+                logger=logger,
+            )
             loss_out = model(images, targets)
             batch_loss = torch.tensor(0.0, device=device)
             if isinstance(loss_out, dict) and loss_out:
@@ -1106,8 +1209,10 @@ def run_val_loss_loop(
     val_loader: DataLoader,
     device_str: str,
     num_classes: int,
-    logging_logger: logging.Logger,
     *,
+    expects_background: bool,
+    label_offset: int,
+    logging_logger: logging.Logger,
     tag: str = "[VAL-POST]",
 ) -> dict:
     model.eval()
@@ -1125,10 +1230,23 @@ def run_val_loss_loop(
                 for t in targets
             ]
             image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
-            _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
+            _validate_targets_batch(
+                targets,
+                num_classes=num_classes,
+                image_sizes=image_sizes,
+                allow_zero_label=expects_background,
+                logger=logging_logger,
+            )
 
             model.train()
-            _maybe_remap_retinanet_targets(model, targets, num_classes=num_classes, logger=logging_logger)
+            _maybe_remap_retinanet_targets(
+                model,
+                targets,
+                num_classes=num_classes,
+                expects_background=expects_background,
+                label_offset=label_offset,
+                logger=logging_logger,
+            )
             loss_out = model(images, targets)
             model.eval()
 
@@ -1252,6 +1370,7 @@ def run_val_coco_metrics(
         val_image_ids_set = gt_img_ids
 
     is_retinanet = isinstance(model, RetinaNet)
+    retinanet_uses_background = is_retinanet
 
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1286,7 +1405,7 @@ def run_val_coco_metrics(
         nonlocal invalid_label_count
         nonlocal invalid_label_examples
         if is_retinanet:
-            idx = raw_label
+            idx = raw_label - 1 if retinanet_uses_background else raw_label
         else:
             idx = raw_label - 1
         if idx < 0 or idx >= len(class_to_cat_id):
@@ -1732,6 +1851,8 @@ def run_post_training_validation(
                 val_loader,
                 device_str,
                 num_classes=model_num_classes,
+                expects_background=retinanet_expects_background,
+                label_offset=retinanet_label_offset,
                 logging_logger=logging_logger,
             )
     except Exception as exc:
@@ -1811,9 +1932,10 @@ def train_torchvision_detector(
     safe_stderr = _safe_stream("stderr", log_dir)
     algorithm_name = None
     model_label = getattr(model, "__class__", type("Obj", (), {})).__name__
+    is_retinanet = isinstance(model, RetinaNet)
     if isinstance(model, FasterRCNN):
         algorithm_name = "Faster R-CNN"
-    elif isinstance(model, RetinaNet):
+    elif is_retinanet:
         algorithm_name = "RetinaNet"
     else:
         algorithm_name = "SSD"
@@ -1882,7 +2004,10 @@ def train_torchvision_detector(
 
         configured_dataset_classes = getattr(config, "dataset_num_classes", None)
         configured_model_num_classes = getattr(config, "num_classes", None)
-        use_background = not isinstance(model, RetinaNet)
+        use_background = not is_retinanet
+        retinanet_expects_background = is_retinanet
+        retinanet_label_offset = 0
+        retinanet_label_stats: dict[str, Any] = {}
 
         train_ann_classes, train_cat_ids = _infer_dataset_classes_from_annotations(train_ann, "train", logging_logger)
         val_ann_classes, val_cat_ids = _infer_dataset_classes_from_annotations(val_ann, "val", logging_logger)
@@ -1927,6 +2052,34 @@ def train_torchvision_detector(
                 dataset_num_classes,
             )
 
+        if is_retinanet:
+            retinanet_label_stats = _audit_retinanet_label_distribution(train_ds_full, "train", logging_logger)
+            val_label_stats = _audit_retinanet_label_distribution(val_ds_full, "val", logging_logger)
+            combined_min = min(
+                x
+                for x in (retinanet_label_stats.get("min"), val_label_stats.get("min"))
+                if x is not None
+            ) if any(x is not None for x in (retinanet_label_stats.get("min"), val_label_stats.get("min"))) else None
+            combined_max = max(
+                x
+                for x in (retinanet_label_stats.get("max"), val_label_stats.get("max"))
+                if x is not None
+            ) if any(x is not None for x in (retinanet_label_stats.get("max"), val_label_stats.get("max"))) else None
+            retinanet_label_offset = 0
+            if combined_min == 0:
+                retinanet_label_offset = 1
+                logging_logger.info(
+                    "[RETINANET][CLASSES] Detectado label mínimo 0; aplicando offset +1 somente para RetinaNet.")
+            retinanet_inferred_from_labels = (combined_max + 1) if combined_max is not None else None
+            logging_logger.info(
+                "[RETINANET][CLASSES] dataset_num_classes=%s inferred_from_labels=%s",
+                dataset_num_classes,
+                retinanet_inferred_from_labels,
+            )
+
+        if is_retinanet:
+            use_background = True
+            retinanet_expects_background = True
         expected_model_classes = dataset_num_classes + 1 if use_background and dataset_num_classes > 0 else dataset_num_classes
         model_num_classes = expected_model_classes
         if configured_model_num_classes is not None and configured_model_num_classes > 0:
@@ -1943,6 +2096,20 @@ def train_torchvision_detector(
             dataset_num_classes,
             model_num_classes,
         )
+
+        if is_retinanet:
+            cls_head = getattr(getattr(getattr(model, "head", None), "classification_head", None), "cls_logits", None)
+            head_shape = tuple(cls_head.weight.shape) if getattr(cls_head, "weight", None) is not None else None
+            logging_logger.info(
+                "[RETINANET][CLASSES] model_num_classes=%d (inclui background) head_cls_shape=%s",
+                model_num_classes,
+                head_shape,
+            )
+            logging_logger.info(
+                "[RETINANET][CLASSES] expects_background=%s label_offset=%d",
+                retinanet_expects_background,
+                retinanet_label_offset,
+            )
 
         if looks_like_visdrone:
             logging_logger.info(
@@ -1961,8 +2128,20 @@ def train_torchvision_detector(
                 )
 
         if config.audit_datasets:
-            _audit_dataset(train_ds_full, "train", num_classes=model_num_classes, logger=logging_logger)
-            _audit_dataset(val_ds_full, "val", num_classes=model_num_classes, logger=logging_logger)
+            _audit_dataset(
+                train_ds_full,
+                "train",
+                num_classes=model_num_classes,
+                logger=logging_logger,
+                allow_zero_label=retinanet_expects_background,
+            )
+            _audit_dataset(
+                val_ds_full,
+                "val",
+                num_classes=model_num_classes,
+                logger=logging_logger,
+                allow_zero_label=retinanet_expects_background,
+            )
 
         collate_fn = ssd_collate_with_diagnostics if algorithm_name == "SSD" else coco_collate
         dataloader_kwargs = dict(
@@ -2115,7 +2294,13 @@ def train_torchvision_detector(
                             )
 
                 image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
-                _validate_targets_batch(targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger)
+                _validate_targets_batch(
+                    targets,
+                    num_classes=num_classes,
+                    image_sizes=image_sizes,
+                    allow_zero_label=retinanet_expects_background,
+                    logger=logging_logger,
+                )
 
                 if algorithm_name == "SSD":
                     last_ok_sample = [t.get("img_path", "<desconhecido>") for t in targets]
@@ -2123,7 +2308,14 @@ def train_torchvision_detector(
                         "[LAST_OK_SAMPLE] epoch=%d step=%d paths=%s", epoch, step, last_ok_sample
                     )
 
-                _maybe_remap_retinanet_targets(model, targets, num_classes=num_classes, logger=logging_logger)
+                _maybe_remap_retinanet_targets(
+                    model,
+                    targets,
+                    num_classes=num_classes,
+                    expects_background=retinanet_expects_background,
+                    label_offset=retinanet_label_offset,
+                    logger=logging_logger,
+                )
                 loss_out = model(images, targets)
                 if not logged_loss_structure:
                     try:
@@ -2281,12 +2473,21 @@ def train_torchvision_detector(
                             ]
                             image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
                             _validate_targets_batch(
-                                targets, num_classes=num_classes, image_sizes=image_sizes, logger=logging_logger
+                                targets,
+                                num_classes=num_classes,
+                                image_sizes=image_sizes,
+                                allow_zero_label=retinanet_expects_background,
+                                logger=logging_logger,
                             )
 
                             model.train()
                             _maybe_remap_retinanet_targets(
-                                model, targets, num_classes=num_classes, logger=logging_logger
+                                model,
+                                targets,
+                                num_classes=num_classes,
+                                expects_background=retinanet_expects_background,
+                                label_offset=retinanet_label_offset,
+                                logger=logging_logger,
                             )
                             loss_out = model(images, targets)
                             model.eval()
