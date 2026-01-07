@@ -53,7 +53,6 @@ except Exception:  # pragma: no cover - fallback silencioso se tqdm não estiver
 
 _retinanet_label_log_before = False
 _retinanet_label_log_after = False
-_retinanet_label_mode_logged = False
 
 
 def _describe_structure(obj: Any, depth: int = 0, max_depth: int = 4) -> str:
@@ -397,7 +396,7 @@ def _is_visdrone_dataset(dataset_dir: Path, dataset: Any) -> bool:
 def _remap_retinanet_labels(
     targets: list[dict[str, torch.Tensor]], *, num_classes: int, expects_background: bool, label_offset: int, logger: logging.Logger
 ) -> None:
-    global _retinanet_label_log_before, _retinanet_label_log_after, _retinanet_label_mode_logged
+    global _retinanet_label_log_before, _retinanet_label_log_after
 
     if num_classes <= 0:
         raise ValueError("[RETINANET] num_classes inválido para remapeamento de labels.")
@@ -409,11 +408,12 @@ def _remap_retinanet_labels(
 
     def _log_mode(mode: str) -> None:
         nonlocal observed_keys
-        if not _retinanet_label_mode_logged:
-            _retinanet_label_mode_logged = True
-            logger.info(
-                "[RETINANET][REMAP] mode=%s keys=%s", mode, sorted(observed_keys)
-            )
+        if getattr(_log_mode, "_logged", False):
+            return
+        logger.info(
+            "[RETINANET][REMAP] mode=%s keys=%s", mode, sorted(observed_keys)
+        )
+        _log_mode._logged = True
 
     labels_before: list[torch.Tensor] = []
     labels_present = False
