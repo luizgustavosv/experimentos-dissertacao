@@ -355,10 +355,12 @@ def _dump_ssd_debug_snapshot(out_dir: Path, payload: dict, logger: logging.Logge
 
 
 def _infer_dataset_classes_from_annotations(
-    ann_path: Path, split: str, logging_logger: logging.Logger
+    ann_path: Optional[Path], split: str, logging_logger: logging.Logger
 ) -> tuple[Optional[int], list[int]]:
     """Infer classes directly from the COCO annotations file."""
 
+    if not ann_path:
+        return None, []
     try:
         data = json.loads(Path(ann_path).read_text(encoding="utf-8"))
     except Exception as exc:  # pragma: no cover - leitura robusta
@@ -2164,8 +2166,8 @@ def run_post_training_validation(
 def train_torchvision_detector(
     model: torch.nn.Module,
     dataset_dir: Path,
-    train_ann: Path,
-    val_ann: Path,
+    train_ann: Optional[Path],
+    val_ann: Optional[Path],
     weights_out: Path,
     config: TrainConfig,
     logger: Optional[Logger] = None,
@@ -2173,6 +2175,7 @@ def train_torchvision_detector(
     train_dataset=None,
     val_dataset=None,
     checkpoint_dir: Optional[Path] = None,
+    ssd_class_info: Optional[dict[str, Any]] = None,
 ) -> Metrics:
     log_dir = Path(config.log_dir).expanduser().resolve()
     safe_stdout = _safe_stream("stdout", log_dir)
@@ -2344,58 +2347,107 @@ def train_torchvision_detector(
         allow_zero_label = is_retinanet
         retinanet_label_offset = 0
 
-        train_ann_classes, train_cat_ids = _infer_dataset_classes_from_annotations(train_ann, "train", logging_logger)
-        val_ann_classes, val_cat_ids = _infer_dataset_classes_from_annotations(val_ann, "val", logging_logger)
-        ann_dataset_classes = train_ann_classes or val_ann_classes
+        class_names = getattr(train_ds_full, "class_names", [])
+        cat_id_to_label = getattr(train_ds_full, "cat_id_to_label", {})
+        label_to_cat_id = getattr(train_ds_full, "label_to_cat_id", {})
+        class_source = None
 
-        inferred_train_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(train_ds_full))
-        inferred_val_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(val_ds_full))
+        if algorithm_name == "SSD":
+            from app.detectors.utils import resolve_ssd_dataset_classes
 
-        dataset_num_classes: Optional[int] = None
-        if ann_dataset_classes is not None:
-            dataset_num_classes = ann_dataset_classes
-        elif configured_dataset_classes is not None:
-            dataset_num_classes = configured_dataset_classes
-        elif configured_model_num_classes is not None and configured_model_num_classes > 0:
-            dataset_num_classes = (
-                max(1, configured_model_num_classes - 1) if use_background else configured_model_num_classes
-            )
+            if ssd_class_info is None:
+                (
+                    ssd_class_names,
+                    ssd_dataset_num_classes,
+                    ssd_source,
+                    background_removed,
+                    background_before,
+                ) = resolve_ssd_dataset_classes(
+                    config,
+                    dataset_dir,
+                    train_ann=train_ann,
+                    val_ann=val_ann,
+                    logging_logger=logging_logger,
+                )
+                logging_logger.info("[CLASSES] source=%s class_names=%s", ssd_source, ssd_class_names)
+                if background_removed:
+                    logging_logger.warning(
+                        "[WARNING] background removido da lista de classes do dataset: before=%s after=%s",
+                        background_before or ssd_class_names,
+                        ssd_class_names,
+                    )
+            else:
+                ssd_class_names = ssd_class_info["class_names"]
+                ssd_dataset_num_classes = ssd_class_info["dataset_num_classes"]
+                ssd_source = ssd_class_info.get("class_source", "user_override")
+                background_removed = ssd_class_info.get("background_removed", False)
+                background_before = ssd_class_info.get("background_before", [])
+                if not ssd_class_info.get("logged", False):
+                    logging_logger.info("[CLASSES] source=%s class_names=%s", ssd_source, ssd_class_names)
+                if background_removed:
+                    logging_logger.warning(
+                        "[WARNING] background removido da lista de classes do dataset: before=%s after=%s",
+                        background_before or ssd_class_names,
+                        ssd_class_names,
+                    )
+            class_names = ssd_class_names
+            dataset_num_classes = ssd_dataset_num_classes
+            class_source = ssd_source
+            use_background = True
         else:
-            dataset_num_classes = inferred_train_classes
+            train_ann_classes, _ = _infer_dataset_classes_from_annotations(train_ann, "train", logging_logger)
+            val_ann_classes, _ = _infer_dataset_classes_from_annotations(val_ann, "val", logging_logger)
+            ann_dataset_classes = train_ann_classes or val_ann_classes
+
+            inferred_train_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(train_ds_full))
+            inferred_val_classes = _normalize_dataset_class_count(_infer_num_classes_from_dataset(val_ds_full))
+
+            dataset_num_classes: Optional[int] = None
+            if ann_dataset_classes is not None:
+                dataset_num_classes = ann_dataset_classes
+            elif configured_dataset_classes is not None:
+                dataset_num_classes = configured_dataset_classes
+            elif configured_model_num_classes is not None and configured_model_num_classes > 0:
+                dataset_num_classes = (
+                    max(1, configured_model_num_classes - 1) if use_background else configured_model_num_classes
+                )
+            else:
+                dataset_num_classes = inferred_train_classes
+
+            if dataset_num_classes is None:
+                dataset_num_classes = inferred_val_classes
+
+            if ann_dataset_classes is not None and dataset_num_classes is not None and dataset_num_classes != ann_dataset_classes:
+                logging_logger.warning(
+                    "[AUDIT] num_classes configurado/inferido (%s) difere do COCO (json=%s); usando configurado/inferido.",
+                    dataset_num_classes,
+                    ann_dataset_classes,
+                )
+
+            if dataset_num_classes is None:
+                raise ValueError("Não foi possível inferir num_classes a partir do dataset; verifique as categorias.")
+
+            if inferred_val_classes is not None and inferred_val_classes != dataset_num_classes:
+                logging_logger.warning(
+                    "[AUDIT] num_classes do val (%s) difere do train (%s); usando o do train.",
+                    inferred_val_classes,
+                    dataset_num_classes,
+                )
 
         looks_like_visdrone = _is_visdrone_dataset(dataset_dir, train_ds_full) or _is_visdrone_dataset(
             dataset_dir, val_ds_full
         )
 
         if dataset_num_classes is None:
-            dataset_num_classes = inferred_val_classes
-
-        if ann_dataset_classes is not None and dataset_num_classes is not None and dataset_num_classes != ann_dataset_classes:
-            logging_logger.warning(
-                "[AUDIT] num_classes configurado/inferido (%s) difere do COCO (json=%s); usando configurado/inferido.",
-                dataset_num_classes,
-                ann_dataset_classes,
-            )
-
-        if dataset_num_classes is None:
             raise ValueError("Não foi possível inferir num_classes a partir do dataset; verifique as categorias.")
 
-        if inferred_val_classes is not None and inferred_val_classes != dataset_num_classes:
-            logging_logger.warning(
-                "[AUDIT] num_classes do val (%s) difere do train (%s); usando o do train.",
-                inferred_val_classes,
-                dataset_num_classes,
-            )
-
-        class_names = getattr(train_ds_full, "class_names", [])
-        cat_id_to_label = getattr(train_ds_full, "cat_id_to_label", {})
-        label_to_cat_id = getattr(train_ds_full, "label_to_cat_id", {})
         meta = {
             "num_classes": dataset_num_classes,
             "class_names": class_names,
             "cat_id_to_label": cat_id_to_label,
             "label_to_cat_id": label_to_cat_id,
             "dataset_name": getattr(train_ds_full, "dataset_name", None),
+            "class_source": class_source,
             "git_commit": _current_git_commit(),
         }
 
@@ -2426,7 +2478,7 @@ def train_torchvision_detector(
             retinanet_expects_background = False
         expected_model_classes = dataset_num_classes + 1 if use_background and dataset_num_classes > 0 else dataset_num_classes
         model_num_classes = expected_model_classes
-        if configured_model_num_classes is not None and configured_model_num_classes > 0:
+        if algorithm_name != "SSD" and configured_model_num_classes is not None and configured_model_num_classes > 0:
             model_num_classes = configured_model_num_classes
             if configured_model_num_classes != expected_model_classes:
                 logging_logger.warning(
@@ -2440,6 +2492,23 @@ def train_torchvision_detector(
             dataset_num_classes,
             model_num_classes,
             "incluindo background" if use_background else "foreground only",
+        )
+
+        _write_args_yaml(
+            ckpt_dir / "args.yaml",
+            config,
+            early_config,
+            {
+                "algorithm": algorithm_name,
+                "epochs": config.epochs,
+                "epochs_to_run": epochs_to_run,
+                "val_mode": val_mode_requested,
+                "dataset_num_classes": dataset_num_classes,
+                "model_num_classes": model_num_classes,
+                "class_names": class_names,
+                "class_source": class_source,
+            },
+            logging_logger,
         )
 
         if is_retinanet:

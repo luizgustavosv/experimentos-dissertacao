@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from app.detectors.base import Logger
+from app.detectors.config import TrainConfig
 
 _VALID_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
@@ -398,3 +399,117 @@ def _load_voc_classes(dataset_root: Path) -> List[str]:
             "Não foi possível inferir classes do dataset Pascal VOC (labels.txt vazio e anotações sem classes)."
         )
     return classes
+
+
+def _remove_background_classes(
+    class_names: List[str],
+) -> tuple[List[str], bool, List[str]]:
+    if not class_names:
+        return class_names, False, class_names
+    background_aliases = {"background", "__background__", "bg"}
+    lowered = [name.strip() for name in class_names]
+    filtered = [name for name in lowered if name.lower() not in background_aliases]
+    return filtered, len(filtered) != len(lowered), lowered
+
+
+def _read_labels_file(labels_path: Optional[Path]) -> List[str]:
+    if not labels_path or not labels_path.exists():
+        return []
+    return [line.strip() for line in labels_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _infer_voc_classes_from_annotations(dataset_root: Path) -> List[str]:
+    annotation_dir = dataset_root / "Annotations"
+    if not annotation_dir.exists():
+        return []
+    found: Set[str] = set()
+    for xml_path in annotation_dir.glob("*.xml"):
+        tree = ET.parse(xml_path)
+        for obj in tree.findall("object"):
+            name = obj.findtext("name")
+            if name:
+                found.add(name.strip())
+    return sorted(found)
+
+
+def _infer_coco_classes_from_annotations(ann_path: Optional[Path], logging_logger: logging.Logger) -> List[str]:
+    if not ann_path:
+        return []
+    try:
+        data = json.loads(Path(ann_path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        logging_logger.warning("[DATASET] Não foi possível ler %s para inferir classes: %s", ann_path, exc)
+        return []
+
+    categories = data.get("categories")
+    if not isinstance(categories, list):
+        logging_logger.warning("[DATASET] Formato de categorias inválido em %s", ann_path)
+        return []
+
+    names = [str(cat.get("name")).strip() for cat in categories if cat.get("name")]
+    return [name for name in names if name]
+
+
+def resolve_ssd_dataset_classes(
+    config: TrainConfig,
+    dataset_root: Path,
+    *,
+    train_ann: Optional[Path] = None,
+    val_ann: Optional[Path] = None,
+    logging_logger: Optional[logging.Logger] = None,
+) -> tuple[List[str], int, str, bool, List[str]]:
+    """Resolve classes for SSD. dataset_num_classes = foreground; model_num_classes = foreground + background."""
+    labels_path = dataset_root / "labels.txt"
+    configured_classes = config.dataset_num_classes if config.dataset_num_classes is not None else config.num_classes
+    class_names: List[str] = []
+    source = ""
+    background_removed = False
+    background_before: List[str] = []
+
+    if configured_classes is not None:
+        labels = _read_labels_file(labels_path)
+        labels, removed, before = _remove_background_classes(labels)
+        background_removed = background_removed or removed
+        background_before = before if removed else background_before
+        if labels and len(labels) == configured_classes:
+            class_names = labels
+        else:
+            if labels and len(labels) != configured_classes:
+                logging_logger = logging_logger or logging.getLogger("train.ssd")
+                logging_logger.warning(
+                    "[CLASSES] labels.txt possui %d classes, mas config indica %d; usando placeholders.",
+                    len(labels),
+                    configured_classes,
+                )
+            class_names = [f"class_{idx+1}" for idx in range(int(configured_classes))]
+        source = "user_override"
+    else:
+        labels = _read_labels_file(labels_path)
+        labels, removed, before = _remove_background_classes(labels)
+        background_removed = background_removed or removed
+        background_before = before if removed else background_before
+        if labels:
+            class_names = labels
+            source = "labels.txt"
+        else:
+            voc_classes = _infer_voc_classes_from_annotations(dataset_root)
+            if voc_classes:
+                class_names, removed, before = _remove_background_classes(voc_classes)
+                background_removed = background_removed or removed
+                background_before = before if removed else background_before
+                source = "voc_xml"
+            else:
+                ann_path = train_ann or val_ann
+                logging_logger = logging_logger or logging.getLogger("train.ssd")
+                coco_classes = _infer_coco_classes_from_annotations(ann_path, logging_logger)
+                if coco_classes:
+                    class_names, removed, before = _remove_background_classes(coco_classes)
+                    background_removed = background_removed or removed
+                    background_before = before if removed else background_before
+                    source = "coco_json"
+
+    if not class_names:
+        raise ValueError("Não foi possível inferir classes do dataset; verifique labels.txt/annotations.")
+
+    dataset_num_classes = len(class_names)
+    return class_names, dataset_num_classes, source, background_removed, background_before
