@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 import re
 import time
@@ -16,7 +15,6 @@ from app.detectors.config import TrainConfig
 from app.detectors.utils import resolve_device
 from app.metrics import InferencePerformance, Metrics
 from app.reporting.reports import ReportBuilder
-from app.training.early_stopping import TrainLossEMAStopper
 
 
 def train_yolo(
@@ -42,85 +40,7 @@ def train_yolo(
     if logger and config.max_epochs is not None:
         logger(f"[YOLO][TRAIN] max_epochs ativo={config.max_epochs} -> epochs_to_run={epochs_to_run}")
 
-    stopper: Optional[TrainLossEMAStopper] = None
-    if config.early_stop_enabled:
-        try:
-            stopper = TrainLossEMAStopper(
-                patience=config.early_stop_patience,
-                min_delta=config.early_stop_min_delta,
-                min_epochs=config.early_stop_min_epochs,
-                ema_alpha=config.early_stop_ema_alpha,
-            )
-            if logger:
-                logger(
-                    "[YOLO][EARLY] Early stopping: patience=%d min_delta=%.4f min_epochs=%d ema_alpha=%.3f",
-                    config.early_stop_patience,
-                    config.early_stop_min_delta,
-                    config.early_stop_min_epochs,
-                    config.early_stop_ema_alpha,
-                )
-        except Exception:
-            stopper = None
-            if logger:
-                logger("[YOLO][EARLY] Falha ao inicializar early stopping; prosseguindo sem interrupção antecipada.")
-
     model = YOLO(str(pretrained_weights))
-
-    def _extract_loss(trainer) -> Optional[float]:
-        candidates = [getattr(trainer, attr, None) for attr in ("tloss", "loss")]
-        try:
-            metrics_loss = trainer.metrics.get("loss") if hasattr(trainer, "metrics") else None
-            candidates.append(metrics_loss)
-        except Exception:
-            candidates.append(None)
-        for value in candidates:
-            if value is None:
-                continue
-            try:
-                numeric = float(value.item()) if hasattr(value, "item") else float(value)
-                return numeric
-            except Exception:
-                continue
-        return None
-
-    def _on_train_epoch_end(trainer):  # type: ignore[unused-argument]
-        nonlocal stopper
-        if stopper is None:
-            return
-        avg_loss = _extract_loss(trainer)
-        if avg_loss is None or not math.isfinite(avg_loss):
-            if logger:
-                logger(
-                    "[YOLO][EARLY] Loss médio indisponível ou inválido (%.4f); desabilitando early stopping.",
-                    avg_loss if avg_loss is not None else float("nan"),
-                )
-            stopper = None
-            return
-        try:
-            epoch_idx = getattr(trainer, "epoch", 0) + 1
-            should_stop, ema_loss, best_ema, bad_epochs = stopper.update(epoch_idx, avg_loss)
-            if logger:
-                logger(
-                    "[YOLO][EARLY] epoch=%d avg_loss=%.4f ema_loss=%.4f best_ema=%.4f bad_epochs=%d/%d",
-                    epoch_idx,
-                    avg_loss,
-                    ema_loss,
-                    best_ema if best_ema is not None else float("nan"),
-                    bad_epochs,
-                    stopper.patience,
-                )
-            if should_stop:
-                setattr(trainer, "stop_training", True)
-                if logger:
-                    logger(
-                        "[YOLO][EARLY] Critério atingido após min_epochs=%d; sinalizando interrupção do treino.",
-                        stopper.min_epochs,
-                    )
-        except Exception:
-            if logger:
-                logger("[YOLO][EARLY] Erro ao atualizar early stopping; desativando recurso.")
-            stopper = None
-
     ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
 
     def _strip_ansi(value: str) -> str:
@@ -128,16 +48,28 @@ def train_yolo(
 
         return ansi_escape.sub("", value)
 
+    early_enabled = bool(config.early_stop_enabled)
+    patience = int(config.early_stop_patience) if early_enabled else 0
+    if logger:
+        logger(
+            f"[YOLO][TRAIN] algoritmo=YOLO epochs={epochs_to_run} early_stopping_enabled={early_enabled} "
+            f"patience={patience} monitor=mAP50-95 mode=max min_delta={config.early_stop_min_delta:.4f} "
+            f"min_epochs={config.early_stop_min_epochs}"
+        )
+        if early_enabled:
+            logger(
+                f"[YOLO][EARLY] Ultralytics usará patience={patience} "
+                "(min_delta/min_epochs/ema_alpha ignorados pelo backend)."
+            )
+
     train_kwargs: Dict[str, object] = {
         "data": str(dataset_yaml),
         "epochs": epochs_to_run,
         "project": str(output_dir),
         "name": "yolo_visdrone",
         "verbose": True,
+        "patience": patience,
     }
-
-    if stopper:
-        model.add_callback("on_train_epoch_end", _on_train_epoch_end)
 
     train_kwargs = {
         key: _strip_ansi(str(value)) if isinstance(value, str) else value
