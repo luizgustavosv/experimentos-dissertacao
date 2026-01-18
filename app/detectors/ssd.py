@@ -15,7 +15,7 @@ from app.detectors.config import TrainConfig
 from app.detectors.dataset_voc import PascalVOCDataset
 from app.detectors.torchvision_detectors import TorchvisionDetector
 from app.detectors.torchvision_train import train_torchvision_detector
-from app.detectors.utils import resolve_device, validate_voc_dataset
+from app.detectors.utils import resolve_device, resolve_ssd_dataset_classes, validate_voc_dataset
 from normalize_dataset import build_imagesets_main, normalize_to_voc, validate_voc_dataset as robust_validate
 
 
@@ -49,16 +49,25 @@ class SSDDetector(TorchvisionDetector):
             val_ids, val_meta = val_split
         else:
             val_ids, val_meta = val_split, []
-        class_to_idx = {"human": 1}
+        class_names, dataset_num_classes, class_source, background_removed, background_before = resolve_ssd_dataset_classes(
+            self.config,
+            dataset_root,
+            train_ann=None,
+            val_ann=None,
+            logging_logger=diag_logger,
+        )
+        class_to_idx = {name: idx + 1 for idx, name in enumerate(class_names)}
         device_str = resolve_device(self.config.device)
-        num_classes = 2
+        model_num_classes = dataset_num_classes + 1
 
         if logger:
-            logger(f"[TRAIN] {self.context.name} em {device_str} com {num_classes} classes (Pascal VOC)")
+            logger(
+                f"[TRAIN] {self.context.name} em {device_str} com {model_num_classes} classes (Pascal VOC)"
+            )
             logger(f"[DATA] Raiz do dataset VOC: {dataset_root}")
             logger(f"[DATA] Splits: train={len(train_ids)}, val={len(val_ids)}")
             logger(f"[DATA] Classes detectadas no VOC: {', '.join(class_names)}")
-            logger("[SSD] num_classes_experiment=2 (background+human)")
+            logger(f"[DATA] Fonte das classes: {class_source}")
 
         transform = transforms.Compose([transforms.ToTensor()])
         train_dataset = PascalVOCDataset(
@@ -69,7 +78,7 @@ class SSDDetector(TorchvisionDetector):
             logger=diag_logger if ssd_debug else None,
             debug=ssd_debug,
             split_metadata=train_meta,
-            num_classes=num_classes,
+            num_classes=model_num_classes,
         )
         val_dataset = PascalVOCDataset(
             dataset_root,
@@ -79,10 +88,10 @@ class SSDDetector(TorchvisionDetector):
             logger=diag_logger if ssd_debug else None,
             debug=False,
             split_metadata=val_meta,
-            num_classes=num_classes,
+            num_classes=model_num_classes,
         )
 
-        model = self._build_ssd_model(num_classes, pretrained_weights, logger)
+        model = self._build_ssd_model(model_num_classes, pretrained_weights, logger)
         metrics = train_torchvision_detector(
             model,
             dataset_root,
@@ -113,11 +122,20 @@ class SSDDetector(TorchvisionDetector):
                 early_stop_min_delta=self.config.early_stop_min_delta,
                 early_stop_min_epochs=self.config.early_stop_min_epochs,
                 early_stop_ema_alpha=self.config.early_stop_ema_alpha,
+                dataset_num_classes=dataset_num_classes,
             ),
             logger=logger,
             val_ratio=0.0,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
+            ssd_class_info={
+                "class_names": class_names,
+                "dataset_num_classes": dataset_num_classes,
+                "class_source": class_source,
+                "background_removed": background_removed,
+                "background_before": background_before,
+                "logged": False,
+            },
         )
         return metrics
 
