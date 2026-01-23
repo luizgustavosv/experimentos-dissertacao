@@ -17,7 +17,13 @@ from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from app.detectors.base import Logger
 from app.detectors.dataset_voc import PascalVOCDataset
 from app.detectors.torchvision_models import build_ssd
-from app.detectors.utils import resolve_device, validate_voc_dataset
+from app.detectors.utils import (
+    infer_ssd_num_classes,
+    load_ssd_weights,
+    resolve_device,
+    resolve_ssd_run_config,
+    validate_voc_dataset,
+)
 
 
 _PREDICTION_KEYS = ("boxes", "scores", "labels")
@@ -100,6 +106,8 @@ def evaluate_torchvision_ssd_voc(
     logger: Optional[Logger] = None,
     log_cb: Optional[Callable[[str], None]] = None,
     progress_every: int = 50,
+    strict_weights: bool = True,
+    strict_head: bool = True,
 ) -> dict:
     dataset_root, class_names, train_ids, val_ids = validate_voc_dataset(Path(voc_root))
     split_normalized = split.lower().strip()
@@ -130,13 +138,73 @@ def evaluate_torchvision_ssd_voc(
     progress_every = max(1, progress_every)
 
     transform = transforms.Compose([transforms.ToTensor()])
-    dataset = PascalVOCDataset(dataset_root, available_ids[split_normalized], {"human": 1}, transforms=transform)
+    class_to_idx = {name: idx + 1 for idx, name in enumerate(class_names)}
+    dataset = PascalVOCDataset(dataset_root, available_ids[split_normalized], class_to_idx, transforms=transform)
     _emit(f"[EVAL] Total de imagens no split '{split_normalized}': {len(dataset)}")
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=ssd_collate_fn)
 
-    model = build_ssd(num_classes=2)
-    state_dict = torch.load(Path(weights_path), map_location=torch_device)
-    model.load_state_dict(state_dict)
+    weights_resolved = Path(weights_path).expanduser().resolve()
+    args_info = resolve_ssd_run_config(weights_resolved, logger=_emit)
+    loaded = torch.load(weights_resolved, map_location=torch_device)
+    meta = loaded.get("meta") if isinstance(loaded, dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+    meta_dataset_num = meta.get("dataset_num_classes") or meta.get("num_classes")
+    meta_model_num = meta.get("model_num_classes")
+    meta_backbone = meta.get("backbone")
+    meta_imgsz = meta.get("imgsz")
+
+    expected_model_num = args_info.get("model_num_classes") or meta_model_num
+    expected_dataset_num = args_info.get("dataset_num_classes") or meta_dataset_num
+    if expected_model_num is None and isinstance(expected_dataset_num, int):
+        expected_model_num = expected_dataset_num + 1
+
+    state_dict = None
+    if isinstance(loaded, dict):
+        state_dict = loaded.get("model_state") or loaded.get("state_dict") or loaded.get("model")
+    if not isinstance(state_dict, dict) and isinstance(loaded, dict):
+        state_dict = loaded if loaded and all(torch.is_tensor(v) for v in loaded.values()) else None
+    if not isinstance(state_dict, dict):
+        state_dict = None
+    ckpt_num_classes = infer_ssd_num_classes(state_dict or {}, logger=_emit)
+
+    if expected_model_num is None:
+        expected_model_num = ckpt_num_classes or (len(class_names) + 1)
+
+    _emit(f"[EVAL][SSD] weights_path={weights_resolved}")
+    if args_info:
+        _emit(
+            "[EVAL][SSD] args.yaml="
+            f"{args_info.get('args_path')} dataset_num_classes={args_info.get('dataset_num_classes')} "
+            f"model_num_classes={args_info.get('model_num_classes')} backbone={args_info.get('backbone')} "
+            f"imgsz={args_info.get('imgsz')}"
+        )
+    if meta:
+        _emit(
+            "[EVAL][SSD] meta="
+            f"dataset_num_classes={meta_dataset_num} model_num_classes={meta_model_num} "
+            f"backbone={meta_backbone} imgsz={meta_imgsz}"
+        )
+    _emit(
+        "[EVAL][SSD] num_classes_model="
+        f"{expected_model_num} num_classes_ckpt={ckpt_num_classes} strict={strict_weights} strict_head={strict_head}"
+    )
+    if args_info.get("backbone") and args_info.get("backbone") != "vgg16":
+        _emit(f"[EVAL][SSD][WARN] backbone esperado={args_info.get('backbone')} porém build_ssd usa vgg16.")
+    if meta_backbone and meta_backbone != "vgg16":
+        _emit(f"[EVAL][SSD][WARN] backbone do checkpoint={meta_backbone} porém build_ssd usa vgg16.")
+
+    model = build_ssd(num_classes=int(expected_model_num))
+    load_ssd_weights(
+        model,
+        weights_resolved,
+        torch_device,
+        strict=strict_weights,
+        strict_head=strict_head,
+        expected_num_classes=int(expected_model_num),
+        loaded=loaded,
+        logger=_emit,
+    )
     model.to(torch_device)
     model.eval()
 

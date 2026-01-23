@@ -51,3 +51,11 @@ Os detectores reais podem ser obtidos em repositórios abertos:
 
 Substitua os _stubs_ no diretório `app/detectors` quando adicionar os modelos
 reais e ajuste as chamadas de treino/validação conforme o seu pipeline.
+
+### SSD: formatos de pesos suportados
+
+A validação do SSD aceita pesos em dois formatos: `state_dict` puro ou checkpoint
+com metadados (`model_state`/`state_dict`/`model`). Quando disponível, o
+`args.yaml` do run (ou o campo `meta` do checkpoint) define `dataset_num_classes`
+e `model_num_classes` para reconstrução do modelo; caso contrário, o número de
+classes é inferido a partir do próprio `state_dict`.

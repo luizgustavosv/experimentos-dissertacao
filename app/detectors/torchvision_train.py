@@ -2494,6 +2494,16 @@ def train_torchvision_detector(
             "incluindo background" if use_background else "foreground only",
         )
 
+        meta.update(
+            {
+                "dataset_num_classes": dataset_num_classes,
+                "model_num_classes": model_num_classes,
+                "imgsz": config.imgsz,
+            }
+        )
+        if algorithm_name == "SSD":
+            meta["backbone"] = "vgg16"
+
         _write_args_yaml(
             ckpt_dir / "args.yaml",
             config,
@@ -2507,6 +2517,8 @@ def train_torchvision_detector(
                 "model_num_classes": model_num_classes,
                 "class_names": class_names,
                 "class_source": class_source,
+                "backbone": "vgg16" if algorithm_name == "SSD" else None,
+                "imgsz": config.imgsz,
             },
             logging_logger,
         )
@@ -3011,7 +3023,12 @@ def train_torchvision_detector(
                             if improved:
                                 with _watchdog_paused(last_progress, watchdog_pause):
                                     atomic_torch_save(
-                                        {"model": model.state_dict(), "meta": meta, "early_stopping": stopper.state_dict()},
+                                        {
+                                            "model_state": model.state_dict(),
+                                            "model": model.state_dict(),
+                                            "meta": meta,
+                                            "early_stopping": stopper.state_dict(),
+                                        },
                                         best_by_monitor_path,
                                     )
                                 logging_logger.info("[EARLY] Novo melhor AP; checkpoint salvo em %s", best_by_monitor_path)
@@ -3052,7 +3069,12 @@ def train_torchvision_detector(
                             if improved:
                                 with _watchdog_paused(last_progress, watchdog_pause):
                                     atomic_torch_save(
-                                        {"model": model.state_dict(), "meta": meta, "early_stopping": stopper.state_dict()},
+                                        {
+                                            "model_state": model.state_dict(),
+                                            "model": model.state_dict(),
+                                            "meta": meta,
+                                            "early_stopping": stopper.state_dict(),
+                                        },
                                         best_by_monitor_path,
                                     )
                                 logging_logger.info("[EARLY] Novo melhor %s; checkpoint salvo em %s", monitor_label, best_by_monitor_path)
@@ -3099,7 +3121,7 @@ def train_torchvision_detector(
 
         with _watchdog_paused(last_progress, watchdog_pause):
             logging_logger.info("Salvando pesos em %s", out)
-            atomic_torch_save({"model": model.state_dict(), "meta": meta}, out)
+            atomic_torch_save({"model_state": model.state_dict(), "model": model.state_dict(), "meta": meta}, out)
             ensure_weights_size(out, logger=logging_logger.info)
             weights_out = out
             logging_logger.info("Treinamento finalizado com sucesso.")
