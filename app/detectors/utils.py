@@ -8,10 +8,11 @@ import shutil
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 from torch.utils.data import DataLoader
+import yaml
 
 from app.detectors.base import Logger
 from app.detectors.config import TrainConfig
@@ -147,6 +148,218 @@ def _looks_like_state_dict(obj: Any) -> bool:
         if obj and all(torch.is_tensor(v) for v in obj.values()):
             return True
     return False
+
+
+def strip_state_dict_prefixes(state_dict: Dict[str, torch.Tensor], prefixes: Sequence[str]) -> Dict[str, torch.Tensor]:
+    filtered: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for prefix in prefixes:
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix):]
+        filtered[new_key] = value
+    return filtered
+
+
+def extract_checkpoint_state(loaded: Any) -> tuple[Dict[str, torch.Tensor], str]:
+    if isinstance(loaded, dict):
+        if isinstance(loaded.get("model_state"), dict):
+            return loaded["model_state"], "checkpoint.model_state"
+        if isinstance(loaded.get("state_dict"), dict):
+            return loaded["state_dict"], "checkpoint.state_dict"
+        if isinstance(loaded.get("model"), dict):
+            return loaded["model"], "checkpoint.model"
+        if loaded and all(torch.is_tensor(v) for v in loaded.values()):
+            return loaded, "state_dict"
+    if isinstance(loaded, dict) and not loaded:
+        return {}, "state_dict.empty"
+    raise ValueError("Formato de checkpoint não suportado para carregamento de pesos.")
+
+
+def extract_checkpoint_meta(loaded: Any) -> Dict[str, Any]:
+    if isinstance(loaded, dict) and isinstance(loaded.get("meta"), dict):
+        return loaded["meta"]
+    return {}
+
+
+def _ssd_priors_per_location() -> Sequence[int]:
+    from torchvision.models.detection import ssd300_vgg16
+
+    model = ssd300_vgg16(weights=None, weights_backbone=None, num_classes=91)
+    return model.anchor_generator.num_anchors_per_location()
+
+
+def infer_ssd_num_classes(state_dict: Dict[str, torch.Tensor], logger: Optional[Logger] = None) -> Optional[int]:
+    priors = _ssd_priors_per_location()
+    for idx, prior in enumerate(priors):
+        key = f"head.classification_head.module_list.{idx}.bias"
+        if key not in state_dict:
+            continue
+        bias_len = state_dict[key].numel()
+        if bias_len % prior == 0:
+            num_classes = bias_len // prior
+            if logger:
+                logger(f"[SSD][WEIGHTS] Inferido num_classes={num_classes} a partir do state_dict (prior={prior}).")
+            return int(num_classes)
+    if logger:
+        logger("[SSD][WEIGHTS] Falha ao inferir num_classes do state_dict.")
+    return None
+
+
+def filter_ssd_state_dict(state_dict: Dict[str, torch.Tensor], drop_heads: bool) -> tuple[Dict[str, torch.Tensor], List[str]]:
+    head_markers = (
+        "head.classification_head",
+        "head.regression_head",
+        "cls_headers",
+        "box_headers",
+        ".cls.",
+        ".cls_",
+        ".conf",
+        ".bbox",
+        ".box",
+        ".reg",
+        ".loc",
+    )
+    filtered: Dict[str, torch.Tensor] = {}
+    removed: List[str] = []
+    for key, value in state_dict.items():
+        lower_key = key.lower()
+        if lower_key.startswith("backbone."):
+            filtered[key] = value
+            continue
+        if drop_heads and any(marker in lower_key for marker in head_markers):
+            removed.append(key)
+            continue
+        filtered[key] = value
+    return filtered, removed
+
+
+def find_args_yaml(weights_path: Path) -> Optional[Path]:
+    weights_path = weights_path.expanduser().resolve()
+    candidates = [weights_path.parent / "args.yaml", weights_path.parent.parent / "args.yaml"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def read_args_yaml(path: Path, logger: Optional[Logger] = None) -> Optional[Dict[str, Any]]:
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        if logger:
+            logger(f"[RUN] Falha ao ler args.yaml em {path}: {exc}")
+        return None
+    if not isinstance(payload, dict):
+        if logger:
+            logger(f"[RUN] args.yaml inválido em {path}: esperado dict, obtido {type(payload).__name__}.")
+        return None
+    return payload
+
+
+def resolve_ssd_run_config(weights_path: Path, logger: Optional[Logger] = None) -> Dict[str, Any]:
+    args_path = find_args_yaml(weights_path)
+    if not args_path:
+        return {}
+
+    payload = read_args_yaml(args_path, logger=logger)
+    if not payload:
+        return {}
+
+    train_config = payload.get("train_config") if isinstance(payload.get("train_config"), dict) else {}
+
+    dataset_num_classes = (
+        payload.get("dataset_num_classes")
+        if isinstance(payload.get("dataset_num_classes"), int)
+        else train_config.get("dataset_num_classes")
+    )
+    if not isinstance(dataset_num_classes, int):
+        dataset_num_classes = train_config.get("num_classes") if isinstance(train_config.get("num_classes"), int) else None
+
+    model_num_classes = (
+        payload.get("model_num_classes")
+        if isinstance(payload.get("model_num_classes"), int)
+        else train_config.get("model_num_classes")
+    )
+    if not isinstance(model_num_classes, int) and isinstance(dataset_num_classes, int):
+        model_num_classes = dataset_num_classes + 1
+
+    backbone = payload.get("backbone") or train_config.get("backbone")
+    imgsz = payload.get("imgsz") or train_config.get("imgsz")
+
+    return {
+        "args_path": args_path,
+        "dataset_num_classes": dataset_num_classes,
+        "model_num_classes": model_num_classes,
+        "backbone": backbone,
+        "imgsz": imgsz,
+    }
+
+
+def load_ssd_weights(
+    model: torch.nn.Module,
+    weights_path: Path,
+    device: torch.device,
+    *,
+    strict: bool = True,
+    strict_head: bool = True,
+    expected_num_classes: Optional[int] = None,
+    loaded: Any = None,
+    logger: Optional[Logger] = None,
+) -> Dict[str, Any]:
+    weights_path = weights_path.expanduser().resolve()
+    if loaded is None:
+        loaded = torch.load(weights_path, map_location=device)
+
+    top_keys = sorted(list(loaded.keys())) if isinstance(loaded, dict) else []
+    if logger and top_keys:
+        logger(f"[SSD][WEIGHTS] checkpoint_keys={top_keys}")
+
+    meta = extract_checkpoint_meta(loaded)
+    state_dict, checkpoint_format = extract_checkpoint_state(loaded)
+    state_dict = strip_state_dict_prefixes(state_dict, ["module.", "model."])
+
+    ckpt_num_classes = infer_ssd_num_classes(state_dict, logger=logger)
+    filtered_state_dict = state_dict
+    removed_keys: List[str] = []
+    strict_load = strict
+
+    if not strict_head and expected_num_classes and ckpt_num_classes and expected_num_classes != ckpt_num_classes:
+        filtered_state_dict, removed_keys = filter_ssd_state_dict(state_dict, drop_heads=True)
+        strict_load = False
+        if logger:
+            logger(
+                "[SSD][WEIGHTS][WARN] ckpt_num_classes="
+                f"{ckpt_num_classes} != model_num_classes={expected_num_classes}; "
+                "carregando backbone com strict=False e head reiniciado."
+            )
+
+    incompatible = model.load_state_dict(filtered_state_dict, strict=strict_load)
+    missing = list(getattr(incompatible, "missing_keys", []))
+    unexpected = list(getattr(incompatible, "unexpected_keys", []))
+
+    if logger:
+        logger(
+            f"[SSD][WEIGHTS] load_state_dict strict={strict_load} missing={len(missing)} unexpected={len(unexpected)}"
+        )
+        if missing:
+            logger(f"[SSD][WEIGHTS] missing_keys_sample={missing[:5]}")
+        if unexpected:
+            logger(f"[SSD][WEIGHTS] unexpected_keys_sample={unexpected[:5]}")
+        if removed_keys:
+            logger(f"[SSD][WEIGHTS] removed_head_keys={len(removed_keys)}")
+
+    return {
+        "loaded": loaded,
+        "meta": meta,
+        "state_dict": state_dict,
+        "checkpoint_format": checkpoint_format,
+        "ckpt_num_classes": ckpt_num_classes,
+        "missing": missing,
+        "unexpected": unexpected,
+        "removed_keys": removed_keys,
+        "strict_load": strict_load,
+    }
 
 
 def ensure_weights_size(
