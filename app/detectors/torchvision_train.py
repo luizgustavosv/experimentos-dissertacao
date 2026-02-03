@@ -37,7 +37,6 @@ from app.detectors.dataset_coco import (
     DetectionTransformCompose,
 )
 from app.detectors.utils import (
-    atomic_torch_save,
     coco_collate,
     describe_dataloader,
     ensure_weights_size,
@@ -46,6 +45,7 @@ from app.detectors.utils import (
     seed_everything,
 )
 from app.metrics import Metrics
+from app.training.checkpointing import CheckpointManager, CheckpointPolicy
 from app.training.early_stopping import EarlyStopping, EarlyStoppingConfig
 
 try:
@@ -2257,6 +2257,22 @@ def train_torchvision_detector(
         },
         logging_logger,
     )
+    config_snapshot = {field.name: _serialize_value(getattr(config, field.name)) for field in fields(TrainConfig)}
+    output_root = Path(weights_out).expanduser().resolve()
+    if output_root.suffix.lower() in {".pth", ".pt"}:
+        output_root = output_root.parent
+    checkpoint_manager = CheckpointManager(
+        output_root,
+        CheckpointPolicy(
+            save_final=config.save_final,
+            save_best=config.save_best,
+            save_every=config.save_every,
+            keep_last_k=config.keep_last_k,
+            monitor_metric=config.monitor_metric,
+            mode=config.mode,
+        ),
+        logger=logging_logger,
+    )
 
     watchdog_stop: Optional[threading.Event] = None
     watchdog_pause: Optional[threading.Event] = None
@@ -2265,7 +2281,9 @@ def train_torchvision_detector(
     epoch = 0
     epochs_completed = 0
     optimizer: Optional[torch.optim.Optimizer] = None
+    lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
     meta: dict[str, Any] = {}
+    stopper: Optional[EarlyStopping] = None
     try:
         val_ratio_to_use = config.val_ratio if val_ratio is None else val_ratio
 
@@ -2618,8 +2636,6 @@ def train_torchvision_detector(
         if algorithm_name == "SSD" and ssd_debug:
             _run_ssd_probe(train_loader, logging_logger, limit=50)
 
-        stopper: Optional[EarlyStopping] = None
-        best_by_monitor_path = ckpt_dir / "best_by_monitor.pth"
         ema_val_loss: Optional[float] = None
         if early_config.enabled:
             try:
@@ -2670,6 +2686,9 @@ def train_torchvision_detector(
         log_every_batches = max(1, config.log_every)
         stop_training_flag = False
         last_ok_sample: list[str] = []
+        last_metrics: dict[str, Any] = {}
+        final_saved = False
+        training_finished = False
 
         epochs_completed = 0
         for epoch in range(1, epochs_to_run + 1):
@@ -3020,18 +3039,6 @@ def train_torchvision_detector(
                                 stopper.num_bad_epochs,
                                 stopper.patience,
                             )
-                            if improved:
-                                with _watchdog_paused(last_progress, watchdog_pause):
-                                    atomic_torch_save(
-                                        {
-                                            "model_state": model.state_dict(),
-                                            "model": model.state_dict(),
-                                            "meta": meta,
-                                            "early_stopping": stopper.state_dict(),
-                                        },
-                                        best_by_monitor_path,
-                                    )
-                                logging_logger.info("[EARLY] Novo melhor AP; checkpoint salvo em %s", best_by_monitor_path)
                             if should_stop:
                                 logging_logger.info(
                                     "[EARLY] Critério de paciência alcançado após min_epochs=%d; encerrando treinamento.",
@@ -3066,18 +3073,6 @@ def train_torchvision_detector(
                                 stopper.num_bad_epochs,
                                 stopper.patience,
                             )
-                            if improved:
-                                with _watchdog_paused(last_progress, watchdog_pause):
-                                    atomic_torch_save(
-                                        {
-                                            "model_state": model.state_dict(),
-                                            "model": model.state_dict(),
-                                            "meta": meta,
-                                            "early_stopping": stopper.state_dict(),
-                                        },
-                                        best_by_monitor_path,
-                                    )
-                                logging_logger.info("[EARLY] Novo melhor %s; checkpoint salvo em %s", monitor_label, best_by_monitor_path)
                             if should_stop:
                                 logging_logger.info(
                                     "[EARLY] Critério de paciência alcançado após min_epochs=%d; encerrando treinamento.",
@@ -3088,20 +3083,38 @@ def train_torchvision_detector(
                     logging_logger.exception("[EARLY] Falha ao processar early stopping; desabilitando.")
                     stopper = None
 
+            metrics_dict: dict[str, Any] = {
+                "train_loss": float(avg_loss),
+                "val_loss": float(val_loss_mean_per_batch),
+                "val_loss_per_image": float(val_loss_mean_per_image),
+            }
+            if val_mode == "metrics":
+                metrics_valid = bool(val_metrics_result.get("metrics_valid", True))
+                val_map = val_metrics_result.get("coco_metrics", {}).get("AP") if metrics_valid else None
+                metrics_dict["val_map"] = float(val_map) if val_map is not None else None
+            else:
+                metrics_dict["val_map"] = None
+            last_metrics = metrics_dict
+
             with _watchdog_paused(last_progress, watchdog_pause):
-                epoch_ckpt = ckpt_dir / f"epoch_{epoch:03d}.pth"
-                atomic_torch_save(
-                    {
-                        "epoch": epoch,
-                        "model_state": model.state_dict(),
-                        "optimizer_state": optimizer.state_dict() if optimizer else None,
-                        "loss": float(avg_loss),
-                        "meta": meta,
-                        "early_stopping": stopper.state_dict() if stopper else None,
-                    },
-                    epoch_ckpt,
+                checkpoint_manager.save_best_if_improved(
+                    epoch=epoch,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=lr_scheduler,
+                    metrics=metrics_dict,
+                    config=config_snapshot,
+                    extra={"meta": meta, "early_stopping": stopper.state_dict() if stopper else None},
                 )
-                logging_logger.info("Checkpoint da época %d salvo em %s", epoch, epoch_ckpt)
+                checkpoint_manager.save_periodic(
+                    epoch=epoch,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=lr_scheduler,
+                    metrics=metrics_dict,
+                    config=config_snapshot,
+                    extra={"meta": meta, "early_stopping": stopper.state_dict() if stopper else None},
+                )
 
             epochs_completed = epoch
             if stop_training_flag:
@@ -3110,21 +3123,22 @@ def train_torchvision_detector(
         watchdog_stop.set()
         watchdog_thread.join(timeout=1)
 
-        weights_out = weights_out.expanduser().resolve()
-        out = weights_out
-        if out.suffix.lower() not in (".pth", ".pt"):
-            out.mkdir(parents=True, exist_ok=True)
-            out = out / "last.pth"
-        else:
-            out.parent.mkdir(parents=True, exist_ok=True)
-        out = out.with_suffix(".pth")
-
+        training_finished = True
         with _watchdog_paused(last_progress, watchdog_pause):
-            logging_logger.info("Salvando pesos em %s", out)
-            atomic_torch_save({"model_state": model.state_dict(), "model": model.state_dict(), "meta": meta}, out)
-            ensure_weights_size(out, logger=logging_logger.info)
-            weights_out = out
+            final_path = checkpoint_manager.save_final(
+                epoch=epochs_completed or epochs_to_run,
+                model=model,
+                optimizer=optimizer,
+                scheduler=lr_scheduler,
+                metrics=last_metrics,
+                config=config_snapshot,
+                extra={"meta": meta, "early_stopping": stopper.state_dict() if stopper else None},
+            )
+            if final_path:
+                ensure_weights_size(final_path, logger=logging_logger.info)
+                weights_out = final_path
             logging_logger.info("Treinamento finalizado com sucesso.")
+            final_saved = final_path is not None
 
         return Metrics(
             precision=0.0,
@@ -3142,23 +3156,20 @@ def train_torchvision_detector(
         logging_logger.exception("Exceção não tratada durante o treinamento.")
         raise
     finally:
-        try:
-            with _watchdog_paused(last_progress, watchdog_pause):
-                final_epoch = epochs_completed if epochs_completed else 0
-                last_ckpt = ckpt_dir / "last.pth"
-                atomic_torch_save(
-                    {
-                        "epoch": final_epoch,
-                        "model_state": model.state_dict(),
-                        "optimizer_state": optimizer.state_dict() if optimizer else None,
-                        "meta": meta,
-                        "early_stopping": stopper.state_dict() if stopper else None,
-                    },
-                    last_ckpt,
-                )
-                logging_logger.info("Checkpoint final salvo em %s", last_ckpt)
-        except Exception:
-            logging_logger.exception("Falha ao salvar checkpoint final.")
+        if training_finished and not final_saved:
+            try:
+                with _watchdog_paused(last_progress, watchdog_pause):
+                    checkpoint_manager.save_final(
+                        epoch=epochs_completed if epochs_completed else 0,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        metrics=last_metrics,
+                        config=config_snapshot,
+                        extra={"meta": meta, "early_stopping": stopper.state_dict() if stopper else None},
+                    )
+            except Exception:
+                logging_logger.exception("Falha ao salvar checkpoint final.")
         if watchdog_stop:
             watchdog_stop.set()
         if watchdog_thread:

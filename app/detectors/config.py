@@ -41,3 +41,11 @@ class TrainConfig:
     early_stop_min_epochs: int = 10
     early_stop_ema_alpha: float = 0.2
     legacy_retinanet_compat: bool = False
+    # Checkpoint enxuto (SSD/Torchvision): final, best e periódicos com retenção.
+    save_final: bool = True
+    save_best: bool = True
+    save_every: int = 10
+    keep_last_k: int = 3
+    monitor_metric: str = "val_map"
+    mode: Literal["max", "min"] = "max"
+    # Exemplo: save_best=True, save_final=True, save_every=10, keep_last_k=3, monitor_metric="val_map", mode="max"

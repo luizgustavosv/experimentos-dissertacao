@@ -100,6 +100,12 @@ class TorchvisionDetector(DetectionAlgorithm):
                 early_stop_min_delta=self.config.early_stop_min_delta,
                 early_stop_min_epochs=self.config.early_stop_min_epochs,
                 early_stop_ema_alpha=self.config.early_stop_ema_alpha,
+                save_final=self.config.save_final,
+                save_best=self.config.save_best,
+                save_every=self.config.save_every,
+                keep_last_k=self.config.keep_last_k,
+                monitor_metric=self.config.monitor_metric,
+                mode=self.config.mode,
             ),
             logger=logger,
         )
