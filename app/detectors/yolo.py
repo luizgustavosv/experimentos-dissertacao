@@ -17,6 +17,41 @@ from app.metrics import InferencePerformance, Metrics
 from app.reporting.reports import ReportBuilder
 
 
+def _prune_yolo_epoch_checkpoints(weights_dir: Path, keep_epoch: Optional[int], logger: Optional[Logger] = None) -> None:
+    """Mantém apenas o checkpoint da última época concluída e remove os demais."""
+
+    if not weights_dir.exists():
+        return
+
+    epoch_pattern = re.compile(r"^epoch(\d+)\.pt$")
+    epoch_checkpoints: List[tuple[int, Path]] = []
+    for path in weights_dir.glob("epoch*.pt"):
+        match = epoch_pattern.match(path.name)
+        if not match:
+            continue
+        epoch_checkpoints.append((int(match.group(1)), path))
+
+    if not epoch_checkpoints:
+        return
+
+    epoch_checkpoints.sort(key=lambda item: item[0])
+    if keep_epoch is None:
+        keep_epoch = epoch_checkpoints[-1][0]
+
+    for epoch_idx, ckpt_path in epoch_checkpoints:
+        if epoch_idx == keep_epoch:
+            continue
+        try:
+            ckpt_path.unlink()
+            if logger:
+                logger(f"[YOLO][CHECKPOINT] Removido checkpoint antigo: {ckpt_path.name}")
+        except FileNotFoundError:
+            continue
+        except Exception as exc:  # pragma: no cover - proteção defensiva
+            if logger:
+                logger(f"[YOLO][CHECKPOINT] Falha ao remover {ckpt_path.name}: {exc}")
+
+
 def train_yolo(
     dataset_yaml: str,
     pretrained_weights: str,
@@ -69,6 +104,8 @@ def train_yolo(
         "name": "yolo_visdrone",
         "verbose": True,
         "patience": patience,
+        "save": True,
+        "save_period": 1,
     }
 
     train_kwargs = {
@@ -81,6 +118,16 @@ def train_yolo(
 
     if logger:
         logger(f"[YOLO][CLI] Comando final: {cli_cmd}")
+
+    def _cleanup_epoch_checkpoints(trainer) -> None:  # pragma: no cover - depende do backend Ultralytics
+        save_dir = Path(getattr(trainer, "save_dir", output_dir / "yolo_visdrone"))
+        weights_dir = save_dir / "weights"
+        current_epoch = int(getattr(trainer, "epoch", -1))
+        keep_epoch = current_epoch if current_epoch > 0 else None
+        _prune_yolo_epoch_checkpoints(weights_dir, keep_epoch=keep_epoch, logger=logger)
+
+    model.add_callback("on_fit_epoch_end", _cleanup_epoch_checkpoints)
+    model.add_callback("on_train_end", _cleanup_epoch_checkpoints)
 
     model.train(**train_kwargs)
 
