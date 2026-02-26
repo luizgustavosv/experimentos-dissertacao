@@ -2261,13 +2261,30 @@ def train_torchvision_detector(
     output_root = Path(weights_out).expanduser().resolve()
     if output_root.suffix.lower() in {".pth", ".pt"}:
         output_root = output_root.parent
+    effective_save_final = False
+    effective_save_every = 1
+    effective_keep_last_k = 1
+
+    if (
+        config.save_final != effective_save_final
+        or config.save_every != effective_save_every
+        or config.keep_last_k != effective_keep_last_k
+    ):
+        logging_logger.info(
+            "[CHECKPOINT] Política forçada para tolerância a reinício do sistema: "
+            "save_final=%s save_every=%s keep_last_k=%s",
+            effective_save_final,
+            effective_save_every,
+            effective_keep_last_k,
+        )
+
     checkpoint_manager = CheckpointManager(
         output_root,
         CheckpointPolicy(
-            save_final=config.save_final,
+            save_final=effective_save_final,
             save_best=config.save_best,
-            save_every=config.save_every,
-            keep_last_k=config.keep_last_k,
+            save_every=effective_save_every,
+            keep_last_k=effective_keep_last_k,
             monitor_metric=config.monitor_metric,
             mode=config.mode,
         ),
