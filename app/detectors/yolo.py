@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import torch
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -14,6 +15,7 @@ from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.utils import resolve_device
 from app.metrics import InferencePerformance, Metrics
+from app.training.checkpoint_manager import CheckpointManager, get_latest_last_checkpoint
 from app.reporting.reports import ReportBuilder
 
 
@@ -75,6 +77,31 @@ def train_yolo(
     if logger and config.max_epochs is not None:
         logger(f"[YOLO][TRAIN] max_epochs ativo={config.max_epochs} -> epochs_to_run={epochs_to_run}")
 
+    run_dir = output_dir / "yolo_visdrone" / "weights"
+    checkpoint_manager = CheckpointManager(
+        run_dir=run_dir,
+        prefix="yolo",
+        ext=".pt",
+        keep_best=True,
+        metric_name="map",
+    )
+
+    resume_last = get_latest_last_checkpoint(run_dir, "yolo", ".pt")
+    resume_completed_epoch = 0
+    if resume_last is not None:
+        match = re.search(r"_last_epoch_(\d+)\.pt$", resume_last.name)
+        if match:
+            resume_completed_epoch = int(match.group(1))
+        pretrained_weights = resume_last
+        if logger:
+            logger(f"[YOLO][RESUME] Retomando de {resume_last} (epoch concluída={resume_completed_epoch})")
+
+    remaining_epochs = max(0, epochs_to_run - resume_completed_epoch)
+    if remaining_epochs <= 0:
+        if logger:
+            logger("[YOLO][RESUME] Treinamento já concluído segundo o checkpoint last.")
+        return
+
     model = YOLO(str(pretrained_weights))
     ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -99,7 +126,7 @@ def train_yolo(
 
     train_kwargs: Dict[str, object] = {
         "data": str(dataset_yaml),
-        "epochs": epochs_to_run,
+        "epochs": remaining_epochs,
         "project": str(output_dir),
         "name": "yolo_visdrone",
         "verbose": True,
@@ -119,15 +146,33 @@ def train_yolo(
     if logger:
         logger(f"[YOLO][CLI] Comando final: {cli_cmd}")
 
-    def _cleanup_epoch_checkpoints(trainer) -> None:  # pragma: no cover - depende do backend Ultralytics
+    def _on_fit_epoch_end(trainer) -> None:  # pragma: no cover - depende do backend Ultralytics
         save_dir = Path(getattr(trainer, "save_dir", output_dir / "yolo_visdrone"))
         weights_dir = save_dir / "weights"
-        current_epoch = int(getattr(trainer, "epoch", -1))
-        keep_epoch = current_epoch if current_epoch > 0 else None
-        _prune_yolo_epoch_checkpoints(weights_dir, keep_epoch=keep_epoch, logger=logger)
+        current_epoch = int(getattr(trainer, "epoch", -1)) + 1 + resume_completed_epoch
 
-    model.add_callback("on_fit_epoch_end", _cleanup_epoch_checkpoints)
-    model.add_callback("on_train_end", _cleanup_epoch_checkpoints)
+        src_last = weights_dir / "last.pt"
+        if src_last.exists():
+            payload = torch.load(src_last, map_location="cpu")
+            checkpoint_manager.save_last(current_epoch, payload)
+
+        metric_value = None
+        for key in ("metrics/mAP50-95(B)", "metrics/mAP50-95", "map"):
+            try:
+                metric_value = float(getattr(trainer, "metrics", {}).get(key))
+                break
+            except Exception:
+                continue
+
+        src_best = weights_dir / "best.pt"
+        if src_best.exists() and metric_value is not None:
+            payload_best = torch.load(src_best, map_location="cpu")
+            checkpoint_manager.maybe_save_best(current_epoch, metric_value, payload_best)
+
+        checkpoint_manager.cleanup()
+
+    model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
+    model.add_callback("on_train_end", _on_fit_epoch_end)
 
     model.train(**train_kwargs)
 

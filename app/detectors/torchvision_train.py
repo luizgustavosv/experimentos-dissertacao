@@ -45,7 +45,7 @@ from app.detectors.utils import (
     seed_everything,
 )
 from app.metrics import Metrics
-from app.training.checkpointing import CheckpointManager, CheckpointPolicy
+from app.training.checkpoint_manager import CheckpointManager, get_latest_last_checkpoint
 from app.training.early_stopping import EarlyStopping, EarlyStoppingConfig
 
 try:
@@ -2258,36 +2258,12 @@ def train_torchvision_detector(
         logging_logger,
     )
     config_snapshot = {field.name: _serialize_value(getattr(config, field.name)) for field in fields(TrainConfig)}
-    output_root = Path(weights_out).expanduser().resolve()
-    if output_root.suffix.lower() in {".pth", ".pt"}:
-        output_root = output_root.parent
-    effective_save_final = False
-    effective_save_every = 1
-    effective_keep_last_k = 1
-
-    if (
-        config.save_final != effective_save_final
-        or config.save_every != effective_save_every
-        or config.keep_last_k != effective_keep_last_k
-    ):
-        logging_logger.info(
-            "[CHECKPOINT] Política forçada para tolerância a reinício do sistema: "
-            "save_final=%s save_every=%s keep_last_k=%s",
-            effective_save_final,
-            effective_save_every,
-            effective_keep_last_k,
-        )
-
     checkpoint_manager = CheckpointManager(
-        output_root,
-        CheckpointPolicy(
-            save_final=effective_save_final,
-            save_best=config.save_best,
-            save_every=effective_save_every,
-            keep_last_k=effective_keep_last_k,
-            monitor_metric=config.monitor_metric,
-            mode=config.mode,
-        ),
+        run_dir=ckpt_dir,
+        prefix="torchvision",
+        ext=".pth",
+        keep_best=config.save_best,
+        metric_name="map",
         logger=logging_logger,
     )
 
@@ -2301,6 +2277,7 @@ def train_torchvision_detector(
     lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
     meta: dict[str, Any] = {}
     stopper: Optional[EarlyStopping] = None
+    resume_start_epoch = 1
     try:
         val_ratio_to_use = config.val_ratio if val_ratio is None else val_ratio
 
@@ -2684,6 +2661,24 @@ def train_torchvision_detector(
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.SGD(params, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay)
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.lr_step_size, gamma=config.lr_gamma)
+
+        latest_last_checkpoint = get_latest_last_checkpoint(ckpt_dir, "torchvision", ".pth")
+        if latest_last_checkpoint is not None:
+            try:
+                resume_payload = torch.load(latest_last_checkpoint, map_location="cpu")
+                model.load_state_dict(resume_payload["model_state"])
+                if optimizer is not None and resume_payload.get("optimizer_state") is not None:
+                    optimizer.load_state_dict(resume_payload["optimizer_state"])
+                if lr_scheduler is not None and resume_payload.get("scheduler_state") is not None:
+                    lr_scheduler.load_state_dict(resume_payload["scheduler_state"])
+                if isinstance(resume_payload.get("meta"), dict):
+                    meta.update(resume_payload.get("meta") or {})
+                resume_epoch_done = int(resume_payload.get("epoch", 0))
+                resume_start_epoch = resume_epoch_done + 1
+                logging_logger.info("[CKPT] resume from %s -> next_epoch=%d", latest_last_checkpoint, resume_start_epoch)
+            except Exception:
+                logging_logger.exception("[CKPT] falha ao restaurar checkpoint; iniciando do zero")
+
         logging_logger.info("Starting training...")
 
         num_classes = model_num_classes
@@ -2708,7 +2703,7 @@ def train_torchvision_detector(
         training_finished = False
 
         epochs_completed = 0
-        for epoch in range(1, epochs_to_run + 1):
+        for epoch in range(resume_start_epoch, epochs_to_run + 1):
             model.train()
             running_loss = 0.0
             epoch_wall_start = time.perf_counter()
@@ -2896,6 +2891,26 @@ def train_torchvision_detector(
                 avg_loss,
                 time.perf_counter() - epoch_wall_start,
             )
+
+            pre_val_metrics = {
+                "train_loss": float(avg_loss),
+                "val_loss": None,
+                "val_loss_per_image": None,
+                "val_map": None,
+            }
+            last_payload = {
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict() if optimizer else None,
+                "scheduler_state": lr_scheduler.state_dict() if lr_scheduler else None,
+                "metrics": pre_val_metrics,
+                "config": config_snapshot,
+                "meta": meta,
+                "early_stopping": stopper.state_dict() if stopper else None,
+            }
+            with _watchdog_paused(last_progress, watchdog_pause):
+                checkpoint_manager.save_last(epoch, last_payload)
+                checkpoint_manager.cleanup()
 
             val_mode = val_mode_requested
 
@@ -3113,25 +3128,20 @@ def train_torchvision_detector(
                 metrics_dict["val_map"] = None
             last_metrics = metrics_dict
 
+            epoch_payload = {
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict() if optimizer else None,
+                "scheduler_state": lr_scheduler.state_dict() if lr_scheduler else None,
+                "metrics": metrics_dict,
+                "config": config_snapshot,
+                "meta": meta,
+                "early_stopping": stopper.state_dict() if stopper else None,
+            }
             with _watchdog_paused(last_progress, watchdog_pause):
-                checkpoint_manager.save_best_if_improved(
-                    epoch=epoch,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=lr_scheduler,
-                    metrics=metrics_dict,
-                    config=config_snapshot,
-                    extra={"meta": meta, "early_stopping": stopper.state_dict() if stopper else None},
-                )
-                checkpoint_manager.save_periodic(
-                    epoch=epoch,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=lr_scheduler,
-                    metrics=metrics_dict,
-                    config=config_snapshot,
-                    extra={"meta": meta, "early_stopping": stopper.state_dict() if stopper else None},
-                )
+                checkpoint_manager.save_last(epoch, epoch_payload)
+                checkpoint_manager.maybe_save_best(epoch, metrics_dict.get("val_map"), epoch_payload)
+                checkpoint_manager.cleanup()
 
             epochs_completed = epoch
             if stop_training_flag:
@@ -3142,20 +3152,12 @@ def train_torchvision_detector(
 
         training_finished = True
         with _watchdog_paused(last_progress, watchdog_pause):
-            final_path = checkpoint_manager.save_final(
-                epoch=epochs_completed or epochs_to_run,
-                model=model,
-                optimizer=optimizer,
-                scheduler=lr_scheduler,
-                metrics=last_metrics,
-                config=config_snapshot,
-                extra={"meta": meta, "early_stopping": stopper.state_dict() if stopper else None},
-            )
-            if final_path:
-                ensure_weights_size(final_path, logger=logging_logger.info)
-                weights_out = final_path
+            latest_last = get_latest_last_checkpoint(ckpt_dir, "torchvision", ".pth")
+            if latest_last:
+                ensure_weights_size(latest_last, logger=logging_logger.info)
+                weights_out = latest_last
             logging_logger.info("Treinamento finalizado com sucesso.")
-            final_saved = final_path is not None
+            final_saved = latest_last is not None
 
         return Metrics(
             precision=0.0,
@@ -3174,19 +3176,7 @@ def train_torchvision_detector(
         raise
     finally:
         if training_finished and not final_saved:
-            try:
-                with _watchdog_paused(last_progress, watchdog_pause):
-                    checkpoint_manager.save_final(
-                        epoch=epochs_completed if epochs_completed else 0,
-                        model=model,
-                        optimizer=optimizer,
-                        scheduler=lr_scheduler,
-                        metrics=last_metrics,
-                        config=config_snapshot,
-                        extra={"meta": meta, "early_stopping": stopper.state_dict() if stopper else None},
-                    )
-            except Exception:
-                logging_logger.exception("Falha ao salvar checkpoint final.")
+            logging_logger.warning("[CKPT] treinamento finalizado sem checkpoint last detectado.")
         if watchdog_stop:
             watchdog_stop.set()
         if watchdog_thread:
