@@ -2241,10 +2241,15 @@ def train_torchvision_detector(
         early_config.min_epochs,
     )
 
-    ckpt_dir = Path(checkpoint_dir) if checkpoint_dir else Path(weights_out).expanduser().resolve().parent
-    ckpt_dir = ckpt_dir.expanduser().resolve()
+    run_output_dir = Path(weights_out).expanduser().resolve()
+    if checkpoint_dir:
+        ckpt_dir = Path(checkpoint_dir).expanduser().resolve()
+    else:
+        ckpt_dir = (run_output_dir / "checkpoints").resolve()
+    run_output_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    logging_logger.info("Checkpoints serão salvos em: %s", ckpt_dir)
+    logging_logger.info("[CKPT] output_dir=%s", run_output_dir)
+    logging_logger.info("[CKPT] checkpoints_dir=%s", ckpt_dir)
     _write_args_yaml(
         ckpt_dir / "args.yaml",
         config,
@@ -2258,14 +2263,38 @@ def train_torchvision_detector(
         logging_logger,
     )
     config_snapshot = {field.name: _serialize_value(getattr(config, field.name)) for field in fields(TrainConfig)}
+    checkpoint_prefix = "ssd" if algorithm_name == "SSD" else "torchvision"
     checkpoint_manager = CheckpointManager(
         run_dir=ckpt_dir,
-        prefix="torchvision",
+        prefix=checkpoint_prefix,
         ext=".pth",
         keep_best=config.save_best,
         metric_name="map",
         logger=logging_logger,
     )
+
+    def _save_last_checkpoint(epoch_value: int, payload: dict[str, Any]) -> Path:
+        ckpt_dir_abs = ckpt_dir.resolve()
+        logging_logger.info("[CKPT] epoch=%d/%d cwd=%s", epoch_value, epochs_to_run, os.getcwd())
+        logging_logger.info("[CKPT] checkpoints_dir_abs=%s", ckpt_dir_abs)
+        if not ckpt_dir_abs.exists():
+            ckpt_dir_abs.mkdir(parents=True, exist_ok=True)
+            logging_logger.info("[CKPT] created checkpoints directory: %s", ckpt_dir_abs)
+        pre_files = sorted(p.name for p in ckpt_dir_abs.iterdir() if p.is_file())
+        logging_logger.info("[CKPT] files_before_save=%s", pre_files)
+        logging_logger.info("[CKPT] saving last checkpoint for epoch=%04d ...", epoch_value)
+        saved_path = checkpoint_manager.save_last(epoch_value, payload).resolve()
+        checkpoint_manager.cleanup()
+        exists = saved_path.exists()
+        size = saved_path.stat().st_size if exists else -1
+        logging_logger.info("[CKPT] saved_path=%s exists=%s size=%s", saved_path, exists, size)
+        post_files = sorted(p.name for p in ckpt_dir_abs.iterdir() if p.is_file())
+        logging_logger.info("[CKPT] files_after_cleanup=%s", post_files)
+        if not exists:
+            raise RuntimeError(f"[CKPT] checkpoint missing after save epoch={epoch_value} path={saved_path}")
+        if size <= 0:
+            raise RuntimeError(f"[CKPT] checkpoint has invalid size epoch={epoch_value} path={saved_path} size={size}")
+        return saved_path
 
     watchdog_stop: Optional[threading.Event] = None
     watchdog_pause: Optional[threading.Event] = None
@@ -2278,6 +2307,8 @@ def train_torchvision_detector(
     meta: dict[str, Any] = {}
     stopper: Optional[EarlyStopping] = None
     resume_start_epoch = 1
+    final_saved = False
+    training_finished = False
     try:
         val_ratio_to_use = config.val_ratio if val_ratio is None else val_ratio
 
@@ -2662,7 +2693,7 @@ def train_torchvision_detector(
         optimizer = torch.optim.SGD(params, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay)
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.lr_step_size, gamma=config.lr_gamma)
 
-        latest_last_checkpoint = get_latest_last_checkpoint(ckpt_dir, "torchvision", ".pth")
+        latest_last_checkpoint = get_latest_last_checkpoint(ckpt_dir, checkpoint_prefix, ".pth")
         if latest_last_checkpoint is not None:
             try:
                 resume_payload = torch.load(latest_last_checkpoint, map_location="cpu")
@@ -2900,156 +2931,130 @@ def train_torchvision_detector(
             }
             last_payload = {
                 "epoch": epoch,
+                "model": model.state_dict(),
                 "model_state": model.state_dict(),
+                "optimizer": optimizer.state_dict() if optimizer else None,
                 "optimizer_state": optimizer.state_dict() if optimizer else None,
+                "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler else None,
                 "scheduler_state": lr_scheduler.state_dict() if lr_scheduler else None,
+                "scaler": None,
+                "best_metric": checkpoint_manager.best_metric,
                 "metrics": pre_val_metrics,
                 "config": config_snapshot,
                 "meta": meta,
                 "early_stopping": stopper.state_dict() if stopper else None,
             }
             with _watchdog_paused(last_progress, watchdog_pause):
-                checkpoint_manager.save_last(epoch, last_payload)
-                checkpoint_manager.cleanup()
+                _save_last_checkpoint(epoch, last_payload)
 
             val_mode = val_mode_requested
+            validation_failed = False
+            val_metrics_result = {}
+            val_loss_mean_per_batch = float("nan")
+            val_loss_mean_per_image = float("nan")
+            breakdown_mean: dict[str, float] = {}
 
             original_mode = model.training
             model.eval()
-            if val_mode == "metrics":
-                metrics_dir = ckpt_dir / "val_metrics" / f"epoch_{epoch:03d}"
-                with _watchdog_paused(last_progress, watchdog_pause):
-                    val_metrics_result = run_val_coco_metrics(
-                        model,
-                        val_loader,
-                        device_str,
-                        val_ann,
-                        logging_logger,
-                        tag="[VAL-METRICS]",
-                        output_dir=metrics_dir,
-                    )
-            else:
-                val_metrics_result = {}
-                val_loss_sum = 0.0
-                val_component_sum: dict[str, float] = {}
-                total_images = 0
-                total_batches = 0
-                return_type_logged = False
+            try:
+                if val_mode == "metrics":
+                    metrics_dir = ckpt_dir / "val_metrics" / f"epoch_{epoch:03d}"
+                    with _watchdog_paused(last_progress, watchdog_pause):
+                        val_metrics_result = run_val_coco_metrics(
+                            model,
+                            val_loader,
+                            device_str,
+                            val_ann,
+                            logging_logger,
+                            tag="[VAL-METRICS]",
+                            output_dir=metrics_dir,
+                        )
+                    val_loss_mean_per_batch = 0.0
+                    val_loss_mean_per_image = 0.0
+                    breakdown_mean = {}
+                    logging_logger.info("[VAL] Época %d | métricas COCO calculadas.", epoch)
+                else:
+                    val_loss_sum = 0.0
+                    val_component_sum: dict[str, float] = {}
+                    total_images = 0
+                    total_batches = 0
+                    return_type_logged = False
 
-                with _watchdog_paused(last_progress, watchdog_pause):
-                    with torch.no_grad():
-                        for vstep, (images, targets) in enumerate(val_loader, start=1):
-                            images = [img.to(device_str) for img in images]
-                            targets = [
-                                {k: (v.to(device_str) if torch.is_tensor(v) else v) for k, v in t.items()}
-                                for t in targets
-                            ]
-                            image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
-                            _validate_targets_batch(
-                                targets,
-                                num_classes=num_classes,
-                                image_sizes=image_sizes,
-                                allow_zero_label=retinanet_expects_background,
-                                logger=logging_logger,
-                            )
-
-                            model.train()
-                            _maybe_remap_retinanet_targets(
-                                model,
-                                targets,
-                                num_classes=num_classes,
-                                expects_background=retinanet_expects_background,
-                                label_offset=retinanet_label_offset,
-                                logger=logging_logger,
-                            )
-                            loss_out = model(images, targets)
-                            model.eval()
-
-                            if not return_type_logged:
-                                keys = list(loss_out.keys()) if isinstance(loss_out, dict) else None
-                                logging_logger.info(
-                                    "[VAL] Return type detected: %s keys=%s", type(loss_out).__name__, keys
-                                )
-                                return_type_logged = True
-
-                            if not isinstance(loss_out, dict) or not all(
-                                torch.is_tensor(v) for v in loss_out.values()
-                            ):
-                                raise RuntimeError(
-                                    "VAL expected loss dict, got predictions. Ensure calling model(images, targets) with model in "
-                                    "train() under no_grad()."
+                    with _watchdog_paused(last_progress, watchdog_pause):
+                        with torch.no_grad():
+                            for vstep, (images, targets) in enumerate(val_loader, start=1):
+                                images = [img.to(device_str) for img in images]
+                                targets = [
+                                    {k: (v.to(device_str) if torch.is_tensor(v) else v) for k, v in t.items()}
+                                    for t in targets
+                                ]
+                                image_sizes = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
+                                _validate_targets_batch(
+                                    targets,
+                                    num_classes=num_classes,
+                                    image_sizes=image_sizes,
+                                    allow_zero_label=retinanet_expects_background,
+                                    logger=logging_logger,
                                 )
 
-                            batch_loss_tensor = sum(loss_out.values())
-
-                            if not torch.isfinite(batch_loss_tensor):
-                                image_ids, file_paths = _collect_batch_identifiers(targets, val_loader.dataset)
-                                target_dump = _summarize_targets_for_logging(targets)
-                                logging_logger.error(
-                                    "Loss não finito detectado no val. epoch=%s step=%s paths=%s",
-                                    epoch,
-                                    vstep,
-                                    file_paths if file_paths else "<indisponível>",
+                                model.train()
+                                _maybe_remap_retinanet_targets(
+                                    model,
+                                    targets,
+                                    num_classes=num_classes,
+                                    expects_background=retinanet_expects_background,
+                                    label_offset=retinanet_label_offset,
+                                    logger=logging_logger,
                                 )
-                                bad_batch = {
-                                    "epoch": epoch,
-                                    "step": vstep,
-                                    "phase": "val",
-                                    "image_ids": image_ids,
-                                    "paths": file_paths,
-                                    "targets": target_dump,
-                                }
-                                try:
-                                    bad_path_json = ckpt_dir / "bad_batch.json"
-                                    bad_path_txt = ckpt_dir / "bad_batch.txt"
-                                    bad_path_json.write_text(json.dumps(bad_batch, indent=2, ensure_ascii=False), encoding="utf-8")
-                                    lines = [
-                                        f"epoch={epoch}",
-                                        f"step={vstep}",
-                                        f"paths={file_paths if file_paths else '<indisponível>'}",
-                                    ]
-                                    for entry in target_dump:
-                                        lines.append("")
-                                        lines.append(f"img_path: {entry.get('img_path', '<desconhecido>')}")
-                                        lines.append(f"boxes: {entry.get('boxes', '<sem boxes>')}")
-                                        lines.append(f"labels: {entry.get('labels', '<sem labels>')}")
-                                    bad_path_txt.write_text("\n".join(lines), encoding="utf-8")
-                                    logging_logger.error(
-                                        "Batch problemático de validação salvo em %s e %s", bad_path_json, bad_path_txt
+                                loss_out = model(images, targets)
+                                model.eval()
+
+                                if not return_type_logged:
+                                    keys = list(loss_out.keys()) if isinstance(loss_out, dict) else None
+                                    logging_logger.info(
+                                        "[VAL] Return type detected: %s keys=%s", type(loss_out).__name__, keys
                                     )
-                                except Exception:
-                                    logging_logger.exception("Falha ao salvar informações do bad batch de validação")
-                                raise RuntimeError("Non-finite loss detected")
+                                    return_type_logged = True
 
-                            total_batches += 1
-                            total_images += len(images)
-                            batch_loss_value = float(batch_loss_tensor.detach().cpu())
-                            val_loss_sum += batch_loss_value
+                                if not isinstance(loss_out, dict) or not all(torch.is_tensor(v) for v in loss_out.values()):
+                                    raise RuntimeError(
+                                        "VAL expected loss dict, got predictions. Ensure calling model(images, targets) with model in train() under no_grad()."
+                                    )
 
-                            for key, value in loss_out.items():
-                                val_component_sum[key] = val_component_sum.get(key, 0.0) + float(value.detach().cpu())
+                                batch_loss_tensor = sum(loss_out.values())
+                                if not torch.isfinite(batch_loss_tensor):
+                                    raise RuntimeError("Non-finite loss detected")
 
-            if original_mode:
-                model.train()
-            else:
-                model.eval()
+                                total_batches += 1
+                                total_images += len(images)
+                                val_loss_sum += float(batch_loss_tensor.detach().cpu())
 
-            if val_mode == "metrics":
-                val_loss_mean_per_batch = 0.0
-                val_loss_mean_per_image = 0.0
-                breakdown_mean: dict[str, float] = {}
-                logging_logger.info("[VAL] Época %d | métricas COCO calculadas.", epoch)
-            else:
-                val_loss_mean_per_batch = val_loss_sum / max(1, total_batches)
-                val_loss_mean_per_image = val_loss_sum / max(1, total_images)
-                breakdown_mean = {k: v / max(1, total_batches) for k, v in val_component_sum.items()}
-                logging_logger.info(
-                    f"[VAL] Época {epoch} | loss/batch={val_loss_mean_per_batch:.4f} | loss/img={val_loss_mean_per_image:.4f}"
-                )
-                if breakdown_mean:
-                    logging_logger.info("[VAL] Breakdown médio por batch: %s", breakdown_mean)
+                                for key, value in loss_out.items():
+                                    val_component_sum[key] = val_component_sum.get(key, 0.0) + float(value.detach().cpu())
 
-            if stopper:
+                    val_loss_mean_per_batch = val_loss_sum / max(1, total_batches)
+                    val_loss_mean_per_image = val_loss_sum / max(1, total_images)
+                    breakdown_mean = {k: v / max(1, total_batches) for k, v in val_component_sum.items()}
+                    logging_logger.info(
+                        f"[VAL] Época {epoch} | loss/batch={val_loss_mean_per_batch:.4f} | loss/img={val_loss_mean_per_image:.4f}"
+                    )
+                    if breakdown_mean:
+                        logging_logger.info("[VAL] Breakdown médio por batch: %s", breakdown_mean)
+            except Exception as val_exc:
+                validation_failed = True
+                val_metrics_result = {}
+                val_loss_mean_per_batch = float("nan")
+                val_loss_mean_per_image = float("nan")
+                breakdown_mean = {}
+                logging_logger.error("[CKPT] validation failed: %s", val_exc)
+                logging_logger.exception("[VAL] validação falhou; treinamento continuará e checkpoint last será salvo.")
+            finally:
+                if original_mode:
+                    model.train()
+                else:
+                    model.eval()
+
+            if stopper and not validation_failed:
                 try:
                     if val_mode == "metrics":
                         metrics_valid = bool(val_metrics_result.get("metrics_valid", True))
@@ -3130,16 +3135,21 @@ def train_torchvision_detector(
 
             epoch_payload = {
                 "epoch": epoch,
+                "model": model.state_dict(),
                 "model_state": model.state_dict(),
+                "optimizer": optimizer.state_dict() if optimizer else None,
                 "optimizer_state": optimizer.state_dict() if optimizer else None,
+                "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler else None,
                 "scheduler_state": lr_scheduler.state_dict() if lr_scheduler else None,
+                "scaler": None,
+                "best_metric": checkpoint_manager.best_metric,
                 "metrics": metrics_dict,
                 "config": config_snapshot,
                 "meta": meta,
                 "early_stopping": stopper.state_dict() if stopper else None,
             }
             with _watchdog_paused(last_progress, watchdog_pause):
-                checkpoint_manager.save_last(epoch, epoch_payload)
+                _save_last_checkpoint(epoch, epoch_payload)
                 checkpoint_manager.maybe_save_best(epoch, metrics_dict.get("val_map"), epoch_payload)
                 checkpoint_manager.cleanup()
 
@@ -3152,7 +3162,7 @@ def train_torchvision_detector(
 
         training_finished = True
         with _watchdog_paused(last_progress, watchdog_pause):
-            latest_last = get_latest_last_checkpoint(ckpt_dir, "torchvision", ".pth")
+            latest_last = get_latest_last_checkpoint(ckpt_dir, checkpoint_prefix, ".pth")
             if latest_last:
                 ensure_weights_size(latest_last, logger=logging_logger.info)
                 weights_out = latest_last
