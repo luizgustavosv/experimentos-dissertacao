@@ -58,14 +58,25 @@ class CheckpointManager:
                 tmp_path.unlink(missing_ok=True)
 
     def _atomic_torch_save(self, payload: dict[str, Any], target: Path) -> Path:
-        with tempfile.NamedTemporaryFile("wb", delete=False, dir=target.parent, prefix=f".{target.name}.", suffix=".tmp") as tmp:
-            tmp_path = Path(tmp.name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_target = target.with_name(f"{target.name}.tmp")
+        if tmp_target.exists():
+            tmp_target.unlink(missing_ok=True)
+
+        with open(tmp_target, "wb") as tmp:
             torch.save(payload, tmp)
             tmp.flush()
             os.fsync(tmp.fileno())
-        os.replace(tmp_path, target)
-        if not target.exists() or target.stat().st_size <= 0:
-            raise IOError(f"Arquivo inválido após salvar: {target}")
+
+        os.replace(tmp_target, target)
+
+        if not target.exists():
+            raise IOError(f"Checkpoint não encontrado após salvar: {target}")
+
+        size = target.stat().st_size
+        if size <= 0:
+            raise IOError(f"Checkpoint com tamanho inválido após salvar: {target}")
+
         return target
 
     def _load_metadata(self) -> None:
@@ -108,11 +119,31 @@ class CheckpointManager:
         self._write_atomic_bytes(self.metadata_path, json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
 
     def save_last(self, epoch: int, payload: dict[str, Any]) -> Path:
-        path = self.run_dir / f"{self.prefix}_last_epoch_{epoch:04d}{self.ext}"
+        previous_path = get_latest_last_checkpoint(self.run_dir, self.prefix, self.ext)
+        path = self.run_dir / f"checkpoint_epoch_{epoch}{self.ext}"
+
+        self._log("end of epoch %d", epoch)
+        self._log("saving checkpoint to %s", path.resolve())
+
         saved = self._atomic_torch_save(payload, path)
+
+        size = saved.stat().st_size
+        self._log("checkpoint saved size=%d", size)
         self._save_metadata(last_epoch=epoch, last_path=saved)
-        self._log("saved last: %s", saved)
+
+        if previous_path is not None and previous_path.resolve() != saved.resolve() and previous_path.exists():
+            self._log("deleting previous checkpoint %s", previous_path.resolve())
+            previous_path.unlink(missing_ok=True)
+
+        self._log("remaining checkpoint %s", saved.resolve())
+        self._cleanup_checkpoint_files(keep_path=saved)
         return saved
+
+    def _cleanup_checkpoint_files(self, keep_path: Path) -> None:
+        for path in self.run_dir.glob(f"checkpoint_epoch_*{self.ext}"):
+            if path.resolve() == keep_path.resolve():
+                continue
+            path.unlink(missing_ok=True)
 
     def maybe_save_best(self, epoch: int, metric_value: Optional[float], payload: dict[str, Any]) -> Optional[Path]:
         if not self.keep_best or metric_value is None:
@@ -137,17 +168,11 @@ class CheckpointManager:
         return saved
 
     def cleanup(self) -> None:
+        # Mantém compatibilidade removendo artefatos legados não utilizados.
         keep_paths: set[Path] = {self.metadata_path}
         latest_last = get_latest_last_checkpoint(self.run_dir, self.prefix, self.ext)
         if latest_last:
             keep_paths.add(latest_last)
-
-        if self.best_path and self.best_path.exists():
-            keep_paths.add(self.best_path)
-        else:
-            discovered_best = sorted(self.run_dir.glob(f"{self.prefix}_best_epoch_*{self.ext}"))
-            if discovered_best:
-                keep_paths.add(discovered_best[-1])
 
         deleted = 0
         for path in self.run_dir.iterdir():
@@ -174,13 +199,25 @@ class CheckpointManager:
 def get_latest_last_checkpoint(run_dir: Path, prefix: str, ext: str) -> Optional[Path]:
     run_dir = Path(run_dir).expanduser().resolve()
     ext = ext if ext.startswith(".") else f".{ext}"
-    pattern = re.compile(rf"^{re.escape(prefix)}_last_epoch_(\d+){re.escape(ext)}$")
+
     latest: Optional[tuple[int, Path]] = None
-    for path in run_dir.glob(f"{prefix}_last_epoch_*{ext}"):
-        match = pattern.match(path.name)
+
+    new_pattern = re.compile(rf"^checkpoint_epoch_(\d+){re.escape(ext)}$")
+    for path in run_dir.glob(f"checkpoint_epoch_*{ext}"):
+        match = new_pattern.match(path.name)
         if not match:
             continue
         epoch = int(match.group(1))
         if latest is None or epoch > latest[0]:
             latest = (epoch, path)
+
+    legacy_pattern = re.compile(rf"^{re.escape(prefix)}_last_epoch_(\d+){re.escape(ext)}$")
+    for path in run_dir.glob(f"{prefix}_last_epoch_*{ext}"):
+        match = legacy_pattern.match(path.name)
+        if not match:
+            continue
+        epoch = int(match.group(1))
+        if latest is None or epoch > latest[0]:
+            latest = (epoch, path)
+
     return latest[1] if latest else None

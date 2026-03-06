@@ -19,6 +19,17 @@ from app.training.checkpoint_manager import CheckpointManager, get_latest_last_c
 from app.reporting.reports import ReportBuilder
 
 
+class _CallbackLoggerAdapter:
+    def __init__(self, callback: Optional[Logger]) -> None:
+        self.callback = callback
+
+    def info(self, msg: str, *args) -> None:
+        if not self.callback:
+            return
+        formatted = msg % args if args else msg
+        self.callback(formatted)
+
+
 def _prune_yolo_epoch_checkpoints(weights_dir: Path, keep_epoch: Optional[int], logger: Optional[Logger] = None) -> None:
     """Mantém apenas o checkpoint da última época concluída e remove os demais."""
 
@@ -84,12 +95,13 @@ def train_yolo(
         ext=".pt",
         keep_best=True,
         metric_name="map",
+        logger=_CallbackLoggerAdapter(logger),
     )
 
     resume_last = get_latest_last_checkpoint(run_dir, "yolo", ".pt")
     resume_completed_epoch = 0
     if resume_last is not None:
-        match = re.search(r"_last_epoch_(\d+)\.pt$", resume_last.name)
+        match = re.search(r"checkpoint_epoch_(\d+)\.pt$", resume_last.name)
         if match:
             resume_completed_epoch = int(match.group(1))
         pretrained_weights = resume_last
