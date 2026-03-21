@@ -12,7 +12,16 @@ from torchvision.utils import draw_bounding_boxes
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.torchvision_train import train_torchvision_detector
-from app.detectors.utils import ensure_weights_size, resolve_device, validate_coco_dataset
+from app.detectors.utils import (
+    ensure_weights_size,
+    extract_checkpoint_meta,
+    extract_checkpoint_state,
+    infer_ssd_num_classes,
+    load_ssd_weights,
+    resolve_device,
+    resolve_ssd_run_config,
+    validate_coco_dataset,
+)
 from app.metrics import Metrics
 from app.metrics import InferencePerformance
 from app.reporting.reports import ReportBuilder
@@ -132,6 +141,11 @@ class TorchvisionDetector(DetectionAlgorithm):
 
         device_str = resolve_device(self.config.device)
         model, class_names, weights_label = self._load_model_for_inference(weights_path, device_str, logger)
+        pedestrian_label = self._resolve_pedestrian_label_id(class_names) if self.context.architecture == "SSD" else 0
+        if logger and self.context.architecture == "SSD":
+            logger(
+                f"[SSD][INFER] class_names={list(class_names)} pedestrian_label_id={pedestrian_label} pedestrian_only={pedestrian_only}"
+            )
 
         prediction_root = report_out.parent / "predictions"
         save_dir = prediction_root / report_out.stem
@@ -150,12 +164,14 @@ class TorchvisionDetector(DetectionAlgorithm):
             scores = output.get("scores", torch.empty(0)).detach().cpu()
             labels = output.get("labels", torch.empty(0, dtype=torch.int64)).detach().cpu()
 
+            raw_count = len(boxes)
             keep = scores >= 0.5
             if pedestrian_only:
-                keep = keep & (labels == 0)
+                keep = keep & (labels == pedestrian_label)
             boxes = boxes[keep]
             scores = scores[keep]
             labels = labels[keep]
+            filtered_count = len(boxes)
 
             image_uint8 = (tensor * 255).to(torch.uint8)
             if boxes.numel() > 0:
@@ -169,7 +185,9 @@ class TorchvisionDetector(DetectionAlgorithm):
             if boxes.numel() > 0:
                 previews.append(save_path)
             if logger:
-                logger(f"[INFER] {image_path.name}: {len(boxes)} detecções acima de 0.5")
+                logger(
+                    f"[INFER] {image_path.name}: {filtered_count} detecções (raw={raw_count}, score_threshold=0.5, pedestrian_only={pedestrian_only})"
+                )
 
         elapsed = time.perf_counter() - start
         total_images = len(image_paths)
@@ -240,20 +258,94 @@ class TorchvisionDetector(DetectionAlgorithm):
             weights_path = weights_path.expanduser().resolve()
             if not weights_path.exists():
                 raise FileNotFoundError(f"Pesos não encontrados: {weights_path}")
-            state_dict = torch.load(weights_path, map_location="cpu")
-            num_classes = self._infer_ssd_num_classes(state_dict, logger)
-            model = ssd300_vgg16(weights=None, weights_backbone=None, num_classes=num_classes)
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+            loaded = torch.load(weights_path, map_location="cpu")
+            top_keys = sorted(loaded.keys()) if isinstance(loaded, dict) else []
             if logger:
-                if missing:
-                    logger(f"[INFER] Aviso: camadas ausentes ao carregar pesos: {missing}")
-                if unexpected:
-                    logger(f"[INFER] Aviso: pesos inesperados ignorados: {unexpected}")
-            class_names = ["background", "human"] if num_classes == 2 else [str(idx) for idx in range(num_classes)]
+                logger(f"[SSD][INFER] checkpoint={weights_path}")
+                logger(f"[SSD][INFER] checkpoint_type={type(loaded).__name__}")
+                if top_keys:
+                    logger(f"[SSD][INFER] checkpoint_keys={top_keys}")
+
+            args_info = resolve_ssd_run_config(weights_path, logger=logger)
+            meta = extract_checkpoint_meta(loaded)
+            state_dict, checkpoint_format = extract_checkpoint_state(loaded)
+            ckpt_num_classes = infer_ssd_num_classes(state_dict, logger=logger)
+            num_classes = self._resolve_ssd_num_classes(
+                args_info=args_info,
+                meta=meta,
+                ckpt_num_classes=ckpt_num_classes,
+                logger=logger,
+            )
+            model = ssd300_vgg16(weights=None, weights_backbone=None, num_classes=num_classes)
+            load_info = load_ssd_weights(
+                model,
+                weights_path,
+                torch.device("cpu"),
+                strict=True,
+                strict_head=True,
+                expected_num_classes=num_classes,
+                loaded=loaded,
+                logger=logger,
+            )
+            if logger:
+                logger(
+                    f"[SSD][INFER] checkpoint_format={checkpoint_format} num_classes_resolved={num_classes} "
+                    f"num_classes_ckpt={ckpt_num_classes if ckpt_num_classes is not None else 'desconhecido'}"
+                )
+                logger(
+                    f"[SSD][INFER] strict={load_info.get('strict_load')} "
+                    f"missing_keys={len(load_info.get('missing', []))} unexpected_keys={len(load_info.get('unexpected', []))}"
+                )
+            class_names = self._resolve_ssd_class_names(meta, num_classes)
             weights_label = weights_path
         model.to(device_str)
         model.eval()
         return model, class_names, weights_label
+
+    @staticmethod
+    def _resolve_ssd_num_classes(
+        *, args_info: dict, meta: dict, ckpt_num_classes: Optional[int], logger: Optional[Logger]
+    ) -> int:
+        candidates: List[Tuple[str, Optional[int]]] = [
+            ("args.model_num_classes", args_info.get("model_num_classes") if isinstance(args_info, dict) else None),
+            ("meta.model_num_classes", meta.get("model_num_classes") if isinstance(meta, dict) else None),
+            ("meta.dataset_num_classes+1", (meta.get("dataset_num_classes") + 1) if isinstance(meta.get("dataset_num_classes"), int) else None),
+            ("checkpoint_state_dict", ckpt_num_classes),
+            (
+                "args.dataset_num_classes+1",
+                (args_info.get("dataset_num_classes") + 1)
+                if isinstance(args_info, dict) and isinstance(args_info.get("dataset_num_classes"), int)
+                else None,
+            ),
+        ]
+        for source, value in candidates:
+            if isinstance(value, int) and value > 1:
+                if logger:
+                    logger(f"[SSD][INFER] num_classes={value} via {source}")
+                return value
+        if logger:
+            logger("[SSD][INFER][WARN] Não foi possível resolver num_classes a partir do checkpoint/meta; fallback=91")
+        return 91
+
+    @staticmethod
+    def _resolve_ssd_class_names(meta: dict, num_classes: int) -> Sequence[str]:
+        if isinstance(meta, dict):
+            class_names = meta.get("class_names")
+            if isinstance(class_names, list) and class_names and all(isinstance(name, str) for name in class_names):
+                if len(class_names) == num_classes - 1:
+                    return ["background", *class_names]
+                if len(class_names) == num_classes:
+                    return class_names
+        return ["background", "human"] if num_classes == 2 else [str(idx) for idx in range(num_classes)]
+
+    @staticmethod
+    def _resolve_pedestrian_label_id(class_names: Sequence[str]) -> int:
+        aliases = {"human", "pedestrian", "person", "people"}
+        for idx, name in enumerate(class_names):
+            if str(name).strip().lower() in aliases:
+                return idx
+        return 1 if len(class_names) > 1 else 0
 
     def _load_faster_rcnn_for_inference(
         self, weights_path: Optional[Path], device_str: str, logger: Optional[Logger]
