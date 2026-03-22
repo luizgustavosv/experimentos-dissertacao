@@ -231,6 +231,7 @@ class YoloDetector(DetectionAlgorithm):
         report_out: Path,
         pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
+        benchmark_mode: bool = False,
     ):
         images_dir = images_dir.expanduser().resolve()
         report_out = report_out.expanduser().resolve()
@@ -255,44 +256,62 @@ class YoloDetector(DetectionAlgorithm):
 
         model = YOLO(str(weights_path))
         predictions_root = report_out.parent / "predictions"
+        resolved_device = self._resolve_yolo_runtime_device(model, device_str)
+        hardware_used = self._describe_hardware(resolved_device)
+        self._cuda_sync(resolved_device)
         start = time.perf_counter()
         predict_kwargs = {
             "source": str(images_dir),
             "imgsz": 640,
             "device": device_str,
-            "save": True,
-            "project": str(predictions_root),
-            "name": report_out.stem,
-            "exist_ok": True,
+            "save": not benchmark_mode,
         }
+        if not benchmark_mode:
+            predict_kwargs.update(
+                {
+                    "project": str(predictions_root),
+                    "name": report_out.stem,
+                    "exist_ok": True,
+                }
+            )
         if pedestrian_only:
             predict_kwargs["classes"] = [0]
         results = model.predict(**predict_kwargs)
+        self._cuda_sync(resolved_device)
         elapsed = time.perf_counter() - start
 
         total_images = len(image_paths)
+        total_detections = self._count_total_detections(results)
+        runtime_device = self._resolve_device_from_results(results) or resolved_device
+        hardware_used = self._describe_hardware(runtime_device)
         images_per_second = total_images / elapsed if elapsed > 0 else 0.0
         milliseconds_per_image = (elapsed / total_images * 1000) if total_images else 0.0
         performance = InferencePerformance(
             images_per_second=images_per_second,
             milliseconds_per_image=milliseconds_per_image,
+            total_images=total_images,
+            total_detections=total_detections,
+            total_inference_seconds=elapsed,
+            hardware=hardware_used,
         )
 
-        save_dir = (
-            Path(results[0].save_dir)
-            if results and hasattr(results[0], "save_dir")
-            else predictions_root / report_out.stem
-        )
-        previews = self._collect_detection_previews(results, save_dir)
+        previews: List[Path] = []
+        if not benchmark_mode:
+            save_dir = (
+                Path(results[0].save_dir)
+                if results and hasattr(results[0], "save_dir")
+                else predictions_root / report_out.stem
+            )
+            previews = self._collect_detection_previews(results, save_dir)
 
         report_builder = ReportBuilder(self.context.name)
         report_builder.save_report(
             report_path=report_out,
             metrics=None,
-            operation="Inferência",
+            operation="Inferência Rápida / Benchmark" if benchmark_mode else "Inferência",
             source_dir=images_dir,
             inference_performance=performance,
-            detection_previews=previews,
+            detection_previews=None if benchmark_mode else previews,
             weights_path=weights_path,
         )
 
@@ -303,6 +322,52 @@ class YoloDetector(DetectionAlgorithm):
             logger(f"[INFER] Relatório salvo em {report_out}")
 
         return performance
+
+    @staticmethod
+    def _resolve_yolo_runtime_device(model: YOLO, fallback_device: str) -> torch.device:
+        try:
+            inner = getattr(model, "model", None)
+            if inner is not None:
+                return next(inner.parameters()).device
+        except (AttributeError, StopIteration, TypeError):
+            pass
+        return torch.device(fallback_device)
+
+    @staticmethod
+    def _resolve_device_from_results(results) -> Optional[torch.device]:
+        for result in results or []:
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            data = getattr(boxes, "data", None)
+            if data is not None and hasattr(data, "device"):
+                return data.device
+        return None
+
+    @staticmethod
+    def _count_total_detections(results) -> int:
+        total = 0
+        for result in results or []:
+            boxes = getattr(result, "boxes", None)
+            if boxes is None:
+                continue
+            try:
+                total += len(boxes)
+            except TypeError:
+                continue
+        return total
+
+    @staticmethod
+    def _cuda_sync(device: torch.device) -> None:
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
+    @staticmethod
+    def _describe_hardware(device: torch.device) -> str:
+        if device.type == "cuda" and torch.cuda.is_available():
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            return f"GPU: {torch.cuda.get_device_name(index)}"
+        return "CPU"
 
     def validate(
         self,

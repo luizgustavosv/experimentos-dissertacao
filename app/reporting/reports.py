@@ -74,8 +74,14 @@ class ReportBuilder:
                     [
                         "",
                         "Latência:",
+                        f" • Total de imagens processadas: {inference_performance.total_images if inference_performance.total_images is not None else 'N/A'}",
+                        f" • Total de objetos detectados: {inference_performance.total_detections if inference_performance.total_detections is not None else 'N/A'}",
+                        f" • Tempo total de inferência: {inference_performance.total_inference_seconds:.4f} s"
+                        if inference_performance.total_inference_seconds is not None
+                        else " • Tempo total de inferência: N/A",
                         f" • {inference_performance.images_per_second:.2f} imagens por segundo",
                         f" • {inference_performance.milliseconds_per_image:.2f} ms por imagem",
+                        f" • Hardware utilizado: {inference_performance.hardware or 'N/A'}",
                     ]
                 )
             elif metrics:

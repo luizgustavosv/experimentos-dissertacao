@@ -38,6 +38,7 @@ class DetectionAlgorithm:
         report_out: Path,
         pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
+        benchmark_mode: bool = False,
     ) -> InferencePerformance:
         raise NotImplementedError
 

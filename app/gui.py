@@ -34,10 +34,10 @@ class DetectorApp(tk.Tk):
         self.controller = ExperimentController()
         self.cuda_available = torch.cuda.is_available()
         self.algorithm_actions: dict[str, list[str]] = {
-            "YOLO": ["Treinar", "Inferir", "Avaliar YOLO", "Normalizar dataset"],
-            "SSD": ["Treinar", "Inferir", "Avaliar SSD", "Normalizar dataset"],
-            "Faster R-CNN": ["Treinar", "Inferir", "Validar", "Normalizar dataset"],
-            "RetinaNet": ["Treinar", "Inferir", "Validar", "Normalizar dataset"],
+            "YOLO": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Avaliar YOLO", "Normalizar dataset"],
+            "SSD": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Avaliar SSD", "Normalizar dataset"],
+            "Faster R-CNN": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Validar", "Normalizar dataset"],
+            "RetinaNet": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Validar", "Normalizar dataset"],
         }
         self.algorithm_var = tk.StringVar(value="YOLO")
         self.action_var = tk.StringVar(value=self.algorithm_actions["YOLO"][0])
@@ -210,7 +210,7 @@ class DetectorApp(tk.Tk):
             self._add_epoch_selector()
             self._add_max_epoch_selector()
             self._add_early_stopping_controls()
-        elif action == "Inferir":
+        elif action in {"Inferir", "Inferência Rápida / Benchmark"}:
             self._add_path_selector("Pesos para inferência", "inference_weights")
             self._add_path_selector("Imagens para inferência", "images", is_dir=True)
             self._add_path_selector("Relatório PDF da inferência", "report", is_file=True, defaultextension=".pdf")
@@ -286,7 +286,9 @@ class DetectorApp(tk.Tk):
         self._update_run_button_text()
 
     def _available_actions(self, algorithm: str) -> list[str]:
-        return self.algorithm_actions.get(algorithm, ["Treinar", "Inferir", "Normalizar dataset"])
+        return self.algorithm_actions.get(
+            algorithm, ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Normalizar dataset"]
+        )
 
     def _on_algorithm_change(self, _event: object | None = None) -> None:
         self._update_action_options()
@@ -674,23 +676,25 @@ class DetectorApp(tk.Tk):
                         early_stop_ema_alpha=ema_alpha,
                     )
 
-            elif action == "Inferir":
+            elif action in {"Inferir", "Inferência Rápida / Benchmark"}:
                 images = Path(self.path_vars["images"].get())
                 weights_raw = self.path_vars["inference_weights"].get().strip()
                 weights = Path(weights_raw) if weights_raw else None
                 report = Path(self.path_vars["report"].get())
                 pedestrian_only = bool(self.pedestrian_only_var.get())
+                benchmark_mode = action == "Inferência Rápida / Benchmark"
                 ssd_score_threshold = (
                     float(self.ssd_infer_threshold_var.get()) if algorithm_key == "SSD" else None
                 )
                 prompt_logger(
                     self._build_prompt_command(
-                        "inferir",
+                        "benchmark" if benchmark_mode else "inferir",
                         algorithm_key,
                         {
                             "imagens": images,
                             "pesos": weights or "padrão",
                             "relatorio": report,
+                            "modo": "benchmark" if benchmark_mode else "normal",
                             "apenas_pedestrian": pedestrian_only,
                             **({"ssd_score_threshold": ssd_score_threshold} if algorithm_key == "SSD" else {}),
                         },
@@ -706,6 +710,7 @@ class DetectorApp(tk.Tk):
                         pedestrian_only,
                         prompt_logger,
                         ssd_score_threshold=ssd_score_threshold,
+                        benchmark_mode=benchmark_mode,
                     )
 
             elif action == "Avaliar SSD":
