@@ -12,10 +12,12 @@ from torchvision.utils import draw_bounding_boxes
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.torchvision_train import train_torchvision_detector
+from app.detectors.torchvision_models import build_ssd
 from app.detectors.utils import (
     ensure_weights_size,
     extract_checkpoint_meta,
     extract_checkpoint_state,
+    filter_torchvision_predictions,
     infer_ssd_num_classes,
     load_ssd_weights,
     resolve_device,
@@ -168,26 +170,17 @@ class TorchvisionDetector(DetectionAlgorithm):
         for image_path in image_paths:
             image = Image.open(image_path).convert("RGB")
             tensor = transform(image)
-            with torch.no_grad():
+            with torch.inference_mode():
                 outputs = model([tensor.to(device_str)])
             output = outputs[0] if outputs else {}
-            boxes = output.get("boxes", torch.empty((0, 4))).detach().cpu()
-            scores = output.get("scores", torch.empty(0)).detach().cpu()
-            labels = output.get("labels", torch.empty(0, dtype=torch.int64)).detach().cpu()
-
-            raw_count = len(boxes)
-            keep_score = scores >= ssd_score_threshold
-            score_count = int(keep_score.sum().item())
-            keep = keep_score
-            class_count = score_count
-            if pedestrian_only:
-                keep_class = labels == pedestrian_label
-                class_count = int((keep & keep_class).sum().item())
-                keep = keep & keep_class
-            boxes = boxes[keep]
-            scores = scores[keep]
-            labels = labels[keep]
-            filtered_count = len(boxes)
+            filtered_output, diag = filter_torchvision_predictions(
+                output,
+                score_threshold=ssd_score_threshold,
+                target_label=pedestrian_label if pedestrian_only else None,
+            )
+            boxes = filtered_output["boxes"]
+            scores = filtered_output["scores"]
+            labels = filtered_output["labels"]
 
             image_uint8 = (tensor * 255).to(torch.uint8)
             if boxes.numel() > 0:
@@ -202,16 +195,22 @@ class TorchvisionDetector(DetectionAlgorithm):
                 previews.append(save_path)
             if logger:
                 if self.context.architecture == "SSD":
+                    score_range = (
+                        f"[{diag['score_min']:.4f}, {diag['score_max']:.4f}]"
+                        if diag["score_min"] is not None
+                        else "n/a"
+                    )
                     logger(
-                        f"[SSD][INFER][DIAG] {image_path.name}: raw={raw_count} "
-                        f"after_score={score_count} after_class={class_count} final={filtered_count} "
+                        f"[SSD][INFER][DIAG] {image_path.name}: raw={diag['raw_count']} "
+                        f"after_score={diag['after_score']} after_class={diag['after_class']} final={diag['final_count']} "
                         f"score_threshold={ssd_score_threshold:.4f} pedestrian_only={pedestrian_only} "
-                        f"pedestrian_label_id={pedestrian_label}"
+                        f"pedestrian_label_id={pedestrian_label} labels_before={diag['unique_labels_before']} "
+                        f"labels_after={diag['unique_labels_after']} score_range={score_range}"
                     )
                 else:
                     logger(
-                        f"[INFER] {image_path.name}: {filtered_count} detecções "
-                        f"(raw={raw_count}, score_threshold={ssd_score_threshold}, pedestrian_only={pedestrian_only})"
+                        f"[INFER] {image_path.name}: {diag['final_count']} detecções "
+                        f"(raw={diag['raw_count']}, score_threshold={ssd_score_threshold}, pedestrian_only={pedestrian_only})"
                     )
 
         elapsed = time.perf_counter() - start
@@ -270,11 +269,12 @@ class TorchvisionDetector(DetectionAlgorithm):
     def _load_ssd_for_inference(
         self, weights_path: Optional[Path], device_str: str, logger: Optional[Logger]
     ) -> Tuple[torch.nn.Module, Sequence[str], Optional[Path]]:
-        from torchvision.models.detection import SSD300_VGG16_Weights, ssd300_vgg16
+        from torchvision.models.detection import SSD300_VGG16_Weights
 
         if weights_path is None:
             weights = SSD300_VGG16_Weights.DEFAULT
-            model = ssd300_vgg16(weights=weights)
+            model = build_ssd(num_classes=91)
+            model.load_state_dict(weights.get_state_dict(progress=True), strict=True)
             class_names: Sequence[str] = tuple(weights.meta.get("categories", []))
             weights_label: Optional[Path] = Path("SSD300_VGG16_Weights.DEFAULT")
             if logger:
@@ -302,7 +302,7 @@ class TorchvisionDetector(DetectionAlgorithm):
                 ckpt_num_classes=ckpt_num_classes,
                 logger=logger,
             )
-            model = ssd300_vgg16(weights=None, weights_backbone=None, num_classes=num_classes)
+            model = build_ssd(num_classes=num_classes)
             load_info = load_ssd_weights(
                 model,
                 weights_path,
@@ -396,14 +396,17 @@ class TorchvisionDetector(DetectionAlgorithm):
         if weights_path is not None:
             args_info = resolve_ssd_run_config(weights_path.expanduser().resolve(), logger=logger)
 
-        threshold_candidates = [
-            args_info.get("conf_threshold") if isinstance(args_info, dict) else None,
-            args_info.get("score_threshold") if isinstance(args_info, dict) else None,
-        ]
+        threshold_candidates = [args_info.get("score_threshold") if isinstance(args_info, dict) else None]
         for candidate in threshold_candidates:
             if isinstance(candidate, (int, float)) and 0.0 <= float(candidate) <= 1.0:
                 return float(candidate)
 
+        ignored_conf = args_info.get("conf_threshold") if isinstance(args_info, dict) else None
+        if logger and isinstance(ignored_conf, (int, float)):
+            logger(
+                "[SSD][INFER][WARN] conf_threshold encontrado em args.yaml, "
+                "mas não será usado na inferência SSD para manter alinhamento com avaliação dedicada."
+            )
         if logger:
             logger(
                 "[SSD][INFER] score_threshold padrão alinhado à avaliação SSD dedicada: "

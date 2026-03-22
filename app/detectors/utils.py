@@ -370,6 +370,53 @@ def load_ssd_weights(
     }
 
 
+def filter_torchvision_predictions(
+    output: Dict[str, torch.Tensor],
+    *,
+    score_threshold: float,
+    target_label: Optional[int] = None,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    boxes = output.get("boxes", torch.empty((0, 4), dtype=torch.float32))
+    scores = output.get("scores", torch.empty((0,), dtype=torch.float32))
+    labels = output.get("labels", torch.empty((0,), dtype=torch.int64))
+
+    raw_count = int(boxes.shape[0])
+    unique_labels_before = sorted(torch.unique(labels).tolist()) if labels.numel() > 0 else []
+    score_min = float(scores.min().item()) if scores.numel() > 0 else None
+    score_max = float(scores.max().item()) if scores.numel() > 0 else None
+
+    keep_score = scores >= float(score_threshold)
+    boxes = boxes[keep_score]
+    scores = scores[keep_score]
+    labels = labels[keep_score]
+    after_score = int(boxes.shape[0])
+
+    if target_label is not None:
+        keep_class = labels == int(target_label)
+        boxes = boxes[keep_class]
+        scores = scores[keep_class]
+        labels = labels[keep_class]
+    after_class = int(boxes.shape[0])
+
+    unique_labels_after = sorted(torch.unique(labels).tolist()) if labels.numel() > 0 else []
+    filtered = {
+        "boxes": boxes.detach().cpu(),
+        "scores": scores.detach().cpu(),
+        "labels": labels.detach().cpu(),
+    }
+    diagnostics = {
+        "raw_count": raw_count,
+        "after_score": after_score,
+        "after_class": after_class,
+        "unique_labels_before": unique_labels_before,
+        "unique_labels_after": unique_labels_after,
+        "score_min": score_min,
+        "score_max": score_max,
+        "final_count": int(filtered["boxes"].shape[0]),
+    }
+    return filtered, diagnostics
+
+
 def ensure_weights_size(
     weights_path: Path | str,
     min_bytes: int = 1_000_000,

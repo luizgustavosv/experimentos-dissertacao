@@ -18,6 +18,7 @@ from app.detectors.base import Logger
 from app.detectors.dataset_voc import PascalVOCDataset
 from app.detectors.torchvision_models import build_ssd
 from app.detectors.utils import (
+    filter_torchvision_predictions,
     infer_ssd_num_classes,
     load_ssd_weights,
     resolve_device,
@@ -43,9 +44,8 @@ def _load_split_ids(dataset_root: Path, split: str, fallback_ids: Sequence[str])
 
 
 def _filter_predictions(output: Dict[str, torch.Tensor], threshold: float) -> Dict[str, torch.Tensor]:
-    keep = output.get("scores", torch.tensor([])) >= threshold
-    filtered = {key: output.get(key, torch.empty((0,), device=output.get("scores", torch.tensor([])).device)) for key in _PREDICTION_KEYS}
-    return {k: v[keep].detach().cpu() if v.numel() > 0 else torch.zeros_like(v.detach().cpu()) for k, v in filtered.items()}
+    filtered, _ = filter_torchvision_predictions(output, score_threshold=threshold)
+    return {key: filtered[key] for key in _PREDICTION_KEYS}
 
 
 def _prepare_target(target: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
