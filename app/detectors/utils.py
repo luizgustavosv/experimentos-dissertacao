@@ -12,7 +12,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 
 import torch
 from torch.utils.data import DataLoader
-import yaml
 
 from app.detectors.base import Logger
 from app.detectors.config import TrainConfig
@@ -206,112 +205,12 @@ def infer_ssd_num_classes(state_dict: Dict[str, torch.Tensor], logger: Optional[
     return None
 
 
-def filter_ssd_state_dict(state_dict: Dict[str, torch.Tensor], drop_heads: bool) -> tuple[Dict[str, torch.Tensor], List[str]]:
-    head_markers = (
-        "head.classification_head",
-        "head.regression_head",
-        "cls_headers",
-        "box_headers",
-        ".cls.",
-        ".cls_",
-        ".conf",
-        ".bbox",
-        ".box",
-        ".reg",
-        ".loc",
-    )
-    filtered: Dict[str, torch.Tensor] = {}
-    removed: List[str] = []
-    for key, value in state_dict.items():
-        lower_key = key.lower()
-        if lower_key.startswith("backbone."):
-            filtered[key] = value
-            continue
-        if drop_heads and any(marker in lower_key for marker in head_markers):
-            removed.append(key)
-            continue
-        filtered[key] = value
-    return filtered, removed
-
-
-def find_args_yaml(weights_path: Path) -> Optional[Path]:
-    weights_path = weights_path.expanduser().resolve()
-    candidates = [weights_path.parent / "args.yaml", weights_path.parent.parent / "args.yaml"]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def read_args_yaml(path: Path, logger: Optional[Logger] = None) -> Optional[Dict[str, Any]]:
-    try:
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        if logger:
-            logger(f"[RUN] Falha ao ler args.yaml em {path}: {exc}")
-        return None
-    if not isinstance(payload, dict):
-        if logger:
-            logger(f"[RUN] args.yaml inválido em {path}: esperado dict, obtido {type(payload).__name__}.")
-        return None
-    return payload
-
-
-def resolve_ssd_run_config(weights_path: Path, logger: Optional[Logger] = None) -> Dict[str, Any]:
-    args_path = find_args_yaml(weights_path)
-    if not args_path:
-        return {}
-
-    payload = read_args_yaml(args_path, logger=logger)
-    if not payload:
-        return {}
-
-    train_config = payload.get("train_config") if isinstance(payload.get("train_config"), dict) else {}
-
-    dataset_num_classes = (
-        payload.get("dataset_num_classes")
-        if isinstance(payload.get("dataset_num_classes"), int)
-        else train_config.get("dataset_num_classes")
-    )
-    if not isinstance(dataset_num_classes, int):
-        dataset_num_classes = train_config.get("num_classes") if isinstance(train_config.get("num_classes"), int) else None
-
-    model_num_classes = (
-        payload.get("model_num_classes")
-        if isinstance(payload.get("model_num_classes"), int)
-        else train_config.get("model_num_classes")
-    )
-    if not isinstance(model_num_classes, int) and isinstance(dataset_num_classes, int):
-        model_num_classes = dataset_num_classes + 1
-
-    backbone = payload.get("backbone") or train_config.get("backbone")
-    imgsz = payload.get("imgsz") or train_config.get("imgsz")
-    conf_threshold = payload.get("conf_threshold")
-    if not isinstance(conf_threshold, (int, float)):
-        conf_threshold = train_config.get("conf_threshold")
-    score_threshold = payload.get("score_threshold")
-    if not isinstance(score_threshold, (int, float)):
-        score_threshold = train_config.get("score_threshold")
-
-    return {
-        "args_path": args_path,
-        "dataset_num_classes": dataset_num_classes,
-        "model_num_classes": model_num_classes,
-        "backbone": backbone,
-        "imgsz": imgsz,
-        "conf_threshold": float(conf_threshold) if isinstance(conf_threshold, (int, float)) else None,
-        "score_threshold": float(score_threshold) if isinstance(score_threshold, (int, float)) else None,
-    }
-
-
 def load_ssd_weights(
     model: torch.nn.Module,
     weights_path: Path,
     device: torch.device,
     *,
     strict: bool = True,
-    strict_head: bool = True,
-    expected_num_classes: Optional[int] = None,
     loaded: Any = None,
     logger: Optional[Logger] = None,
 ) -> Dict[str, Any]:
@@ -328,34 +227,18 @@ def load_ssd_weights(
     state_dict = strip_state_dict_prefixes(state_dict, ["module.", "model."])
 
     ckpt_num_classes = infer_ssd_num_classes(state_dict, logger=logger)
-    filtered_state_dict = state_dict
-    removed_keys: List[str] = []
-    strict_load = strict
-
-    if not strict_head and expected_num_classes and ckpt_num_classes and expected_num_classes != ckpt_num_classes:
-        filtered_state_dict, removed_keys = filter_ssd_state_dict(state_dict, drop_heads=True)
-        strict_load = False
-        if logger:
-            logger(
-                "[SSD][WEIGHTS][WARN] ckpt_num_classes="
-                f"{ckpt_num_classes} != model_num_classes={expected_num_classes}; "
-                "carregando backbone com strict=False e head reiniciado."
-            )
-
-    incompatible = model.load_state_dict(filtered_state_dict, strict=strict_load)
+    incompatible = model.load_state_dict(state_dict, strict=strict)
     missing = list(getattr(incompatible, "missing_keys", []))
     unexpected = list(getattr(incompatible, "unexpected_keys", []))
 
     if logger:
         logger(
-            f"[SSD][WEIGHTS] load_state_dict strict={strict_load} missing={len(missing)} unexpected={len(unexpected)}"
+            f"[SSD][WEIGHTS] load_state_dict strict={strict} missing={len(missing)} unexpected={len(unexpected)}"
         )
         if missing:
             logger(f"[SSD][WEIGHTS] missing_keys_sample={missing[:5]}")
         if unexpected:
             logger(f"[SSD][WEIGHTS] unexpected_keys_sample={unexpected[:5]}")
-        if removed_keys:
-            logger(f"[SSD][WEIGHTS] removed_head_keys={len(removed_keys)}")
 
     return {
         "loaded": loaded,
@@ -365,8 +248,7 @@ def load_ssd_weights(
         "ckpt_num_classes": ckpt_num_classes,
         "missing": missing,
         "unexpected": unexpected,
-        "removed_keys": removed_keys,
-        "strict_load": strict_load,
+        "strict_load": strict,
     }
 
 
@@ -381,10 +263,6 @@ def filter_torchvision_predictions(
     labels = output.get("labels", torch.empty((0,), dtype=torch.int64))
 
     raw_count = int(boxes.shape[0])
-    unique_labels_before = sorted(torch.unique(labels).tolist()) if labels.numel() > 0 else []
-    score_min = float(scores.min().item()) if scores.numel() > 0 else None
-    score_max = float(scores.max().item()) if scores.numel() > 0 else None
-
     keep_score = scores >= float(score_threshold)
     boxes = boxes[keep_score]
     scores = scores[keep_score]
@@ -398,7 +276,6 @@ def filter_torchvision_predictions(
         labels = labels[keep_class]
     after_class = int(boxes.shape[0])
 
-    unique_labels_after = sorted(torch.unique(labels).tolist()) if labels.numel() > 0 else []
     filtered = {
         "boxes": boxes.detach().cpu(),
         "scores": scores.detach().cpu(),
@@ -408,10 +285,6 @@ def filter_torchvision_predictions(
         "raw_count": raw_count,
         "after_score": after_score,
         "after_class": after_class,
-        "unique_labels_before": unique_labels_before,
-        "unique_labels_after": unique_labels_after,
-        "score_min": score_min,
-        "score_max": score_max,
         "final_count": int(filtered["boxes"].shape[0]),
     }
     return filtered, diagnostics

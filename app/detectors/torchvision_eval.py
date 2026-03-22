@@ -18,11 +18,12 @@ from app.detectors.base import Logger
 from app.detectors.dataset_voc import PascalVOCDataset
 from app.detectors.torchvision_models import build_ssd
 from app.detectors.utils import (
+    extract_checkpoint_meta,
+    extract_checkpoint_state,
     filter_torchvision_predictions,
     infer_ssd_num_classes,
     load_ssd_weights,
     resolve_device,
-    resolve_ssd_run_config,
     validate_voc_dataset,
 )
 
@@ -107,7 +108,6 @@ def evaluate_torchvision_ssd_voc(
     log_cb: Optional[Callable[[str], None]] = None,
     progress_every: int = 50,
     strict_weights: bool = True,
-    strict_head: bool = True,
 ) -> dict:
     dataset_root, class_names, train_ids, val_ids = validate_voc_dataset(Path(voc_root))
     split_normalized = split.lower().strip()
@@ -144,41 +144,21 @@ def evaluate_torchvision_ssd_voc(
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=ssd_collate_fn)
 
     weights_resolved = Path(weights_path).expanduser().resolve()
-    args_info = resolve_ssd_run_config(weights_resolved, logger=_emit)
     loaded = torch.load(weights_resolved, map_location=torch_device)
-    meta = loaded.get("meta") if isinstance(loaded, dict) else {}
-    if not isinstance(meta, dict):
-        meta = {}
+    meta = extract_checkpoint_meta(loaded)
     meta_dataset_num = meta.get("dataset_num_classes") or meta.get("num_classes")
     meta_model_num = meta.get("model_num_classes")
     meta_backbone = meta.get("backbone")
     meta_imgsz = meta.get("imgsz")
-
-    expected_model_num = args_info.get("model_num_classes") or meta_model_num
-    expected_dataset_num = args_info.get("dataset_num_classes") or meta_dataset_num
-    if expected_model_num is None and isinstance(expected_dataset_num, int):
-        expected_model_num = expected_dataset_num + 1
-
-    state_dict = None
-    if isinstance(loaded, dict):
-        state_dict = loaded.get("model_state") or loaded.get("state_dict") or loaded.get("model")
-    if not isinstance(state_dict, dict) and isinstance(loaded, dict):
-        state_dict = loaded if loaded and all(torch.is_tensor(v) for v in loaded.values()) else None
-    if not isinstance(state_dict, dict):
-        state_dict = None
-    ckpt_num_classes = infer_ssd_num_classes(state_dict or {}, logger=_emit)
-
-    if expected_model_num is None:
-        expected_model_num = ckpt_num_classes or (len(class_names) + 1)
+    state_dict, _ = extract_checkpoint_state(loaded)
+    ckpt_num_classes = infer_ssd_num_classes(state_dict, logger=_emit)
+    expected_model_num = (
+        meta_model_num if isinstance(meta_model_num, int) else None
+    ) or (
+        (meta_dataset_num + 1) if isinstance(meta_dataset_num, int) else None
+    ) or ckpt_num_classes or (len(class_names) + 1)
 
     _emit(f"[EVAL][SSD] weights_path={weights_resolved}")
-    if args_info:
-        _emit(
-            "[EVAL][SSD] args.yaml="
-            f"{args_info.get('args_path')} dataset_num_classes={args_info.get('dataset_num_classes')} "
-            f"model_num_classes={args_info.get('model_num_classes')} backbone={args_info.get('backbone')} "
-            f"imgsz={args_info.get('imgsz')}"
-        )
     if meta:
         _emit(
             "[EVAL][SSD] meta="
@@ -187,10 +167,8 @@ def evaluate_torchvision_ssd_voc(
         )
     _emit(
         "[EVAL][SSD] num_classes_model="
-        f"{expected_model_num} num_classes_ckpt={ckpt_num_classes} strict={strict_weights} strict_head={strict_head}"
+        f"{expected_model_num} num_classes_ckpt={ckpt_num_classes} strict={strict_weights}"
     )
-    if args_info.get("backbone") and args_info.get("backbone") != "vgg16":
-        _emit(f"[EVAL][SSD][WARN] backbone esperado={args_info.get('backbone')} porém build_ssd usa vgg16.")
     if meta_backbone and meta_backbone != "vgg16":
         _emit(f"[EVAL][SSD][WARN] backbone do checkpoint={meta_backbone} porém build_ssd usa vgg16.")
 
@@ -200,8 +178,6 @@ def evaluate_torchvision_ssd_voc(
         weights_resolved,
         torch_device,
         strict=strict_weights,
-        strict_head=strict_head,
-        expected_num_classes=int(expected_model_num),
         loaded=loaded,
         logger=_emit,
     )
