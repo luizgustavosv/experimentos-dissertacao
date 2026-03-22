@@ -146,7 +146,7 @@ class TorchvisionDetector(DetectionAlgorithm):
         device_str = resolve_device(self.config.device)
         model, class_names, weights_label = self._load_model_for_inference(weights_path, device_str, logger)
         ssd_score_threshold = (
-            self._resolve_ssd_score_threshold(weights_path=weights_path, logger=logger)
+            self._resolve_ssd_score_threshold(weights_path, logger=logger)
             if self.context.architecture == "SSD"
             else 0.5
         )
