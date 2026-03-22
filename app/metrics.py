@@ -65,9 +65,22 @@ class Metrics:
 class InferencePerformance:
     images_per_second: float
     milliseconds_per_image: float
+    total_images: Optional[int] = None
+    total_detections: Optional[int] = None
+    total_inference_seconds: Optional[float] = None
+    hardware: Optional[str] = None
 
     def to_dict(self) -> Dict[str, float]:
-        return {
+        payload: Dict[str, float] = {
             "images_per_second": self.images_per_second,
             "milliseconds_per_image": self.milliseconds_per_image,
         }
+        if self.total_images is not None:
+            payload["total_images"] = float(self.total_images)
+        if self.total_detections is not None:
+            payload["total_detections"] = float(self.total_detections)
+        if self.total_inference_seconds is not None:
+            payload["total_inference_seconds"] = float(self.total_inference_seconds)
+        if self.hardware is not None:
+            payload["hardware"] = str(self.hardware)
+        return payload

@@ -134,6 +134,7 @@ class TorchvisionDetector(DetectionAlgorithm):
         pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
         ssd_score_threshold: Optional[float] = None,
+        benchmark_mode: bool = False,
     ):
         images_dir = images_dir.expanduser().resolve()
         report_out = report_out.expanduser().resolve()
@@ -160,12 +161,18 @@ class TorchvisionDetector(DetectionAlgorithm):
                 f"pedestrian_label_id={pedestrian_label}"
             )
 
-        prediction_root = report_out.parent / "predictions"
-        save_dir = prediction_root / report_out.stem
-        save_dir.mkdir(parents=True, exist_ok=True)
+        save_dir: Optional[Path] = None
+        if not benchmark_mode:
+            prediction_root = report_out.parent / "predictions"
+            save_dir = prediction_root / report_out.stem
+            save_dir.mkdir(parents=True, exist_ok=True)
 
         transform = transforms.ToTensor()
         previews: List[Path] = []
+        total_detections = 0
+        device = self._resolve_model_device(model)
+        hardware_used = self._describe_hardware(device)
+        self._cuda_sync(device)
         start = time.perf_counter()
         for image_path in image_paths:
             image = Image.open(image_path).convert("RGB")
@@ -181,18 +188,20 @@ class TorchvisionDetector(DetectionAlgorithm):
             boxes = filtered_output["boxes"]
             scores = filtered_output["scores"]
             labels = filtered_output["labels"]
+            total_detections += int(diag["final_count"])
 
-            image_uint8 = (tensor * 255).to(torch.uint8)
-            if boxes.numel() > 0:
-                label_texts = [self._format_label(l, s, class_names) for l, s in zip(labels, scores)]
-                drawn = draw_bounding_boxes(image_uint8, boxes, labels=label_texts, colors="red", width=2)
-            else:
-                drawn = image_uint8
+            if not benchmark_mode and save_dir is not None:
+                image_uint8 = (tensor * 255).to(torch.uint8)
+                if boxes.numel() > 0:
+                    label_texts = [self._format_label(l, s, class_names) for l, s in zip(labels, scores)]
+                    drawn = draw_bounding_boxes(image_uint8, boxes, labels=label_texts, colors="red", width=2)
+                else:
+                    drawn = image_uint8
 
-            save_path = save_dir / image_path.name
-            transforms.ToPILImage()(drawn).save(save_path)
-            if boxes.numel() > 0:
-                previews.append(save_path)
+                save_path = save_dir / image_path.name
+                transforms.ToPILImage()(drawn).save(save_path)
+                if boxes.numel() > 0:
+                    previews.append(save_path)
             if logger:
                 if self.context.architecture == "SSD":
                     logger(
@@ -206,6 +215,7 @@ class TorchvisionDetector(DetectionAlgorithm):
                         f"(raw={diag['raw_count']}, score_threshold={score_threshold}, pedestrian_only={pedestrian_only})"
                     )
 
+        self._cuda_sync(device)
         elapsed = time.perf_counter() - start
         total_images = len(image_paths)
         images_per_second = total_images / elapsed if elapsed > 0 else 0.0
@@ -213,16 +223,20 @@ class TorchvisionDetector(DetectionAlgorithm):
         performance = InferencePerformance(
             images_per_second=images_per_second,
             milliseconds_per_image=milliseconds_per_image,
+            total_images=total_images,
+            total_detections=total_detections,
+            total_inference_seconds=elapsed,
+            hardware=hardware_used,
         )
 
         report_builder = ReportBuilder(self.context.name)
         report_builder.save_report(
             report_path=report_out,
             metrics=None,
-            operation="Inferência",
+            operation="Inferência Rápida / Benchmark" if benchmark_mode else "Inferência",
             source_dir=images_dir,
             inference_performance=performance,
-            detection_previews=previews,
+            detection_previews=None if benchmark_mode else previews,
             weights_path=weights_label,
         )
 
@@ -233,6 +247,25 @@ class TorchvisionDetector(DetectionAlgorithm):
             logger(f"[INFER] Relatório salvo em {report_out}")
 
         return performance
+
+    @staticmethod
+    def _resolve_model_device(model: torch.nn.Module) -> torch.device:
+        try:
+            return next(model.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    @staticmethod
+    def _cuda_sync(device: torch.device) -> None:
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
+    @staticmethod
+    def _describe_hardware(device: torch.device) -> str:
+        if device.type == "cuda" and torch.cuda.is_available():
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            return f"GPU: {torch.cuda.get_device_name(index)}"
+        return "CPU"
 
     def validate(
         self,

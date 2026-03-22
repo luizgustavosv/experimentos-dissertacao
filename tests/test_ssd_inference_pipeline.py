@@ -47,18 +47,25 @@ def test_controller_forwards_ssd_threshold_only_for_ssd() -> None:
     class SSDDummy:
         def __init__(self) -> None:
             self.received_threshold = None
+            self.received_benchmark_mode = None
 
-        def infer(self, *_args, ssd_score_threshold=None, **_kwargs):
+        def infer(self, *_args, ssd_score_threshold=None, benchmark_mode=False, **_kwargs):
             self.received_threshold = ssd_score_threshold
+            self.received_benchmark_mode = benchmark_mode
             return InferencePerformance(images_per_second=1.0, milliseconds_per_image=1.0)
 
     class YOLODummy:
-        def infer(self, *_args, **_kwargs):
+        def __init__(self) -> None:
+            self.received_benchmark_mode = None
+
+        def infer(self, *_args, benchmark_mode=False, **_kwargs):
+            self.received_benchmark_mode = benchmark_mode
             return InferencePerformance(images_per_second=1.0, milliseconds_per_image=1.0)
 
     controller = ExperimentController.__new__(ExperimentController)
     ssd_dummy = SSDDummy()
-    controller.detectors = {"SSD": ssd_dummy, "YOLO": YOLODummy()}
+    yolo_dummy = YOLODummy()
+    controller.detectors = {"SSD": ssd_dummy, "YOLO": yolo_dummy}
 
     controller.execute_infer(
         "SSD",
@@ -66,8 +73,10 @@ def test_controller_forwards_ssd_threshold_only_for_ssd() -> None:
         weights_path=Path("/tmp/weights.pth"),
         report_out=Path("/tmp/report.pdf"),
         ssd_score_threshold=0.33,
+        benchmark_mode=True,
     )
     assert ssd_dummy.received_threshold == 0.33
+    assert ssd_dummy.received_benchmark_mode is True
 
     controller.execute_infer(
         "YOLO",
@@ -75,4 +84,6 @@ def test_controller_forwards_ssd_threshold_only_for_ssd() -> None:
         weights_path=Path("/tmp/weights.pt"),
         report_out=Path("/tmp/report.pdf"),
         ssd_score_threshold=0.88,
+        benchmark_mode=False,
     )
+    assert yolo_dummy.received_benchmark_mode is False
