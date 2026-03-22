@@ -286,6 +286,12 @@ def resolve_ssd_run_config(weights_path: Path, logger: Optional[Logger] = None) 
 
     backbone = payload.get("backbone") or train_config.get("backbone")
     imgsz = payload.get("imgsz") or train_config.get("imgsz")
+    conf_threshold = payload.get("conf_threshold")
+    if not isinstance(conf_threshold, (int, float)):
+        conf_threshold = train_config.get("conf_threshold")
+    score_threshold = payload.get("score_threshold")
+    if not isinstance(score_threshold, (int, float)):
+        score_threshold = train_config.get("score_threshold")
 
     return {
         "args_path": args_path,
@@ -293,6 +299,8 @@ def resolve_ssd_run_config(weights_path: Path, logger: Optional[Logger] = None) 
         "model_num_classes": model_num_classes,
         "backbone": backbone,
         "imgsz": imgsz,
+        "conf_threshold": float(conf_threshold) if isinstance(conf_threshold, (int, float)) else None,
+        "score_threshold": float(score_threshold) if isinstance(score_threshold, (int, float)) else None,
     }
 
 
