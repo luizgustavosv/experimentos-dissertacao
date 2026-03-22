@@ -26,6 +26,9 @@ from app.metrics import Metrics
 from app.metrics import InferencePerformance
 from app.reporting.reports import ReportBuilder
 
+SSD_EVAL_ALIGNED_SCORE_THRESHOLD = 0.05
+SSD_PEDESTRIAN_LABEL_ID = 1
+
 
 class TorchvisionDetector(DetectionAlgorithm):
     def __init__(self, context: DetectorContext, build_model: Callable[[int], torch.nn.Module], config: Optional[TrainConfig] = None):
@@ -141,10 +144,18 @@ class TorchvisionDetector(DetectionAlgorithm):
 
         device_str = resolve_device(self.config.device)
         model, class_names, weights_label = self._load_model_for_inference(weights_path, device_str, logger)
-        pedestrian_label = self._resolve_pedestrian_label_id(class_names) if self.context.architecture == "SSD" else 0
+        ssd_score_threshold = (
+            self._resolve_ssd_score_threshold(weights_path=weights_path, logger=logger)
+            if self.context.architecture == "SSD"
+            else 0.5
+        )
+        pedestrian_label = (
+            self._resolve_pedestrian_label_id(class_names, logger=logger) if self.context.architecture == "SSD" else 0
+        )
         if logger and self.context.architecture == "SSD":
             logger(
-                f"[SSD][INFER] class_names={list(class_names)} pedestrian_label_id={pedestrian_label} pedestrian_only={pedestrian_only}"
+                f"[SSD][INFER] class_names={list(class_names)} pedestrian_label_id={pedestrian_label} "
+                f"pedestrian_only={pedestrian_only} score_threshold={ssd_score_threshold:.4f}"
             )
 
         prediction_root = report_out.parent / "predictions"
@@ -165,9 +176,14 @@ class TorchvisionDetector(DetectionAlgorithm):
             labels = output.get("labels", torch.empty(0, dtype=torch.int64)).detach().cpu()
 
             raw_count = len(boxes)
-            keep = scores >= 0.5
+            keep_score = scores >= ssd_score_threshold
+            score_count = int(keep_score.sum().item())
+            keep = keep_score
+            class_count = score_count
             if pedestrian_only:
-                keep = keep & (labels == pedestrian_label)
+                keep_class = labels == pedestrian_label
+                class_count = int((keep & keep_class).sum().item())
+                keep = keep & keep_class
             boxes = boxes[keep]
             scores = scores[keep]
             labels = labels[keep]
@@ -185,9 +201,18 @@ class TorchvisionDetector(DetectionAlgorithm):
             if boxes.numel() > 0:
                 previews.append(save_path)
             if logger:
-                logger(
-                    f"[INFER] {image_path.name}: {filtered_count} detecções (raw={raw_count}, score_threshold=0.5, pedestrian_only={pedestrian_only})"
-                )
+                if self.context.architecture == "SSD":
+                    logger(
+                        f"[SSD][INFER][DIAG] {image_path.name}: raw={raw_count} "
+                        f"after_score={score_count} after_class={class_count} final={filtered_count} "
+                        f"score_threshold={ssd_score_threshold:.4f} pedestrian_only={pedestrian_only} "
+                        f"pedestrian_label_id={pedestrian_label}"
+                    )
+                else:
+                    logger(
+                        f"[INFER] {image_path.name}: {filtered_count} detecções "
+                        f"(raw={raw_count}, score_threshold={ssd_score_threshold}, pedestrian_only={pedestrian_only})"
+                    )
 
         elapsed = time.perf_counter() - start
         total_images = len(image_paths)
@@ -340,12 +365,51 @@ class TorchvisionDetector(DetectionAlgorithm):
         return ["background", "human"] if num_classes == 2 else [str(idx) for idx in range(num_classes)]
 
     @staticmethod
-    def _resolve_pedestrian_label_id(class_names: Sequence[str]) -> int:
+    def _resolve_pedestrian_label_id(class_names: Sequence[str], logger: Optional[Logger] = None) -> int:
+        if len(class_names) > SSD_PEDESTRIAN_LABEL_ID:
+            if logger:
+                logger(
+                    f"[SSD][INFER] pedestrian_label_id fixado em {SSD_PEDESTRIAN_LABEL_ID} "
+                    "(convenção SSD/VOC com background=0)."
+                )
+            return SSD_PEDESTRIAN_LABEL_ID
+
         aliases = {"human", "pedestrian", "person", "people"}
         for idx, name in enumerate(class_names):
             if str(name).strip().lower() in aliases:
+                if logger:
+                    logger(
+                        f"[SSD][INFER][WARN] convenção SSD label=1 indisponível; "
+                        f"usando alias '{name}' no índice {idx}."
+                    )
                 return idx
-        return 1 if len(class_names) > 1 else 0
+        fallback = 1 if len(class_names) > 1 else 0
+        if logger:
+            logger(
+                f"[SSD][INFER][WARN] classe de pedestre não encontrada por alias; "
+                f"fallback para índice {fallback}."
+            )
+        return fallback
+
+    def _resolve_ssd_score_threshold(self, weights_path: Optional[Path], logger: Optional[Logger]) -> float:
+        args_info: dict = {}
+        if weights_path is not None:
+            args_info = resolve_ssd_run_config(weights_path.expanduser().resolve(), logger=logger)
+
+        threshold_candidates = [
+            args_info.get("conf_threshold") if isinstance(args_info, dict) else None,
+            args_info.get("score_threshold") if isinstance(args_info, dict) else None,
+        ]
+        for candidate in threshold_candidates:
+            if isinstance(candidate, (int, float)) and 0.0 <= float(candidate) <= 1.0:
+                return float(candidate)
+
+        if logger:
+            logger(
+                "[SSD][INFER] score_threshold padrão alinhado à avaliação SSD dedicada: "
+                f"{SSD_EVAL_ALIGNED_SCORE_THRESHOLD:.4f}."
+            )
+        return SSD_EVAL_ALIGNED_SCORE_THRESHOLD
 
     def _load_faster_rcnn_for_inference(
         self, weights_path: Optional[Path], device_str: str, logger: Optional[Logger]
