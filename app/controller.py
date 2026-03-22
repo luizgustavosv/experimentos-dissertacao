@@ -91,9 +91,20 @@ class ExperimentController:
         report_out: Path,
         pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
+        ssd_score_threshold: Optional[float] = None,
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
-        performance = detector.infer(images_dir, weights_path, report_out, pedestrian_only=pedestrian_only, logger=logger)
+        if algorithm_key == "SSD":
+            performance = detector.infer(
+                images_dir,
+                weights_path,
+                report_out,
+                pedestrian_only=pedestrian_only,
+                logger=logger,
+                ssd_score_threshold=ssd_score_threshold,
+            )
+        else:
+            performance = detector.infer(images_dir, weights_path, report_out, pedestrian_only=pedestrian_only, logger=logger)
         return OperationResult(inference_performance=performance, message="Inferência concluída.")
 
     def execute_validate(
