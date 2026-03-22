@@ -27,7 +27,7 @@ from app.metrics import Metrics
 from app.metrics import InferencePerformance
 from app.reporting.reports import ReportBuilder
 
-SSD_DEFAULT_SCORE_THRESHOLD = 0.5
+SSD_DEFAULT_SCORE_THRESHOLD = 0.05
 SSD_PEDESTRIAN_LABEL_ID = 1
 
 
@@ -133,6 +133,7 @@ class TorchvisionDetector(DetectionAlgorithm):
         report_out: Path,
         pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
+        ssd_score_threshold: Optional[float] = None,
     ):
         images_dir = images_dir.expanduser().resolve()
         report_out = report_out.expanduser().resolve()
@@ -145,17 +146,17 @@ class TorchvisionDetector(DetectionAlgorithm):
 
         device_str = resolve_device(self.config.device)
         model, class_names, weights_label = self._load_model_for_inference(weights_path, device_str, logger)
-        ssd_score_threshold = (
-            self._resolve_ssd_score_threshold(weights_path, logger=logger)
-            if self.context.architecture == "SSD"
-            else 0.5
-        )
+        score_threshold = SSD_DEFAULT_SCORE_THRESHOLD
+        if self.context.architecture == "SSD" and ssd_score_threshold is not None:
+            score_threshold = float(ssd_score_threshold)
+        elif self.context.architecture != "SSD":
+            score_threshold = 0.5
         pedestrian_label = (
             self._resolve_pedestrian_label_id(class_names, logger=logger) if self.context.architecture == "SSD" else 0
         )
         if logger and self.context.architecture == "SSD":
             logger(
-                f"[SSD][INFER] score_threshold={ssd_score_threshold:.4f} pedestrian_only={pedestrian_only} "
+                f"[SSD][INFER] score_threshold={score_threshold:.4f} pedestrian_only={pedestrian_only} "
                 f"pedestrian_label_id={pedestrian_label}"
             )
 
@@ -174,7 +175,7 @@ class TorchvisionDetector(DetectionAlgorithm):
             output = outputs[0] if outputs else {}
             filtered_output, diag = filter_torchvision_predictions(
                 output,
-                score_threshold=ssd_score_threshold,
+                score_threshold=score_threshold,
                 target_label=pedestrian_label if pedestrian_only else None,
             )
             boxes = filtered_output["boxes"]
@@ -202,7 +203,7 @@ class TorchvisionDetector(DetectionAlgorithm):
                 else:
                     logger(
                         f"[INFER] {image_path.name}: {diag['final_count']} detecções "
-                        f"(raw={diag['raw_count']}, score_threshold={ssd_score_threshold}, pedestrian_only={pedestrian_only})"
+                        f"(raw={diag['raw_count']}, score_threshold={score_threshold}, pedestrian_only={pedestrian_only})"
                     )
 
         elapsed = time.perf_counter() - start
@@ -359,12 +360,6 @@ class TorchvisionDetector(DetectionAlgorithm):
                 f"usando fallback pedestrian_label_id={fallback}."
             )
         return fallback
-
-    def _resolve_ssd_score_threshold(self, _weights_path: Optional[Path], logger: Optional[Logger]) -> float:
-        threshold = SSD_DEFAULT_SCORE_THRESHOLD
-        if logger:
-            logger(f"[SSD][INFER] score_threshold={threshold:.4f}")
-        return threshold
 
     def _load_faster_rcnn_for_inference(
         self, weights_path: Optional[Path], device_str: str, logger: Optional[Logger]

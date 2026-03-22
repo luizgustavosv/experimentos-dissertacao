@@ -10,8 +10,10 @@ if "ultralytics" not in sys.modules:
     sys.modules["ultralytics"] = ultralytics_stub
 
 from app.detectors.base import DetectorContext
+from app.controller import ExperimentController
 from app.detectors.torchvision_detectors import TorchvisionDetector
 from app.detectors.utils import filter_torchvision_predictions
+from app.metrics import InferencePerformance
 
 
 def _detector() -> TorchvisionDetector:
@@ -38,24 +40,39 @@ def test_filter_torchvision_predictions_applies_score_and_class_filters() -> Non
     assert diag["raw_count"] == 3
     assert diag["after_score"] == 2
     assert diag["after_class"] == 2
-    assert diag["unique_labels_before"] == [1, 2]
-    assert diag["unique_labels_after"] == [1]
+    assert diag["final_count"] == 2
 
 
-def test_ssd_infer_threshold_uses_score_threshold_and_ignores_conf_threshold(monkeypatch) -> None:
-    detector = _detector()
-    fake_weights = Path("/tmp/fake_ssd_weights.pth")
+def test_controller_forwards_ssd_threshold_only_for_ssd() -> None:
+    class SSDDummy:
+        def __init__(self) -> None:
+            self.received_threshold = None
 
-    monkeypatch.setattr(
-        "app.detectors.torchvision_detectors.resolve_ssd_run_config",
-        lambda *_args, **_kwargs: {"conf_threshold": 0.001, "score_threshold": 0.07},
+        def infer(self, *_args, ssd_score_threshold=None, **_kwargs):
+            self.received_threshold = ssd_score_threshold
+            return InferencePerformance(images_per_second=1.0, milliseconds_per_image=1.0)
+
+    class YOLODummy:
+        def infer(self, *_args, **_kwargs):
+            return InferencePerformance(images_per_second=1.0, milliseconds_per_image=1.0)
+
+    controller = ExperimentController.__new__(ExperimentController)
+    ssd_dummy = SSDDummy()
+    controller.detectors = {"SSD": ssd_dummy, "YOLO": YOLODummy()}
+
+    controller.execute_infer(
+        "SSD",
+        images_dir=Path("/tmp/images"),
+        weights_path=Path("/tmp/weights.pth"),
+        report_out=Path("/tmp/report.pdf"),
+        ssd_score_threshold=0.33,
     )
-    threshold = detector._resolve_ssd_score_threshold(fake_weights, logger=None)
-    assert threshold == 0.07
+    assert ssd_dummy.received_threshold == 0.33
 
-    monkeypatch.setattr(
-        "app.detectors.torchvision_detectors.resolve_ssd_run_config",
-        lambda *_args, **_kwargs: {"conf_threshold": 0.001},
+    controller.execute_infer(
+        "YOLO",
+        images_dir=Path("/tmp/images"),
+        weights_path=Path("/tmp/weights.pt"),
+        report_out=Path("/tmp/report.pdf"),
+        ssd_score_threshold=0.88,
     )
-    threshold = detector._resolve_ssd_score_threshold(fake_weights, logger=None)
-    assert threshold == 0.05

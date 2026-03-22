@@ -66,6 +66,7 @@ class DetectorApp(tk.Tk):
         self.eval_split_var = tk.StringVar(value="val")
         self.conf_threshold_var = tk.DoubleVar(value=0.05)
         self.iou_threshold_var = tk.DoubleVar(value=0.5)
+        self.ssd_infer_threshold_var = tk.DoubleVar(value=0.05)
         self.yolo_split_var = tk.StringVar(value="val")
         self.yolo_conf_var = tk.DoubleVar(value=0.001)
         self.yolo_iou_var = tk.DoubleVar(value=0.6)
@@ -213,6 +214,8 @@ class DetectorApp(tk.Tk):
             self._add_path_selector("Pesos para inferência", "inference_weights")
             self._add_path_selector("Imagens para inferência", "images", is_dir=True)
             self._add_path_selector("Relatório PDF da inferência", "report", is_file=True, defaultextension=".pdf")
+            if algorithm == "SSD":
+                self._add_ssd_infer_threshold_selector()
             self._add_pedestrian_filter_selector()
         elif action == "Avaliar SSD":
             if algorithm != "SSD":
@@ -357,6 +360,21 @@ class DetectorApp(tk.Tk):
         frame.pack(fill="x", padx=10, pady=6)
         tk.Label(frame, text=label, bg="#12233d", fg="white").pack(anchor="w")
         spinbox = tk.Spinbox(frame, from_=0.1, to=1.0, increment=0.05, textvariable=variable or self.iou_threshold_var, width=8)
+        spinbox.pack(anchor="w")
+
+    def _add_ssd_infer_threshold_selector(self) -> None:
+        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+        frame.pack(fill="x", padx=10, pady=6)
+        tk.Label(frame, text="Threshold de Inferência SSD (score)", bg="#12233d", fg="white").pack(anchor="w")
+        spinbox = tk.Spinbox(
+            frame,
+            from_=0.01,
+            to=0.99,
+            increment=0.01,
+            format="%.2f",
+            textvariable=self.ssd_infer_threshold_var,
+            width=8,
+        )
         spinbox.pack(anchor="w")
 
     def _add_val_mode_selector(self) -> None:
@@ -662,6 +680,9 @@ class DetectorApp(tk.Tk):
                 weights = Path(weights_raw) if weights_raw else None
                 report = Path(self.path_vars["report"].get())
                 pedestrian_only = bool(self.pedestrian_only_var.get())
+                ssd_score_threshold = (
+                    float(self.ssd_infer_threshold_var.get()) if algorithm_key == "SSD" else None
+                )
                 prompt_logger(
                     self._build_prompt_command(
                         "inferir",
@@ -671,13 +692,20 @@ class DetectorApp(tk.Tk):
                             "pesos": weights or "padrão",
                             "relatorio": report,
                             "apenas_pedestrian": pedestrian_only,
+                            **({"ssd_score_threshold": ssd_score_threshold} if algorithm_key == "SSD" else {}),
                         },
                     )
                 )
 
                 def run_action() -> OperationResult:
                     return self.controller.execute_infer(
-                        algorithm_key, images, weights, report, pedestrian_only, prompt_logger
+                        algorithm_key,
+                        images,
+                        weights,
+                        report,
+                        pedestrian_only,
+                        prompt_logger,
+                        ssd_score_threshold=ssd_score_threshold,
                     )
 
             elif action == "Avaliar SSD":
