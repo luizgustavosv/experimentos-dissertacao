@@ -30,6 +30,7 @@ from torchvision.models.detection.retinanet import RetinaNet
 from app.datasets.class_mapping import summarize_class_mapping
 from app.detectors.base import Logger
 from app.detectors.config import TrainConfig
+from app.detectors.history_utils import load_training_history, save_training_history
 from app.detectors.dataset_coco import (
     CocoDetectionDataset,
     DetectionResize,
@@ -2734,6 +2735,22 @@ def train_torchvision_detector(
         training_finished = False
 
         epochs_completed = 0
+        # Caminhos dos arquivos de histórico (definidos aqui para uso dentro do loop)
+        _hist_json_path = ckpt_dir / "training_history.json"
+        _hist_csv_path = ckpt_dir / "training_history.csv"
+        # Carrega histórico anterior para retomada de treinamento (resume-aware).
+        # Mantém apenas épocas já concluídas antes do checkpoint atual,
+        # evitando duplicação ou sobrescrita de dados ao retomar.
+        epoch_history: list[dict] = [
+            e for e in load_training_history(_hist_json_path)
+            if e.get("epoch", 0) <= resume_epoch_done
+        ]
+        if epoch_history:
+            logging_logger.info(
+                "[HISTORY] Histórico anterior carregado: %d época(s) (até epoch=%d).",
+                len(epoch_history),
+                resume_epoch_done,
+            )
         for epoch in range(resume_start_epoch, epochs_to_run + 1):
             model.train()
             running_loss = 0.0
@@ -3137,6 +3154,43 @@ def train_torchvision_detector(
                 metrics_dict["val_map"] = None
             last_metrics = metrics_dict
 
+            # --- instrumentação: histórico por época ---
+            _h_coco = {}
+            if val_mode == "metrics" and not validation_failed:
+                _h_coco = val_metrics_result.get("coco_metrics", {})
+            _h_val_loss = None
+            if val_mode != "metrics" and not validation_failed and math.isfinite(val_loss_mean_per_batch):
+                _h_val_loss = round(float(val_loss_mean_per_batch), 6)
+            _h_map50 = round(float(_h_coco["AP50"]), 6) if "AP50" in _h_coco else None
+            _h_time = round(time.perf_counter() - epoch_wall_start, 2)
+            epoch_history.append({
+                "epoch": epoch,
+                "train_loss": round(float(avg_loss), 6),
+                "val_loss": _h_val_loss,
+                "map50": _h_map50,
+                "precision": None,
+                "recall": None,
+                "epoch_time_sec": _h_time,
+            })
+            logging_logger.info(
+                "[HISTORY] epoch=%d train_loss=%.4f val_loss=%s map50=%s time=%.2fs",
+                epoch,
+                float(avg_loss),
+                f"{_h_val_loss:.4f}" if _h_val_loss is not None else "null",
+                f"{_h_map50:.4f}" if _h_map50 is not None else "null",
+                _h_time,
+            )
+            # Persistência incremental: salva JSON e CSV ao final de cada época.
+            # Garante que o histórico esteja em disco mesmo em caso de
+            # reinicialização inesperada do Windows.
+            save_training_history(
+                _hist_json_path,
+                _hist_csv_path,
+                epoch_history,
+                logger=logging_logger.info,
+            )
+            # --- fim instrumentação ---
+
             epoch_payload = {
                 "epoch": epoch,
                 "model": model.state_dict(),
@@ -3176,6 +3230,16 @@ def train_torchvision_detector(
                 weights_out = latest_last
             logging_logger.info("Treinamento finalizado com sucesso.")
             final_saved = latest_last is not None
+
+        # --- salvar histórico final (redundância de segurança; já salvo por época) ---
+        if epoch_history:
+            save_training_history(
+                _hist_json_path,
+                _hist_csv_path,
+                epoch_history,
+                logger=logging_logger.info,
+            )
+        # --- fim salvar histórico ---
 
         return Metrics(
             precision=0.0,

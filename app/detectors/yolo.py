@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv as _csv_mod
+import json
 import os
 import re
 import time
@@ -13,6 +15,7 @@ from ultralytics import YOLO
 
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
+from app.detectors.history_utils import load_training_history, save_training_history
 from app.detectors.utils import resolve_device
 from app.metrics import InferencePerformance, Metrics
 from app.training.checkpoint_manager import CheckpointManager, get_latest_last_checkpoint
@@ -82,6 +85,30 @@ def train_yolo(
         raise FileNotFoundError(pretrained_weights)
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Garantir que o campo 'path' no dataset.yaml aponta para o diretório do
+    # próprio arquivo YAML.  O exporter sempre escreve o yaml na raiz do dataset,
+    # mas se o diretório foi movido o campo 'path' pode ter ficado desatualizado
+    # (ex.: exportado em D:\ e movido para C:\).  Ultralytics usa esse campo para
+    # resolver 'images/train' e 'images/val', portanto precisa estar correto.
+    _yaml_correct_path = dataset_yaml.parent.as_posix()
+    try:
+        _yaml_content = yaml.safe_load(dataset_yaml.read_text(encoding="utf-8"))
+        if isinstance(_yaml_content, dict) and str(_yaml_content.get("path", "")).strip() != _yaml_correct_path:
+            _old_path = _yaml_content.get("path", "<ausente>")
+            _yaml_content["path"] = _yaml_correct_path
+            dataset_yaml.write_text(
+                yaml.safe_dump(_yaml_content, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+            if logger:
+                logger(
+                    f"[YOLO][TRAIN] Campo 'path' no dataset.yaml corrigido: "
+                    f"'{_old_path}' -> '{_yaml_correct_path}'"
+                )
+    except Exception as _yaml_fix_exc:
+        if logger:
+            logger(f"[YOLO][TRAIN] Aviso: não foi possível verificar/corrigir 'path' no dataset.yaml: {_yaml_fix_exc}")
 
     planned_epochs = config.epochs
     epochs_to_run = planned_epochs if config.max_epochs is None else min(planned_epochs, config.max_epochs)
@@ -158,6 +185,18 @@ def train_yolo(
     if logger:
         logger(f"[YOLO][CLI] Comando final: {cli_cmd}")
 
+    # --- instrumentação: histórico por época ---
+    _hist_json = run_dir / "training_history.json"
+    _hist_csv = run_dir / "training_history.csv"
+    # Carrega histórico anterior para retomada de treinamento (resume).
+    # Mantém apenas épocas já concluídas antes do checkpoint atual.
+    epoch_history: list[dict] = [
+        e for e in load_training_history(_hist_json)
+        if e.get("epoch", 0) <= resume_completed_epoch
+    ]
+    if epoch_history and logger:
+        logger(f"[YOLO][HISTORY] Histórico anterior carregado: {len(epoch_history)} época(s).")
+
     def _on_fit_epoch_end(trainer) -> None:  # pragma: no cover - depende do backend Ultralytics
         save_dir = Path(getattr(trainer, "save_dir", output_dir / "yolo_visdrone"))
         weights_dir = save_dir / "weights"
@@ -183,10 +222,156 @@ def train_yolo(
 
         checkpoint_manager.cleanup()
 
+        # coletar métricas para histórico
+        try:
+            _metrics = getattr(trainer, "metrics", {}) or {}
+            _train_loss = None
+            for _lk in ("tloss", "loss"):
+                try:
+                    _v = getattr(trainer, _lk, None)
+                    if _v is not None:
+                        _train_loss = round(float(_v), 6)
+                        break
+                except Exception:
+                    pass
+            _map50 = None
+            for _k in ("metrics/mAP50(B)", "metrics/mAP50"):
+                try:
+                    _v = _metrics.get(_k)
+                    if _v is not None:
+                        _map50 = round(float(_v), 6)
+                        break
+                except Exception:
+                    pass
+            _precision = None
+            for _k in ("metrics/precision(B)", "metrics/precision"):
+                try:
+                    _v = _metrics.get(_k)
+                    if _v is not None:
+                        _precision = round(float(_v), 6)
+                        break
+                except Exception:
+                    pass
+            _recall = None
+            for _k in ("metrics/recall(B)", "metrics/recall"):
+                try:
+                    _v = _metrics.get(_k)
+                    if _v is not None:
+                        _recall = round(float(_v), 6)
+                        break
+                except Exception:
+                    pass
+
+            # --- Captura de val_loss ---
+            # Estratégia 1: componentes val/* já presentes em trainer.metrics
+            # (Ultralytics >=8.1 inclui val/box_loss, val/cls_loss, val/dfl_loss).
+            # Estratégia 2: atributos do objeto validator (loss / loss_items).
+            # Estratégia 3: parsear results.csv gerado pelo Ultralytics antes
+            #               de disparar este callback.
+            # O val_loss consolidado é a soma dos componentes de loss de validação,
+            # equivalente ao train_loss (também soma de componentes box+cls+dfl).
+            _val_loss = None
+            try:
+                # Estratégia 1: trainer.metrics tem val/box_loss etc.
+                _val_components: list[float] = []
+                for _col in ("val/box_loss", "val/cls_loss", "val/dfl_loss"):
+                    _v = _metrics.get(_col)
+                    if _v is not None:
+                        try:
+                            _val_components.append(float(_v))
+                        except Exception:
+                            pass
+                if _val_components:
+                    _val_loss = round(sum(_val_components), 6)
+            except Exception:
+                pass
+
+            if _val_loss is None:
+                try:
+                    # Estratégia 2: objeto trainer.validator
+                    _validator = getattr(trainer, "validator", None)
+                    if _validator is not None:
+                        for _vattr in ("loss", "running_loss"):
+                            _vv = getattr(_validator, _vattr, None)
+                            if _vv is not None:
+                                try:
+                                    if torch.is_tensor(_vv):
+                                        _val_loss = round(float(_vv.detach().cpu().mean()), 6)
+                                    else:
+                                        _val_loss = round(float(_vv), 6)
+                                    break
+                                except Exception:
+                                    pass
+                        if _val_loss is None:
+                            _loss_items = getattr(_validator, "loss_items", None)
+                            if _loss_items is not None:
+                                try:
+                                    if torch.is_tensor(_loss_items):
+                                        _val_loss = round(float(_loss_items.detach().cpu().sum()), 6)
+                                    elif hasattr(_loss_items, "__iter__"):
+                                        _val_loss = round(sum(float(x) for x in _loss_items), 6)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+            if _val_loss is None:
+                try:
+                    # Estratégia 3: results.csv gerado pelo Ultralytics
+                    import csv as _csv_local
+                    _save_dir_val = Path(getattr(trainer, "save_dir", ""))
+                    _results_csv = _save_dir_val / "results.csv"
+                    if _results_csv.exists():
+                        with open(_results_csv, "r", encoding="utf-8") as _rf:
+                            _rows = list(_csv_local.DictReader(_rf))
+                        if _rows:
+                            # Normaliza chaves removendo espaços (Ultralytics usa espaços nos headers)
+                            _last = {k.strip(): v.strip() for k, v in _rows[-1].items()}
+                            _val_components = []
+                            for _col in ("val/box_loss", "val/cls_loss", "val/dfl_loss"):
+                                _v = _last.get(_col)
+                                if _v:
+                                    try:
+                                        _val_components.append(float(_v))
+                                    except Exception:
+                                        pass
+                            if _val_components:
+                                _val_loss = round(sum(_val_components), 6)
+                except Exception:
+                    pass
+            # --- fim captura val_loss ---
+
+            epoch_history.append({
+                "epoch": current_epoch,
+                "train_loss": _train_loss,
+                "val_loss": _val_loss,
+                "map50": _map50,
+                "precision": _precision,
+                "recall": _recall,
+                "epoch_time_sec": None,  # não disponível diretamente no callback
+            })
+            if logger:
+                logger(
+                    f"[YOLO][HISTORY] epoch={current_epoch} train_loss={_train_loss} "
+                    f"val_loss={_val_loss} map50={_map50} precision={_precision} recall={_recall}"
+                )
+
+            # Persistência incremental: salva JSON e CSV ao final de cada época.
+            save_training_history(_hist_json, _hist_csv, epoch_history, logger=logger)
+
+        except Exception as _hist_exc:
+            if logger:
+                logger(f"[YOLO][HISTORY] Falha ao coletar métricas da época {current_epoch}: {_hist_exc}")
+
     model.add_callback("on_fit_epoch_end", _on_fit_epoch_end)
     model.add_callback("on_train_end", _on_fit_epoch_end)
 
     model.train(**train_kwargs)
+
+    # --- salvar histórico final (redundância de segurança; já salvo por época) ---
+    if epoch_history:
+        save_training_history(_hist_json, _hist_csv, epoch_history, logger=logger)
+    # --- fim salvar histórico ---
 
 
 class YoloDetector(DetectionAlgorithm):

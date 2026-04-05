@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''app/detectors/torchvision_train.py''\\).read\\(\\)\\); print\\(''torchvision_train.py: OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''app/detectors/yolo.py''\\).read\\(\\)\\); print\\(''yolo.py: OK''\\)\")",
+      "Bash(find C:experimentos-dissertacao -name *.json -type f)",
+      "Bash(find C:experimentos-dissertacao -path *yolo* -name dataset.yaml -type f)",
+      "Bash(find C:experimentos-dissertacaoExperimentos -name *.yaml -type f)",
+      "Bash(python3 -c \"from ultralytics import Settings; print\\(Settings\\(\\)\\)\")",
+      "Bash(find C:Users -name settings.json -path *ultralytics* -type f)",
+      "Bash(python3 -c \"from ultralytics.utils import settings; print\\(settings\\)\")",
+      "Bash(python3 -c \":*)",
+      "Bash(python3:*)"
+    ]
+  }
+}
