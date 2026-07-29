@@ -16,6 +16,10 @@ class RetinaNetDetector(FasterRCNNDetector):
 
     def __init__(self, context: DetectorContext):
         TorchvisionDetector.__init__(self, context, build_retinanet)
+        # RetinaNet always records optimization losses and COCO detection
+        # metrics.  This makes a default training run self-contained for later
+        # experiment analysis (at the cost of a second validation pass).
+        self.config.val_mode = "both"
 
     def validate_trained_weights(
         self,

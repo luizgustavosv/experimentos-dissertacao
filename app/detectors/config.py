@@ -32,7 +32,7 @@ class TrainConfig:
     audit_datasets: bool = True
     dataset_num_classes: Optional[int] = None
     num_classes: Optional[int] = None
-    val_mode: Literal["loss", "metrics"] = "loss"
+    val_mode: Literal["loss", "metrics", "both"] = "loss"
     val_ratio: float = 0.1
     max_epochs: Optional[int] = None
     early_stop_enabled: bool = False

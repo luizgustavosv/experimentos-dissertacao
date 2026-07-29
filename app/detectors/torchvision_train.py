@@ -1998,7 +1998,7 @@ def run_post_training_validation(
 
     expects_background = getattr(config, "num_classes", None) != getattr(config, "dataset_num_classes", None)
     val_mode_requested = getattr(config, "val_mode", "loss")
-    if val_mode_requested not in {"loss", "metrics"}:
+    if val_mode_requested not in {"loss", "metrics", "both"}:
         logging_logger.warning("[VAL] val_mode desconhecido %s; forçando 'loss'", val_mode_requested)
         val_mode_requested = "loss"
     val_mode = val_mode_requested
@@ -2217,11 +2217,11 @@ def train_torchvision_detector(
     if config.max_epochs is not None:
         logging_logger.info("[TRAIN] max_epochs ativo=%s -> epochs_to_run=%s", config.max_epochs, epochs_to_run)
     val_mode_requested = getattr(config, "val_mode", "loss")
-    if val_mode_requested not in {"loss", "metrics"}:
+    if val_mode_requested not in {"loss", "metrics", "both"}:
         logging_logger.warning("[VAL] val_mode desconhecido %s; forçando 'loss'", val_mode_requested)
         val_mode_requested = "loss"
-    early_monitor = "val_loss" if val_mode_requested == "loss" else "AP"
-    early_mode = "min" if val_mode_requested == "loss" else "max"
+    early_monitor = "AP" if val_mode_requested == "metrics" else "val_loss"
+    early_mode = "max" if val_mode_requested == "metrics" else "min"
     early_config = EarlyStoppingConfig(
         enabled=config.early_stop_enabled,
         patience=config.early_stop_patience,
@@ -2978,7 +2978,7 @@ def train_torchvision_detector(
             original_mode = model.training
             model.eval()
             try:
-                if val_mode == "metrics":
+                if val_mode in {"metrics", "both"}:
                     metrics_dir = ckpt_dir / "val_metrics" / f"epoch_{epoch:03d}"
                     with _watchdog_paused(last_progress, watchdog_pause):
                         val_metrics_result = run_val_coco_metrics(
@@ -2990,11 +2990,8 @@ def train_torchvision_detector(
                             tag="[VAL-METRICS]",
                             output_dir=metrics_dir,
                         )
-                    val_loss_mean_per_batch = 0.0
-                    val_loss_mean_per_image = 0.0
-                    breakdown_mean = {}
                     logging_logger.info("[VAL] Época %d | métricas COCO calculadas.", epoch)
-                else:
+                if val_mode in {"loss", "both"}:
                     val_loss_sum = 0.0
                     val_component_sum: dict[str, float] = {}
                     total_images = 0
@@ -3146,7 +3143,7 @@ def train_torchvision_detector(
                 "val_loss": float(val_loss_mean_per_batch),
                 "val_loss_per_image": float(val_loss_mean_per_image),
             }
-            if val_mode == "metrics":
+            if val_mode in {"metrics", "both"}:
                 metrics_valid = bool(val_metrics_result.get("metrics_valid", True))
                 val_map = val_metrics_result.get("coco_metrics", {}).get("AP") if metrics_valid else None
                 metrics_dict["val_map"] = float(val_map) if val_map is not None else None
@@ -3156,20 +3153,35 @@ def train_torchvision_detector(
 
             # --- instrumentação: histórico por época ---
             _h_coco = {}
-            if val_mode == "metrics" and not validation_failed:
+            if val_mode in {"metrics", "both"} and not validation_failed:
                 _h_coco = val_metrics_result.get("coco_metrics", {})
             _h_val_loss = None
-            if val_mode != "metrics" and not validation_failed and math.isfinite(val_loss_mean_per_batch):
+            if val_mode in {"loss", "both"} and not validation_failed and math.isfinite(val_loss_mean_per_batch):
                 _h_val_loss = round(float(val_loss_mean_per_batch), 6)
+            _h_val_loss_per_image = (
+                round(float(val_loss_mean_per_image), 6)
+                if _h_val_loss is not None and math.isfinite(val_loss_mean_per_image)
+                else None
+            )
+            _h_map = round(float(_h_coco["AP"]), 6) if "AP" in _h_coco else None
             _h_map50 = round(float(_h_coco["AP50"]), 6) if "AP50" in _h_coco else None
+            _h_map75 = round(float(_h_coco["AP75"]), 6) if "AP75" in _h_coco else None
+            _h_ar100 = round(float(_h_coco["AR100"]), 6) if "AR100" in _h_coco else None
             _h_time = round(time.perf_counter() - epoch_wall_start, 2)
             epoch_history.append({
                 "epoch": epoch,
                 "train_loss": round(float(avg_loss), 6),
                 "val_loss": _h_val_loss,
+                "val_loss_per_image": _h_val_loss_per_image,
+                "learning_rate": round(float(lr_scheduler.get_last_lr()[0]), 10),
+                "map": _h_map,
                 "map50": _h_map50,
-                "precision": None,
-                "recall": None,
+                "map75": _h_map75,
+                "ar100": _h_ar100,
+                # COCO AP/AR are the appropriate aggregate detection measures;
+                # retain legacy names for report consumers.
+                "precision": _h_map,
+                "recall": _h_ar100,
                 "epoch_time_sec": _h_time,
             })
             logging_logger.info(
