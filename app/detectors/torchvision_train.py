@@ -865,6 +865,10 @@ def _run_smoke_test_val_loss(
     num_classes: Optional[int] = None,
 ) -> None:
     logger.info("[SMOKE] Iniciando smoke_test_val_loss com limite de %d imagens", max_images)
+    # O smoke test move os batches para ``device``; o modelo precisa acompanhá-los.
+    # Mantemos esta garantia também dentro do helper para que chamadas isoladas não
+    # reproduzam o mismatch CUDA input / CPU weight.
+    model.to(device)
     processed_images = 0
     total_loss = 0.0
     component_sum: dict[str, float] = {}
@@ -932,6 +936,9 @@ def run_detection_sanity_check(
     threshold: float = 0.25,
     max_images: int = 5,
 ) -> None:
+    # Este check roda antes do primeiro forward de treinamento e recebe imagens já
+    # movidas para ``device``. Garanta que os pesos estejam no mesmo dispositivo.
+    model.to(device)
     model.eval()
     checked = 0
     detections = 0
@@ -2495,6 +2502,11 @@ def train_torchvision_detector(
             "git_commit": _current_git_commit(),
         }
 
+        # Os checks abaixo já transferem os batches para o dispositivo selecionado.
+        # Mova o modelo antes deles, e não apenas antes de criar o otimizador.
+        logging_logger.info("[SETUP] Movendo modelo para %s antes dos smoke tests.", device_str)
+        model.to(device)
+
         if is_retinanet:
             retinanet_label_stats = _audit_retinanet_label_distribution(train_ds_full, "train", logging_logger)
             val_label_stats = _audit_retinanet_label_distribution(val_ds_full, "val", logging_logger)
@@ -2688,8 +2700,7 @@ def train_torchvision_detector(
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logging_logger.info("[MODEL] Modelo preparado. params=%d | treináveis=%d", total_params, trainable_params)
-        logging_logger.info("[SETUP] Movendo modelo para %s e preparando otimizador.", device_str)
-        model.to(device_str)
+        logging_logger.info("[SETUP] Preparando otimizador com modelo em %s.", device_str)
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.SGD(params, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay)
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.lr_step_size, gamma=config.lr_gamma)
