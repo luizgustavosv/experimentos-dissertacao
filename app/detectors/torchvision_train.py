@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
+import numpy as np
 import torch
 import yaml
 from torch.nn.utils import clip_grad_norm_
@@ -1547,6 +1548,8 @@ def run_val_coco_metrics(
     output_dir: Path,
     label_to_cat_id: dict[int, int] | None = None,
     legacy_drop_label: int | None = None,
+    conf_threshold: float | None = None,
+    iou_threshold: float | None = None,
 ) -> dict:
     COCO, COCOeval = _ensure_pycocotools()
     val_image_ids_set: set[int] = set()
@@ -1623,7 +1626,20 @@ def run_val_coco_metrics(
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = output_dir / "predictions_coco.json"
     predictions_path.unlink(missing_ok=True)
+    conf_threshold_to_use = 0.0 if conf_threshold is None else float(conf_threshold)
+    iou_threshold_to_use = None if iou_threshold is None else float(iou_threshold)
+    if not 0.0 <= conf_threshold_to_use <= 1.0:
+        raise ValueError(f"{tag} conf_threshold deve estar entre 0.0 e 1.0.")
+    if iou_threshold_to_use is not None and not 0.0 < iou_threshold_to_use <= 1.0:
+        raise ValueError(f"{tag} iou_threshold deve estar no intervalo (0.0, 1.0].")
+
     logging_logger.info("%s Gerando predictions_coco.json em %s", tag, predictions_path)
+    logging_logger.info(
+        "%s Thresholds: conf_threshold=%.4f iou_threshold=%s",
+        tag,
+        conf_threshold_to_use,
+        f"{iou_threshold_to_use:.4f}" if iou_threshold_to_use is not None else "COCO-default",
+    )
 
     if dataset_num_classes <= 0:
         raise RuntimeError(f"{tag} Não há categorias no GT para gerar métricas COCO.")
@@ -1743,6 +1759,9 @@ def run_val_coco_metrics(
                     max_label_observed = max(max_label_observed, int(labels_cpu.max()))
 
                 for box, score, label in zip(boxes_cpu, scores_cpu, labels_cpu):
+                    if float(score) < conf_threshold_to_use:
+                        continue
+
                     raw_label = int(label)
                     category_id = _map_label_to_category(raw_label)
                     if category_id is None:
@@ -1912,6 +1931,8 @@ def run_val_coco_metrics(
 
     coco_dt = coco_gt.loadRes(str(predictions_path))
     coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
+    if iou_threshold_to_use is not None:
+        coco_eval.params.iouThrs = np.array([iou_threshold_to_use])
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
@@ -1964,6 +1985,8 @@ def run_val_coco_metrics(
         "pred_summary": pred_summary,
         "gt_annotations": str(val_ann),
         "num_predictions": len(filtered_predictions),
+        "conf_threshold": conf_threshold_to_use,
+        "iou_threshold": iou_threshold_to_use,
     }
 
 
@@ -1978,6 +2001,8 @@ def run_post_training_validation(
     logger: Optional[Logger] = None,
     log_cb: Optional[Callable[[str], None]] = None,
     run_tag: str = "torchvision",
+    conf_threshold: float | None = None,
+    iou_threshold: float | None = None,
 ) -> dict:
     log_dir = Path(config.log_dir).expanduser().resolve()
     safe_stdout = _safe_stream(f"{run_tag}_val_stdout", log_dir)
@@ -1996,6 +2021,11 @@ def run_post_training_validation(
         logging_logger.info(message)
 
     _emit(f"[{run_tag.upper()}][VAL-POST] Logger inicializado em {log_path}")
+    _emit(
+        f"[{run_tag.upper()}][VAL-POST] Thresholds: "
+        f"conf_threshold={conf_threshold if conf_threshold is not None else 'COCO-default'} "
+        f"iou_threshold={iou_threshold if iou_threshold is not None else 'COCO-default'}"
+    )
 
     device_str = resolve_device(config.device)
     device = torch.device(device_str)
@@ -2101,6 +2131,8 @@ def run_post_training_validation(
                 logging_logger,
                 tag="[VAL-METRICS]",
                 output_dir=out_dir,
+                conf_threshold=conf_threshold,
+                iou_threshold=iou_threshold,
             )
         else:
             results = run_val_loss_loop(
@@ -2159,6 +2191,8 @@ def run_post_training_validation(
         "ignored_head_keys": ignored_keys,
         "val_mode_requested": val_mode_requested,
         "val_mode": val_mode,
+        "conf_threshold": conf_threshold,
+        "iou_threshold": iou_threshold,
         **results,
     }
     results_payload.update({"output_dir": str(out_dir)})

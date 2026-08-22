@@ -43,6 +43,8 @@ class FasterRCNNDetector(TorchvisionDetector):
         train_ann: Optional[Path] = None,
         val_ann: Optional[Path] = None,
         val_mode: Optional[str] = None,
+        conf_threshold: float = 0.05,
+        iou_threshold: float = 0.5,
         logger: Optional[Logger] = None,
         log_cb: Optional[Callable[[str], None]] = None,
     ) -> dict:
@@ -65,6 +67,8 @@ class FasterRCNNDetector(TorchvisionDetector):
             logger=logger,
             log_cb=log_cb,
             run_tag="faster_rcnn",
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
         )
 
     def _prepare_model(

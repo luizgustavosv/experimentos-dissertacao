@@ -278,6 +278,8 @@ class DetectorApp(tk.Tk):
                 )
                 if algorithm == "Faster R-CNN":
                     self._add_val_mode_selector()
+                    self._add_conf_threshold_selector(label="Limite de confiança (Faster R-CNN)")
+                    self._add_iou_threshold_selector(label="Limite de IoU (Faster R-CNN)")
         elif action == "Normalizar dataset":
             self._add_dataset_type_selector()
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
@@ -798,6 +800,8 @@ class DetectorApp(tk.Tk):
                 val_annotations_raw = self.path_vars["val_annotations"].get().strip()
                 val_annotations = Path(val_annotations_raw) if val_annotations_raw else None
                 weights = Path(self.path_vars["validation_weights"].get())
+                conf_threshold = float(self.conf_threshold_var.get())
+                iou_threshold = float(self.iou_threshold_var.get())
 
                 prompt_logger(
                     self._build_prompt_command(
@@ -808,6 +812,11 @@ class DetectorApp(tk.Tk):
                             "val": val_annotations or "auto",
                             "imagens": images_dir,
                             "pesos": weights,
+                            **(
+                                {"conf_threshold": conf_threshold, "iou_threshold": iou_threshold}
+                                if algorithm_key == "Faster R-CNN"
+                                else {}
+                            ),
                         },
                     )
                 )
@@ -821,6 +830,8 @@ class DetectorApp(tk.Tk):
                             weights_path=weights,
                             val_annotations=val_annotations,
                             val_mode=self.val_mode_var.get(),
+                            conf_threshold=conf_threshold,
+                            iou_threshold=iou_threshold,
                             logger=prompt_logger,
                             log_cb=lambda msg: self._emit_gui(msg, stdout=False),
                         )

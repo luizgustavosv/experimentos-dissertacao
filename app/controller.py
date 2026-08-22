@@ -239,6 +239,8 @@ class ExperimentController:
         weights_path: Path,
         val_annotations: Optional[Path] = None,
         val_mode: Optional[str] = None,
+        conf_threshold: float = 0.05,
+        iou_threshold: float = 0.5,
         logger: Optional[Logger] = None,
         log_cb: Optional[Callable[[str], None]] = None,
     ) -> OperationResult:
@@ -257,6 +259,8 @@ class ExperimentController:
             train_ann=coco_ann,
             val_ann=val_ann,
             val_mode=val_mode,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
             logger=logger,
             log_cb=log_cb,
         )
