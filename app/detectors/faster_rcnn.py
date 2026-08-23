@@ -45,7 +45,7 @@ class FasterRCNNDetector(TorchvisionDetector):
         val_mode: Optional[str] = None,
         output_dir: Optional[Path] = None,
         device: Optional[str] = None,
-        conf_threshold: float = 0.05,
+        conf_threshold: float = 0.25,
         iou_threshold: float = 0.5,
         logger: Optional[Logger] = None,
         log_cb: Optional[Callable[[str], None]] = None,

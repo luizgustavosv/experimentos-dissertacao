@@ -13,12 +13,12 @@ def build_faster_rcnn(num_classes: int):
             weights=None,
             weights_backbone=backbone_weights,
             num_classes=num_classes,
+            box_detections_per_img=300,
         )
     except TypeError:
-        return torchvision.models.detection.fasterrcnn_resnet50_fpn(
-            weights=None,
-            num_classes=num_classes,
-        )
+        model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights=None, num_classes=num_classes)
+        model.roi_heads.detections_per_img = 300
+        return model
 
 
 def build_retinanet(num_classes: int):
@@ -27,7 +27,11 @@ def build_retinanet(num_classes: int):
 
     # Carrega apenas backbone/FPN pré-treinados no COCO e recria o head para o dataset alvo.
     weights = RetinaNet_ResNet50_FPN_Weights.COCO_V1
-    model = retinanet_resnet50_fpn(weights=weights)
+    try:
+        model = retinanet_resnet50_fpn(weights=weights, detections_per_img=300)
+    except TypeError:
+        model = retinanet_resnet50_fpn(weights=weights)
+        model.detections_per_img = 300
 
     classification_head = model.head.classification_head
     num_anchors = classification_head.num_anchors
@@ -40,6 +44,13 @@ def build_retinanet(num_classes: int):
 
 
 def build_ssd(num_classes: int):
-    return torchvision.models.detection.ssd300_vgg16(
-        weights=None, weights_backbone=VGG16_Weights.DEFAULT, num_classes=num_classes
-    )
+    try:
+        return torchvision.models.detection.ssd300_vgg16(
+            weights=None, weights_backbone=VGG16_Weights.DEFAULT, num_classes=num_classes, detections_per_img=300
+        )
+    except TypeError:
+        model = torchvision.models.detection.ssd300_vgg16(
+            weights=None, weights_backbone=VGG16_Weights.DEFAULT, num_classes=num_classes
+        )
+        model.detections_per_img = 300
+        return model

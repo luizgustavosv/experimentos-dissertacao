@@ -1,0 +1,446 @@
+from __future__ import annotations
+
+import json
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional
+
+import numpy as np
+
+
+Logger = Optional[Callable[[str], None]]
+
+DEFAULT_CONF_THRESHOLD = 0.25
+DEFAULT_IOU_ASSOCIATION_THRESHOLD = 0.5
+DEFAULT_MAX_DETECTIONS = 300
+VISDRONE_VAL_IMAGES = 548
+
+METRIC_KEYS = [
+    "map50",
+    "map50_95",
+    "map75",
+    "map_small",
+    "map_medium",
+    "map_large",
+    "ar1",
+    "ar10",
+    "ar100",
+    "ar_small",
+    "ar_medium",
+    "ar_large",
+    "precision_micro",
+    "recall_micro",
+    "f1_micro",
+    "precision_macro",
+    "recall_macro",
+    "f1_macro",
+    "per_class",
+    "confusion_matrix",
+]
+
+
+def expected_validation_images(dataset_name: str | None, annotations_path: Path | None = None) -> int | None:
+    name = (dataset_name or "").lower()
+    path_text = str(annotations_path or "").lower()
+    if "visdrone" in name or "visdrone" in path_text:
+        return VISDRONE_VAL_IMAGES
+    return None
+
+
+def read_coco_json(path: Path) -> dict[str, Any]:
+    data = json.loads(Path(path).expanduser().resolve().read_text(encoding="utf-8"))
+    required = {"images", "annotations", "categories"}
+    missing = required - set(data.keys())
+    if missing:
+        raise ValueError(f"COCO JSON inválido em {path}. Chaves ausentes: {sorted(missing)}")
+    return data
+
+
+def assert_official_validation_split(
+    val_annotations: Path,
+    *,
+    dataset_name: str | None = None,
+    expected_images: int | None = None,
+) -> dict[str, Any]:
+    val_data = read_coco_json(val_annotations)
+    image_count = len(val_data.get("images", []))
+    expected = expected_images
+    if expected is None:
+        expected = expected_validation_images(dataset_name, val_annotations)
+    if expected is not None and image_count != expected:
+        raise AssertionError(
+            f"Partição de validação inválida: esperado {expected} imagens para {dataset_name or val_annotations}, "
+            f"mas foram carregadas {image_count}. Use exclusivamente a divisão oficial de validação."
+        )
+    return {"expected_images": expected, "actual_images": image_count, "passed": expected is None or image_count == expected}
+
+
+def check_train_val_disjoint(train_annotations: Path | None, val_annotations: Path) -> dict[str, Any]:
+    if train_annotations is None:
+        return {"checked": False, "disjoint": None, "intersection_count": None, "intersection_sample": []}
+    train_data = read_coco_json(train_annotations)
+    val_data = read_coco_json(val_annotations)
+    train_ids = {int(img["id"]) for img in train_data.get("images", []) if "id" in img}
+    val_ids = {int(img["id"]) for img in val_data.get("images", []) if "id" in img}
+    intersection = sorted(train_ids & val_ids)
+    return {
+        "checked": True,
+        "disjoint": len(intersection) == 0,
+        "train_images": len(train_ids),
+        "val_images": len(val_ids),
+        "intersection_count": len(intersection),
+        "intersection_sample": intersection[:20],
+    }
+
+
+def xywh_to_xyxy(box: Iterable[float]) -> list[float]:
+    x, y, w, h = [float(v) for v in box]
+    return [x, y, x + w, y + h]
+
+
+def box_iou(a: list[float], b: list[float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _filter_and_cap_predictions(
+    predictions: list[dict[str, Any]],
+    *,
+    conf_threshold: float,
+    max_detections: int,
+) -> list[dict[str, Any]]:
+    # Ordem metodológica: primeiro aplica o limiar de confiança, depois limita o teto por imagem.
+    by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for pred in predictions:
+        if float(pred.get("score", 0.0)) >= conf_threshold:
+            by_image[int(pred["image_id"])].append(pred)
+
+    capped: list[dict[str, Any]] = []
+    for _, items in by_image.items():
+        items_sorted = sorted(items, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        capped.extend(items_sorted[:max_detections])
+    return capped
+
+
+def _compute_pr_and_confusion(
+    gt_data: dict[str, Any],
+    predictions: list[dict[str, Any]],
+    *,
+    conf_threshold: float,
+    iou_threshold: float,
+) -> dict[str, Any]:
+    cat_ids = [int(cat["id"]) for cat in gt_data.get("categories", []) if "id" in cat]
+    cat_names = {int(cat["id"]): str(cat.get("name", cat["id"])) for cat in gt_data.get("categories", []) if "id" in cat}
+    cat_to_idx = {cat_id: idx for idx, cat_id in enumerate(cat_ids)}
+    background_idx = len(cat_ids)
+
+    gts_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for ann in gt_data.get("annotations", []):
+        if int(ann.get("iscrowd", 0)) == 1:
+            continue
+        gts_by_image[int(ann["image_id"])].append(
+            {"category_id": int(ann["category_id"]), "bbox": xywh_to_xyxy(ann["bbox"]), "matched": False}
+        )
+
+    preds_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for pred in predictions:
+        if float(pred.get("score", 0.0)) < conf_threshold:
+            continue
+        preds_by_image[int(pred["image_id"])].append(
+            {
+                "category_id": int(pred["category_id"]),
+                "bbox": xywh_to_xyxy(pred["bbox"]),
+                "score": float(pred.get("score", 0.0)),
+            }
+        )
+
+    matrix = np.zeros((len(cat_ids) + 1, len(cat_ids) + 1), dtype=np.int64)
+    per_class_counts = {cat_id: {"tp": 0, "fp": 0, "fn": 0} for cat_id in cat_ids}
+    tp = fp = fn = 0
+
+    all_image_ids = set(gts_by_image.keys()) | set(preds_by_image.keys())
+    for image_id in all_image_ids:
+        gts = gts_by_image.get(image_id, [])
+        preds = sorted(preds_by_image.get(image_id, []), key=lambda item: item["score"], reverse=True)
+        matched_gt: set[int] = set()
+
+        for pred in preds:
+            best_idx = None
+            best_iou = 0.0
+            for idx, gt in enumerate(gts):
+                if idx in matched_gt:
+                    continue
+                iou = box_iou(pred["bbox"], gt["bbox"])
+                if iou >= iou_threshold and iou > best_iou:
+                    best_iou = iou
+                    best_idx = idx
+
+            pred_cat = pred["category_id"]
+            pred_idx = cat_to_idx.get(pred_cat, background_idx)
+            if best_idx is not None:
+                gt = gts[best_idx]
+                matched_gt.add(best_idx)
+                gt_idx = cat_to_idx.get(gt["category_id"], background_idx)
+                matrix[gt_idx, pred_idx] += 1
+                if pred_cat == gt["category_id"]:
+                    tp += 1
+                    per_class_counts.setdefault(pred_cat, {"tp": 0, "fp": 0, "fn": 0})["tp"] += 1
+                else:
+                    fp += 1
+                    fn += 1
+                    per_class_counts.setdefault(pred_cat, {"tp": 0, "fp": 0, "fn": 0})["fp"] += 1
+                    per_class_counts.setdefault(gt["category_id"], {"tp": 0, "fp": 0, "fn": 0})["fn"] += 1
+            else:
+                matrix[background_idx, pred_idx] += 1
+                fp += 1
+                per_class_counts.setdefault(pred_cat, {"tp": 0, "fp": 0, "fn": 0})["fp"] += 1
+
+        for idx, gt in enumerate(gts):
+            if idx in matched_gt:
+                continue
+            gt_cat = gt["category_id"]
+            gt_idx = cat_to_idx.get(gt_cat, background_idx)
+            matrix[gt_idx, background_idx] += 1
+            fn += 1
+            per_class_counts.setdefault(gt_cat, {"tp": 0, "fp": 0, "fn": 0})["fn"] += 1
+
+    precision_micro = tp / (tp + fp) if tp + fp else 0.0
+    recall_micro = tp / (tp + fn) if tp + fn else 0.0
+    f1_micro = 2 * precision_micro * recall_micro / (precision_micro + recall_micro) if precision_micro + recall_micro else 0.0
+
+    precisions = []
+    recalls = []
+    f1s = []
+    for cat_id in cat_ids:
+        counts = per_class_counts.get(cat_id, {"tp": 0, "fp": 0, "fn": 0})
+        p = counts["tp"] / (counts["tp"] + counts["fp"]) if counts["tp"] + counts["fp"] else 0.0
+        r = counts["tp"] / (counts["tp"] + counts["fn"]) if counts["tp"] + counts["fn"] else 0.0
+        f = 2 * p * r / (p + r) if p + r else 0.0
+        precisions.append(p)
+        recalls.append(r)
+        f1s.append(f)
+
+    row_sums = matrix.sum(axis=1, keepdims=True)
+    normalized = np.divide(matrix, row_sums, out=np.zeros_like(matrix, dtype=np.float64), where=row_sums != 0)
+    labels = [cat_names.get(cat_id, str(cat_id)) for cat_id in cat_ids] + ["background"]
+    return {
+        "precision_micro": float(precision_micro),
+        "recall_micro": float(recall_micro),
+        "f1_micro": float(f1_micro),
+        "precision_macro": float(np.mean(precisions)) if precisions else 0.0,
+        "recall_macro": float(np.mean(recalls)) if recalls else 0.0,
+        "f1_macro": float(np.mean(f1s)) if f1s else 0.0,
+        "confusion_matrix": {
+            "labels_true": labels,
+            "labels_pred": labels,
+            "absolute": matrix.tolist(),
+            "normalized_by_true": normalized.tolist(),
+        },
+    }
+
+
+def _mean_valid(values: np.ndarray) -> float | None:
+    valid = values[values > -1]
+    return float(np.mean(valid)) if valid.size else None
+
+
+def _coco_stats_from_eval(evaluator: Any, max_detections: int) -> list[float | None]:
+    precision = evaluator.eval.get("precision")
+    recall = evaluator.eval.get("recall")
+    if precision is None or recall is None:
+        return [None] * 12
+
+    params = evaluator.params
+    max_det_idx = list(params.maxDets).index(max_detections)
+    max_det_1_idx = list(params.maxDets).index(1)
+    max_det_10_idx = list(params.maxDets).index(10)
+    area_labels = list(params.areaRngLbl)
+    all_idx = area_labels.index("all")
+    small_idx = area_labels.index("small")
+    medium_idx = area_labels.index("medium")
+    large_idx = area_labels.index("large")
+    ious = np.asarray(params.iouThrs)
+    iou50_idx = int(np.where(np.isclose(ious, 0.5))[0][0])
+    iou75_idx = int(np.where(np.isclose(ious, 0.75))[0][0])
+
+    return [
+        _mean_valid(precision[:, :, :, all_idx, max_det_idx]),
+        _mean_valid(precision[iou50_idx, :, :, all_idx, max_det_idx]),
+        _mean_valid(precision[iou75_idx, :, :, all_idx, max_det_idx]),
+        _mean_valid(precision[:, :, :, small_idx, max_det_idx]),
+        _mean_valid(precision[:, :, :, medium_idx, max_det_idx]),
+        _mean_valid(precision[:, :, :, large_idx, max_det_idx]),
+        _mean_valid(recall[:, :, all_idx, max_det_1_idx]),
+        _mean_valid(recall[:, :, all_idx, max_det_10_idx]),
+        _mean_valid(recall[:, :, all_idx, max_det_idx]),
+        _mean_valid(recall[:, :, small_idx, max_det_idx]),
+        _mean_valid(recall[:, :, medium_idx, max_det_idx]),
+        _mean_valid(recall[:, :, large_idx, max_det_idx]),
+    ]
+
+
+def evaluate_coco_predictions(
+    *,
+    gt_annotations: Path,
+    predictions_json: Path,
+    output_dir: Path,
+    model_name: str,
+    dataset_name: str,
+    split: str,
+    weights_path: Path | None = None,
+    train_annotations: Path | None = None,
+    conf_threshold: float = DEFAULT_CONF_THRESHOLD,
+    iou_threshold: float = DEFAULT_IOU_ASSOCIATION_THRESHOLD,
+    max_detections: int = DEFAULT_MAX_DETECTIONS,
+    input_size: int | None = None,
+    device: str | None = None,
+    epoch_relative: int | None = None,
+    epoch_accumulated: int | None = None,
+    logger: Logger = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+
+    gt_annotations = Path(gt_annotations).expanduser().resolve()
+    predictions_json = Path(predictions_json).expanduser().resolve()
+    output_dir = Path(output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    gt_data = read_coco_json(gt_annotations)
+    split_check = assert_official_validation_split(gt_annotations, dataset_name=dataset_name)
+    disjoint_check = check_train_val_disjoint(train_annotations, gt_annotations)
+    if disjoint_check["checked"] and not disjoint_check["disjoint"]:
+        raise AssertionError(
+            f"IDs de imagem de treino e validação não são disjuntos: interseção={disjoint_check['intersection_count']}"
+        )
+
+    raw_predictions = json.loads(predictions_json.read_text(encoding="utf-8"))
+    predictions = _filter_and_cap_predictions(
+        raw_predictions,
+        conf_threshold=conf_threshold,
+        max_detections=max_detections,
+    )
+    filtered_predictions_path = output_dir / "predictions_coco_filtered.json"
+    filtered_predictions_path.write_text(json.dumps(predictions, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    coco_gt = COCO(str(gt_annotations))
+    if predictions:
+        coco_dt = coco_gt.loadRes(str(filtered_predictions_path))
+        evaluator = COCOeval(coco_gt, coco_dt, iouType="bbox")
+        evaluator.params.maxDets = [1, 10, int(max_detections)]
+        evaluator.evaluate()
+        evaluator.accumulate()
+        evaluator.summarize()
+        stats = _coco_stats_from_eval(evaluator, int(max_detections))
+        precision_array = evaluator.eval.get("precision")
+    else:
+        stats = [0.0] * 12
+        precision_array = None
+
+    metrics: dict[str, Any] = {
+        "map50_95": stats[0],
+        "map50": stats[1],
+        "map75": stats[2],
+        "map_small": stats[3],
+        "map_medium": stats[4],
+        "map_large": stats[5],
+        "ar1": stats[6],
+        "ar10": stats[7],
+        "ar100": stats[8],
+        "ar_small": stats[9],
+        "ar_medium": stats[10],
+        "ar_large": stats[11],
+    }
+
+    per_class: dict[str, Any] = {}
+    categories = gt_data.get("categories", [])
+    if predictions and precision_array is not None:
+        for idx, cat_id in enumerate(evaluator.params.catIds):
+            cat = next((c for c in categories if int(c.get("id")) == int(cat_id)), {"name": str(cat_id)})
+            cls_all = precision_array[:, :, idx, 0, 2]
+            cls_all = cls_all[cls_all > -1]
+            cls_50 = precision_array[0, :, idx, 0, 2]
+            cls_50 = cls_50[cls_50 > -1]
+            per_class[str(cat_id)] = {
+                "name": cat.get("name"),
+                "ap50": float(np.mean(cls_50)) if cls_50.size else None,
+                "ap50_95": float(np.mean(cls_all)) if cls_all.size else None,
+            }
+    else:
+        for cat in categories:
+            per_class[str(cat.get("id"))] = {"name": cat.get("name"), "ap50": None, "ap50_95": None}
+
+    metrics["per_class"] = per_class
+    metrics.update(
+        _compute_pr_and_confusion(
+            gt_data,
+            predictions,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+        )
+    )
+
+    by_image_counts: dict[int, int] = defaultdict(int)
+    for pred in predictions:
+        by_image_counts[int(pred["image_id"])] += 1
+    saturation_count = sum(1 for count in by_image_counts.values() if count >= max_detections)
+    saturation_alert = saturation_count > 0
+
+    result = {
+        "schema_version": "unified-detection-eval-v1",
+        "model": model_name,
+        "dataset": dataset_name,
+        "split": split,
+        "gt_annotations": str(gt_annotations),
+        "train_annotations": str(Path(train_annotations).expanduser().resolve()) if train_annotations else None,
+        "predictions_coco_json": str(predictions_json),
+        "predictions_coco_filtered_json": str(filtered_predictions_path),
+        "output_dir": str(output_dir),
+        "weights_path": str(Path(weights_path).expanduser().resolve()) if weights_path is not None else None,
+        "epoch_relative": epoch_relative,
+        "epoch_accumulated": epoch_accumulated,
+        "parameters": {
+            "conf_threshold": float(conf_threshold),
+            "iou_association_threshold": float(iou_threshold),
+            "max_detections_per_image": int(max_detections),
+            "weights_policy": "last_checkpoint_at_epoch_budget",
+            "device": device,
+            "input_size": input_size,
+            "class_mapping": "COCO category_id preserved; torchvision internal labels reserve/adjust background before export",
+        },
+        "validation_split_check": split_check,
+        "train_val_disjoint_check": disjoint_check,
+        "num_images": len(gt_data.get("images", [])),
+        "num_detections": len(predictions),
+        "num_prediction_categories": len({int(p["category_id"]) for p in predictions}),
+        "saturation_alert": saturation_alert,
+        "saturation": {
+            "images_at_detection_cap": saturation_count,
+            "max_detections_per_image": int(max_detections),
+            "message": (
+                "Há imagens no teto de detecções; investigue possível saturação."
+                if saturation_alert
+                else None
+            ),
+        },
+        "metrics": {key: metrics.get(key) for key in METRIC_KEYS},
+        "extra": extra or {},
+        "created_at": datetime.now().isoformat(),
+    }
+
+    results_path = output_dir / "results_unified.json"
+    result["results_path"] = str(results_path)
+    results_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    if logger:
+        logger(f"[EVAL][UNIFIED] Resultado salvo em {results_path}")
+    return result

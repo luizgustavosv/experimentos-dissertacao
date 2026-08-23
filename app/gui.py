@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tkinter as tk
 import traceback
 from pathlib import Path
@@ -65,12 +66,12 @@ class DetectorApp(tk.Tk):
         self.epochs_var = tk.IntVar(value=10)
         self.pedestrian_only_var = tk.BooleanVar(value=False)
         self.eval_split_var = tk.StringVar(value="val")
-        self.conf_threshold_var = tk.DoubleVar(value=0.05)
+        self.conf_threshold_var = tk.DoubleVar(value=0.25)
         self.iou_threshold_var = tk.DoubleVar(value=0.5)
         self.ssd_infer_threshold_var = tk.DoubleVar(value=0.05)
         self.yolo_split_var = tk.StringVar(value="val")
-        self.yolo_conf_var = tk.DoubleVar(value=0.001)
-        self.yolo_iou_var = tk.DoubleVar(value=0.6)
+        self.yolo_conf_var = tk.DoubleVar(value=0.25)
+        self.yolo_iou_var = tk.DoubleVar(value=0.5)
         self.yolo_imgsz_var = tk.IntVar(value=640)
         self.yolo_batch_var = tk.IntVar(value=16)
         self.yolo_device_var = tk.StringVar(value="cpu")
@@ -941,6 +942,21 @@ class DetectorApp(tk.Tk):
         self._worker_thread.start()
 
     def _on_action_complete(self, result: OperationResult) -> None:
+        if result.results_path and result.results_path.exists():
+            try:
+                payload = json.loads(result.results_path.read_text(encoding="utf-8"))
+                params = payload.get("parameters", {})
+                metrics = payload.get("metrics", {})
+                self.append_log(
+                    "[RESULTADO][UNIFICADO] "
+                    f"arquivo={result.results_path} imagens={payload.get('num_images')} "
+                    f"detecções={payload.get('num_detections')} "
+                    f"conf={params.get('conf_threshold')} iou={params.get('iou_association_threshold')} "
+                    f"max_det={params.get('max_detections_per_image')} device={params.get('device')} "
+                    f"map50={metrics.get('map50')} map50_95={metrics.get('map50_95')}"
+                )
+            except Exception as exc:
+                self.append_log(f"[RESULTADO][UNIFICADO] Não foi possível ler {result.results_path}: {exc}")
         if result.inference_performance:
             perf = result.inference_performance
             self.append_log(

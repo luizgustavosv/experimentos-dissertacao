@@ -234,7 +234,7 @@ def validate_retinanet_post_train(
     logger: Optional[Logger] = None,
     log_cb: Optional[Callable[[str], None]] = None,
     output_dir: Optional[Path] = None,
-    conf_threshold: float = 0.05,
+    conf_threshold: float = 0.25,
     iou_threshold: float = 0.5,
 ) -> dict:
     log_dir = Path(config.log_dir).expanduser().resolve()
@@ -290,6 +290,7 @@ def validate_retinanet_post_train(
     _emit(f"[RETINANET][VAL-POST] Diretório de saída: {out_dir}")
 
     loaded = torch.load(weights_path.expanduser().resolve(), map_location="cpu")
+    checkpoint_epoch = loaded.get("epoch") if isinstance(loaded, dict) and isinstance(loaded.get("epoch"), int) else None
     meta = _extract_checkpoint_meta(loaded)
     state_dict, checkpoint_format = _extract_state_dict(loaded)
     _emit(f"[RETINANET][VAL-POST] Formato de checkpoint: {checkpoint_format}")
@@ -363,14 +364,16 @@ def validate_retinanet_post_train(
             legacy_drop_label=0 if legacy_mode else None,
             conf_threshold=conf_threshold,
             iou_threshold=iou_threshold,
+            train_ann=train_ann,
+            weights_path=weights_path,
+            model_name="RetinaNet",
+            dataset_name=str(dataset_dir),
+            input_size=config.imgsz,
+            epoch_relative=checkpoint_epoch,
+            epoch_accumulated=checkpoint_epoch,
         )
         metrics_valid = metrics_valid and results.get("metrics_valid", True)
-        pr_metrics = _compute_classic_pr_metrics(
-            Path(results["predictions_coco_json"]),
-            Path(results["gt_annotations"]),
-            logging_logger,
-            iou_threshold=iou_threshold,
-        )
+        pr_metrics = {}
     else:
         results = run_val_loss_loop(
             model,

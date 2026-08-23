@@ -11,9 +11,8 @@ from typing import Callable, Dict, List, Optional, Sequence
 import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torchvision.ops import box_iou
-from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
+from app.avaliacao.metricas import DEFAULT_MAX_DETECTIONS, evaluate_coco_predictions
 from app.detectors.base import Logger
 from app.detectors.dataset_voc import PascalVOCDataset
 from app.detectors.torchvision_models import build_ssd
@@ -44,54 +43,18 @@ def _load_split_ids(dataset_root: Path, split: str, fallback_ids: Sequence[str])
     return list(fallback_ids)
 
 
-def _filter_predictions(output: Dict[str, torch.Tensor], threshold: float) -> Dict[str, torch.Tensor]:
+def _filter_predictions(output: Dict[str, torch.Tensor], threshold: float, max_detections: int = DEFAULT_MAX_DETECTIONS) -> Dict[str, torch.Tensor]:
     filtered, _ = filter_torchvision_predictions(output, score_threshold=threshold)
+    scores = filtered["scores"]
+    if scores.numel() > max_detections:
+        order = torch.argsort(scores, descending=True)[:max_detections]
+        return {key: filtered[key][order] for key in _PREDICTION_KEYS}
     return {key: filtered[key] for key in _PREDICTION_KEYS}
 
 
-def _prepare_target(target: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    return {
-        "boxes": target.get("boxes", torch.zeros((0, 4), dtype=torch.float32)).detach().cpu().float(),
-        "labels": target.get("labels", torch.zeros((0,), dtype=torch.int64)).detach().cpu().long(),
-    }
-
-
-def _update_pr_counters(
-    preds: Dict[str, torch.Tensor],
-    target: Dict[str, torch.Tensor],
-    iou_threshold: float,
-) -> Dict[str, int]:
-    tp = fp = fn = 0
-    pred_boxes = preds["boxes"].float()
-    pred_scores = preds["scores"].float()
-    pred_labels = preds["labels"].long()
-    gt_boxes = target["boxes"].float()
-    gt_labels = target["labels"].long()
-
-    if pred_scores.numel() > 0:
-        order = torch.argsort(pred_scores, descending=True)
-        pred_boxes = pred_boxes[order]
-        pred_labels = pred_labels[order]
-
-    matched = torch.zeros(gt_boxes.shape[0], dtype=torch.bool)
-    for box, label in zip(pred_boxes, pred_labels):
-        if label.item() != 1:
-            continue
-        if gt_boxes.numel() == 0:
-            fp += 1
-            continue
-        ious = box_iou(box.unsqueeze(0), gt_boxes).squeeze(0)
-        max_iou, max_idx = (ious.max(0) if ious.numel() > 0 else (torch.tensor(0.0), torch.tensor(0)))
-        if max_iou >= iou_threshold and not matched[max_idx] and gt_labels[max_idx] == 1:
-            tp += 1
-            matched[max_idx] = True
-        else:
-            fp += 1
-
-    positives = int((gt_labels == 1).sum().item())
-    matched_count = int(matched.sum().item())
-    fn += max(0, positives - matched_count)
-    return {"tp": tp, "fp": fp, "fn": fn}
+def _xyxy_to_xywh(box: torch.Tensor) -> list[float]:
+    x1, y1, x2, y2 = [float(x) for x in box.detach().cpu().tolist()]
+    return [x1, y1, max(0.0, x2 - x1), max(0.0, y2 - y1)]
 
 
 def evaluate_torchvision_ssd_voc(
@@ -101,7 +64,7 @@ def evaluate_torchvision_ssd_voc(
     device: Optional[str] = None,
     batch_size: int = 1,
     num_workers: int = 2,
-    conf_threshold: float = 0.05,
+    conf_threshold: float = 0.25,
     iou_threshold: float = 0.5,
     out_dir: Optional[str] = None,
     logger: Optional[Logger] = None,
@@ -145,6 +108,7 @@ def evaluate_torchvision_ssd_voc(
 
     weights_resolved = Path(weights_path).expanduser().resolve()
     loaded = torch.load(weights_resolved, map_location=torch_device)
+    checkpoint_epoch = loaded.get("epoch") if isinstance(loaded, dict) and isinstance(loaded.get("epoch"), int) else None
     meta = extract_checkpoint_meta(loaded)
     meta_dataset_num = meta.get("dataset_num_classes") or meta.get("num_classes")
     meta_model_num = meta.get("model_num_classes")
@@ -183,9 +147,10 @@ def evaluate_torchvision_ssd_voc(
     )
     model.to(torch_device)
     model.eval()
-
-    metric = MeanAveragePrecision(iou_type="bbox")
-    counters = {"tp": 0, "fp": 0, "fn": 0}
+    if hasattr(model, "score_thresh"):
+        model.score_thresh = float(conf_threshold)
+    if hasattr(model, "detections_per_img"):
+        model.detections_per_img = DEFAULT_MAX_DETECTIONS
 
     total_batches = len(dataloader)
 
@@ -196,17 +161,46 @@ def evaluate_torchvision_ssd_voc(
         _emit("[EVAL] Ambiente Windows detectado: usando funções globais compatíveis com multiprocessing.")
 
     start_time = time.time()
+    predictions: list[dict[str, object]] = []
+    coco_images: list[dict[str, object]] = []
+    coco_annotations: list[dict[str, object]] = []
+    ann_id = 1
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(dataloader, start=1):
             images_device = [img.to(torch_device) for img in images]
             outputs = model(images_device)
-            for output, target in zip(outputs, targets):
-                preds = _filter_predictions(output, conf_threshold)
-                tgt = _prepare_target(target)
-                metric.update([preds], [tgt])
-                pr_counts = _update_pr_counters(preds, tgt, iou_threshold)
-                for key in counters:
-                    counters[key] += pr_counts[key]
+            for image_tensor, output, target in zip(images, outputs, targets):
+                image_id = int(target["image_id"].reshape(-1)[0].item())
+                img_path = str(target.get("img_path", ""))
+                height, width = int(image_tensor.shape[-2]), int(image_tensor.shape[-1])
+                coco_images.append({"id": image_id, "file_name": Path(img_path).name if img_path else str(image_id), "width": width, "height": height})
+
+                gt_boxes = target.get("boxes", torch.zeros((0, 4), dtype=torch.float32)).detach().cpu().float()
+                gt_labels = target.get("labels", torch.zeros((0,), dtype=torch.int64)).detach().cpu().long()
+                for box, label in zip(gt_boxes, gt_labels):
+                    bbox = _xyxy_to_xywh(box)
+                    coco_annotations.append(
+                        {
+                            "id": ann_id,
+                            "image_id": image_id,
+                            "category_id": int(label.item()),
+                            "bbox": bbox,
+                            "area": float(bbox[2] * bbox[3]),
+                            "iscrowd": 0,
+                        }
+                    )
+                    ann_id += 1
+
+                preds = _filter_predictions(output, conf_threshold, DEFAULT_MAX_DETECTIONS)
+                for box, score, label in zip(preds["boxes"].detach().cpu(), preds["scores"].detach().cpu(), preds["labels"].detach().cpu()):
+                    predictions.append(
+                        {
+                            "image_id": image_id,
+                            "category_id": int(label.item()),
+                            "bbox": _xyxy_to_xywh(box),
+                            "score": float(score.item()),
+                        }
+                    )
 
             processed_images = min(batch_idx * batch_size, len(dataset))
             if processed_images % progress_every == 0 or batch_idx == total_batches:
@@ -218,42 +212,62 @@ def evaluate_torchvision_ssd_voc(
                     f"[EVAL] {processed_images}/{len(dataset)} | {rate:.2f} img/s | elapsed {elapsed:.1f}s | ETA {eta:.1f}s"
                 )
 
-    metric_result = metric.compute()
-    precision = counters["tp"] / (counters["tp"] + counters["fp"] + 1e-8) if (counters["tp"] + counters["fp"]) > 0 else 0.0
-    recall = counters["tp"] / (counters["tp"] + counters["fn"] + 1e-8) if (counters["tp"] + counters["fn"]) > 0 else 0.0
-
-    result = {
-        "map": float(metric_result.get("map", torch.tensor(0.0)).item()),
-        "map50": float(metric_result.get("map_50", torch.tensor(0.0)).item()),
-        "mar_100": float(metric_result.get("mar_100", torch.tensor(0.0)).item()),
-        "precision": float(precision),
-        "recall": float(recall),
-        "conf_threshold": float(conf_threshold),
-        "iou_threshold": float(iou_threshold),
-        "split": split_normalized,
-        "weights_path": str(Path(weights_path).expanduser().resolve()),
-        "timestamp": datetime.now().isoformat(),
-        "device": device_str,
-        "num_images": len(dataset),
-        "classes": class_names,
-    }
-
     output_dir = Path(out_dir) if out_dir else Path(weights_path).expanduser().resolve().parent / "eval"
     output_dir.mkdir(parents=True, exist_ok=True)
+    gt_path = output_dir / "gt_coco.json"
+    predictions_path = output_dir / "predictions_coco.json"
+    categories = [{"id": idx + 1, "name": name} for idx, name in enumerate(class_names)]
+    gt_payload = {"images": coco_images, "annotations": coco_annotations, "categories": categories}
+    gt_path.write_text(json.dumps(gt_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    predictions_path.write_text(json.dumps(predictions, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    result = evaluate_coco_predictions(
+        gt_annotations=gt_path,
+        predictions_json=predictions_path,
+        output_dir=output_dir,
+        model_name="SSD300",
+        dataset_name=str(dataset_root),
+        split=split_normalized,
+        weights_path=weights_resolved,
+        conf_threshold=float(conf_threshold),
+        iou_threshold=float(iou_threshold),
+        max_detections=DEFAULT_MAX_DETECTIONS,
+        input_size=300,
+        device=device_str,
+        epoch_relative=checkpoint_epoch,
+        epoch_accumulated=checkpoint_epoch,
+        logger=_emit,
+        extra={"classes": class_names, "checkpoint_meta": meta},
+    )
+    metrics = result.get("metrics", {})
     json_path = output_dir / "metrics.json"
     csv_path = output_dir / "metrics.csv"
 
     json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    csv_fields = ["timestamp", "split", "map", "map50", "mar_100", "precision", "recall", "conf_threshold", "iou_threshold", "weights_path", "num_images", "device"]
+    csv_fields = ["created_at", "split", "map50_95", "map50", "ar100", "precision_micro", "recall_micro", "conf_threshold", "iou_threshold", "weights_path", "num_images", "device"]
     with csv_path.open("w", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=csv_fields)
         writer.writeheader()
-        writer.writerow({field: result.get(field, "") for field in csv_fields})
+        row = {
+            "created_at": result.get("created_at"),
+            "split": result.get("split"),
+            "map50_95": metrics.get("map50_95"),
+            "map50": metrics.get("map50"),
+            "ar100": metrics.get("ar100"),
+            "precision_micro": metrics.get("precision_micro"),
+            "recall_micro": metrics.get("recall_micro"),
+            "conf_threshold": result.get("parameters", {}).get("conf_threshold"),
+            "iou_threshold": result.get("parameters", {}).get("iou_association_threshold"),
+            "weights_path": result.get("weights_path"),
+            "num_images": result.get("num_images"),
+            "device": result.get("parameters", {}).get("device"),
+        }
+        writer.writerow(row)
 
     _emit(f"[EVAL] Resultado salvo em {output_dir}")
     _emit(
-        f"[EVAL] mAP@0.5:0.95={result['map']:.4f} | mAP@0.5={result['map50']:.4f} | Precision={result['precision']:.4f} | Recall={result['recall']:.4f}"
+        f"[EVAL] mAP@0.5:0.95={metrics.get('map50_95')} | mAP@0.5={metrics.get('map50')} | Precision={metrics.get('precision_micro')} | Recall={metrics.get('recall_micro')}"
     )
 
     return result

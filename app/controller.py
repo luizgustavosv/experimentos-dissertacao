@@ -17,6 +17,7 @@ class OperationResult:
     metrics: Optional[Metrics] = None
     inference_performance: Optional[InferencePerformance] = None
     message: str = ""
+    results_path: Optional[Path] = None
 
 
 class ExperimentController:
@@ -153,7 +154,7 @@ class ExperimentController:
         weights_path: Path,
         split: str = "val",
         out_dir: Optional[Path] = None,
-        conf_threshold: float = 0.05,
+        conf_threshold: float = 0.25,
         iou_threshold: float = 0.5,
         batch_size: int = 1,
         num_workers: int = 2,
@@ -177,20 +178,23 @@ class ExperimentController:
             log_cb=log_cb,
         )
 
+        result_metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
         metrics = Metrics(
-            precision=float(result.get("precision", 0.0)),
-            recall=float(result.get("recall", 0.0)),
-            map50=float(result.get("map50", 0.0)),
-            map50_95=float(result.get("map", 0.0)),
+            precision=float(result_metrics.get("precision_micro", 0.0) or 0.0),
+            recall=float(result_metrics.get("recall_micro", 0.0) or 0.0),
+            map50=float(result_metrics.get("map50", 0.0) or 0.0),
+            map50_95=float(result_metrics.get("map50_95", 0.0) or 0.0),
             device=result.get("device"),
             weights_path=weights_path,
             map_computed=True,
-            extra={"mar_100": float(result.get("mar_100", 0.0))},
+            extra={"ar100": result_metrics.get("ar100")},
         )
 
-        output_dir = Path(out_dir) if out_dir else Path(result["weights_path"]).parent / "eval"
+        output_dir = Path(out_dir) if out_dir else Path(weights_path).expanduser().resolve().parent / "eval"
         message = f"Avaliação concluída. Resultados salvos em {output_dir}"
-        return OperationResult(metrics=metrics, message=message)
+        results_path_value = result.get("unified_results_path") or result.get("results_path")
+        results_path = Path(results_path_value) if results_path_value else None
+        return OperationResult(metrics=metrics, message=message, results_path=results_path)
 
     def execute_eval_yolo(
         self,
@@ -202,8 +206,8 @@ class ExperimentController:
         imgsz: int = 640,
         batch: int = 16,
         device: str = "cpu",
-        conf: float = 0.001,
-        iou: float = 0.6,
+        conf: float = 0.25,
+        iou: float = 0.5,
         logger: Optional[Logger] = None,
         log_cb: Optional[Callable[[str], None]] = None,
     ) -> OperationResult:
@@ -229,7 +233,9 @@ class ExperimentController:
         )
 
         message = f"Avaliação concluída. Resultados salvos em {out_dir}"
-        return OperationResult(metrics=None, message=message)
+        results_path_value = result.get("unified_results_path") or result.get("results_path")
+        results_path = Path(results_path_value) if results_path_value else None
+        return OperationResult(metrics=None, message=message, results_path=results_path)
 
     def execute_validate_faster_rcnn(
         self,
@@ -241,7 +247,7 @@ class ExperimentController:
         val_mode: Optional[str] = None,
         output_dir: Optional[Path] = None,
         device: Optional[str] = None,
-        conf_threshold: float = 0.05,
+        conf_threshold: float = 0.25,
         iou_threshold: float = 0.5,
         logger: Optional[Logger] = None,
         log_cb: Optional[Callable[[str], None]] = None,
@@ -271,7 +277,9 @@ class ExperimentController:
 
         output_dir = result.get("output_dir") or Path(weights_path).expanduser().resolve().parent
         message = f"Validação concluída. Resultados salvos em {output_dir}"
-        return OperationResult(metrics=None, message=message)
+        results_path_value = result.get("unified_results_path") or result.get("results_path")
+        results_path = Path(results_path_value) if results_path_value else None
+        return OperationResult(metrics=None, message=message, results_path=results_path)
 
     def execute_validate_retinanet(
         self,
@@ -283,7 +291,7 @@ class ExperimentController:
         val_mode: Optional[str] = None,
         output_dir: Optional[Path] = None,
         device: Optional[str] = None,
-        conf_threshold: float = 0.05,
+        conf_threshold: float = 0.25,
         iou_threshold: float = 0.5,
         logger: Optional[Logger] = None,
         log_cb: Optional[Callable[[str], None]] = None,
@@ -315,7 +323,9 @@ class ExperimentController:
 
         output_dir = result.get("output_dir") or Path(weights_path).expanduser().resolve().parent
         message = f"Validação concluída. Resultados salvos em {output_dir}"
-        return OperationResult(metrics=None, message=message)
+        results_path_value = result.get("unified_results_path") or result.get("results_path")
+        results_path = Path(results_path_value) if results_path_value else None
+        return OperationResult(metrics=None, message=message, results_path=results_path)
 
     def _get_detector(self, algorithm_key: str) -> DetectionAlgorithm:
         if algorithm_key not in self.detectors:

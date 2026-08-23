@@ -602,19 +602,30 @@ class YoloDetector(DetectionAlgorithm):
                 f"train_exists={train_dir.exists()} val_exists={val_dir.exists()}"
             )
 
-        model = YOLO(weights_resolved)
-        with self._temporary_cwd(yaml_path_abs.parent):
-            results = model.val(
-                data=str(yaml_path_abs),
-                project=str(plots_dir),
-                name=report_out.stem,
-                save_json=True,
-                plots=True,
-                classes=[0] if pedestrian_only else None,
-            )
+        from app.detectors.yolo_eval import evaluate_yolo
 
-        run_dir = Path(getattr(results, "save_dir", plots_dir / report_out.stem))
-        metrics = self._build_metrics_from_results(results, device_str, weights_resolved)
+        result = evaluate_yolo(
+            data_yaml=str(yaml_path_abs),
+            weights_path=str(weights_resolved),
+            out_dir=str(plots_dir / report_out.stem),
+            split="val",
+            imgsz=self.config.imgsz,
+            device=device_str,
+            conf=0.25,
+            iou=0.5,
+            logger=logger,
+        )
+        result_metrics = result.get("metrics", {})
+        metrics = Metrics(
+            precision=float(result_metrics.get("precision_micro", 0.0) or 0.0),
+            recall=float(result_metrics.get("recall_micro", 0.0) or 0.0),
+            map50=float(result_metrics.get("map50", 0.0) or 0.0),
+            map50_95=float(result_metrics.get("map50_95", 0.0) or 0.0),
+            device=device_str,
+            weights_path=weights_resolved,
+            map_computed=True,
+        )
+        run_dir = Path(result.get("output_dir") or plots_dir / report_out.stem)
 
         report_builder = ReportBuilder(self.context.name)
         metrics_plot = run_dir / "metrics_summary.png"

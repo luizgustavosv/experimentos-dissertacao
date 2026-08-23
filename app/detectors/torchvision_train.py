@@ -20,7 +20,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
-import numpy as np
 import torch
 import yaml
 from torch.nn.utils import clip_grad_norm_
@@ -29,6 +28,10 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRC
 from torchvision.models.detection.retinanet import RetinaNet
 
 from app.datasets.class_mapping import summarize_class_mapping
+from app.avaliacao.metricas import (
+    DEFAULT_MAX_DETECTIONS,
+    evaluate_coco_predictions,
+)
 from app.detectors.base import Logger
 from app.detectors.config import TrainConfig
 from app.detectors.history_utils import load_training_history, save_training_history
@@ -1550,6 +1553,14 @@ def run_val_coco_metrics(
     legacy_drop_label: int | None = None,
     conf_threshold: float | None = None,
     iou_threshold: float | None = None,
+    train_ann: Path | None = None,
+    weights_path: Path | None = None,
+    model_name: str = "torchvision",
+    dataset_name: str = "dataset",
+    input_size: int | None = None,
+    max_detections: int = DEFAULT_MAX_DETECTIONS,
+    epoch_relative: int | None = None,
+    epoch_accumulated: int | None = None,
 ) -> dict:
     COCO, COCOeval = _ensure_pycocotools()
     val_image_ids_set: set[int] = set()
@@ -1632,6 +1643,12 @@ def run_val_coco_metrics(
         raise ValueError(f"{tag} conf_threshold deve estar entre 0.0 e 1.0.")
     if iou_threshold_to_use is not None and not 0.0 < iou_threshold_to_use <= 1.0:
         raise ValueError(f"{tag} iou_threshold deve estar no intervalo (0.0, 1.0].")
+    if isinstance(model, FasterRCNN):
+        model.roi_heads.score_thresh = conf_threshold_to_use
+        model.roi_heads.detections_per_img = int(max_detections)
+    if isinstance(model, RetinaNet):
+        model.score_thresh = conf_threshold_to_use
+        model.detections_per_img = int(max_detections)
 
     logging_logger.info("%s Gerando predictions_coco.json em %s", tag, predictions_path)
     logging_logger.info(
@@ -1927,43 +1944,6 @@ def run_val_coco_metrics(
     if not valid_pred_cat_ids <= gt_cat_ids:
         raise RuntimeError(f"{tag} category_id inválidos após filtro: {sorted(list(valid_pred_cat_ids - gt_cat_ids))}")
 
-    logging_logger.info("%s Executando COCOeval...", tag)
-
-    coco_dt = coco_gt.loadRes(str(predictions_path))
-    coco_eval = COCOeval(coco_gt, coco_dt, iouType="bbox")
-    if iou_threshold_to_use is not None:
-        coco_eval.params.iouThrs = np.array([iou_threshold_to_use])
-    coco_eval.evaluate()
-    coco_eval.accumulate()
-    coco_eval.summarize()
-
-    stats = [float(x) for x in coco_eval.stats.tolist()]
-    metrics = {
-        "AP": stats[0],
-        "AP50": stats[1],
-        "AP75": stats[2],
-        "APs": stats[3],
-        "APm": stats[4],
-        "APl": stats[5],
-        "AR1": stats[6],
-        "AR10": stats[7],
-        "AR100": stats[8],
-        "ARs": stats[9],
-        "ARm": stats[10],
-        "ARl": stats[11],
-    }
-
-    precisions = coco_eval.eval.get("precision")
-    per_class: dict[str, dict[str, float | str]] = {}
-    if precisions is not None:
-        for idx, cat_id in enumerate(coco_eval.params.catIds):
-            cls_prec = precisions[:, :, idx, 0, 2]
-            cls_prec = cls_prec[cls_prec > -1]
-            ap = float(cls_prec.mean()) if cls_prec.size else float("nan")
-            per_class[str(cat_id)] = {"name": coco_gt.cats.get(cat_id, {}).get("name", str(cat_id)), "AP": ap}
-
-    logging_logger.info("%s AP=%.4f, AP50=%.4f, AP75=%.4f, AR100=%.4f", tag, metrics["AP"], metrics["AP50"], metrics["AP75"], metrics["AR100"])
-
     gt_summary = {
         "num_images": len(gt_img_ids),
         "num_categories": len(gt_cat_ids),
@@ -1976,17 +1956,55 @@ def run_val_coco_metrics(
         "unique_category_ids": len(valid_pred_cat_ids),
     }
 
+    unified = evaluate_coco_predictions(
+        gt_annotations=val_ann,
+        train_annotations=train_ann,
+        predictions_json=predictions_path,
+        output_dir=output_dir,
+        model_name=model_name,
+        dataset_name=dataset_name,
+        split="val",
+        weights_path=weights_path,
+        conf_threshold=conf_threshold_to_use,
+        iou_threshold=0.5 if iou_threshold_to_use is None else iou_threshold_to_use,
+        max_detections=max_detections,
+        input_size=input_size,
+        device=device_str,
+        epoch_relative=epoch_relative,
+        epoch_accumulated=epoch_accumulated,
+        logger=logging_logger.info,
+        extra={"gt_summary": gt_summary, "pred_summary": pred_summary},
+    )
+    metrics = unified.get("metrics", {})
+    stats = [
+        metrics.get("map50_95"),
+        metrics.get("map50"),
+        metrics.get("map75"),
+        metrics.get("map_small"),
+        metrics.get("map_medium"),
+        metrics.get("map_large"),
+        metrics.get("ar1"),
+        metrics.get("ar10"),
+        metrics.get("ar100"),
+        metrics.get("ar_small"),
+        metrics.get("ar_medium"),
+        metrics.get("ar_large"),
+    ]
+
     return {
         "coco_metrics": metrics,
         "coco_stats": stats,
         "predictions_coco_json": str(predictions_path),
-        "per_class": per_class,
+        "predictions_coco_filtered_json": unified.get("predictions_coco_filtered_json"),
+        "per_class": metrics.get("per_class", {}),
         "gt_summary": gt_summary,
         "pred_summary": pred_summary,
         "gt_annotations": str(val_ann),
         "num_predictions": len(filtered_predictions),
         "conf_threshold": conf_threshold_to_use,
         "iou_threshold": iou_threshold_to_use,
+        "unified_results_path": unified.get("results_path"),
+        "metrics_valid": True,
     }
 
 
@@ -2076,6 +2094,7 @@ def run_post_training_validation(
         logging_logger.warning(message)
 
     loaded = torch.load(weights_path.expanduser().resolve(), map_location="cpu")
+    checkpoint_epoch = loaded.get("epoch") if isinstance(loaded, dict) and isinstance(loaded.get("epoch"), int) else None
     state_dict, checkpoint_format = _extract_state_dict(loaded)
     _emit(f"[{run_tag.upper()}][VAL-POST] Formato de checkpoint: {checkpoint_format}")
     (
@@ -2139,6 +2158,13 @@ def run_post_training_validation(
                 output_dir=out_dir,
                 conf_threshold=conf_threshold,
                 iou_threshold=iou_threshold,
+                train_ann=train_ann,
+                weights_path=weights_path,
+                model_name="Faster R-CNN" if run_tag == "faster_rcnn" else run_tag,
+                dataset_name=str(dataset_dir),
+                input_size=config.imgsz,
+                epoch_relative=checkpoint_epoch,
+                epoch_accumulated=checkpoint_epoch,
             )
         else:
             results = run_val_loss_loop(

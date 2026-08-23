@@ -32,7 +32,7 @@ class RetinaNetDetector(FasterRCNNDetector):
         val_mode=None,
         output_dir=None,
         device=None,
-        conf_threshold=0.05,
+        conf_threshold=0.25,
         iou_threshold=0.5,
     ) -> dict:
         dataset_dir = dataset_dir.expanduser().resolve()
