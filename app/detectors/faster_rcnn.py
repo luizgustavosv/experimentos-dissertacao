@@ -43,6 +43,8 @@ class FasterRCNNDetector(TorchvisionDetector):
         train_ann: Optional[Path] = None,
         val_ann: Optional[Path] = None,
         val_mode: Optional[str] = None,
+        output_dir: Optional[Path] = None,
+        device: Optional[str] = None,
         conf_threshold: float = 0.05,
         iou_threshold: float = 0.5,
         logger: Optional[Logger] = None,
@@ -55,7 +57,12 @@ class FasterRCNNDetector(TorchvisionDetector):
         def _build_model(num_classes: int) -> torch.nn.Module:
             return self._prepare_model(num_classes, None, logger)
 
-        config_to_use = replace(self.config, val_mode=val_mode) if val_mode else self.config
+        config_updates = {}
+        if val_mode:
+            config_updates["val_mode"] = val_mode
+        if device:
+            config_updates["device"] = device
+        config_to_use = replace(self.config, **config_updates) if config_updates else self.config
 
         return run_post_training_validation(
             model_builder=_build_model,
@@ -67,6 +74,7 @@ class FasterRCNNDetector(TorchvisionDetector):
             logger=logger,
             log_cb=log_cb,
             run_tag="faster_rcnn",
+            output_dir=output_dir,
             conf_threshold=conf_threshold,
             iou_threshold=iou_threshold,
         )

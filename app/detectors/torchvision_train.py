@@ -2001,6 +2001,7 @@ def run_post_training_validation(
     logger: Optional[Logger] = None,
     log_cb: Optional[Callable[[str], None]] = None,
     run_tag: str = "torchvision",
+    output_dir: Optional[Path] = None,
     conf_threshold: float | None = None,
     iou_threshold: float | None = None,
 ) -> dict:
@@ -2040,6 +2041,8 @@ def run_post_training_validation(
         val_mode_requested = "loss"
     val_mode = val_mode_requested
     metrics_valid = True
+    retinanet_expects_background = False
+    retinanet_label_offset = 0
 
     force_dataset_classes = None
     if run_tag == "faster_rcnn" and val_mode in {"loss", "metrics"}:
@@ -2059,8 +2062,10 @@ def run_post_training_validation(
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = log_dir / run_tag / "val_post" / timestamp
+    output_root = Path(output_dir).expanduser().resolve() if output_dir else log_dir / run_tag / "val_post"
+    out_dir = output_root / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
+    _emit(f"[{run_tag.upper()}][VAL-POST] Diretório de saída: {out_dir}")
 
     model = model_builder(model_num_classes)
     model.to(device)
@@ -2120,6 +2125,7 @@ def run_post_training_validation(
 
     if isinstance(model, FasterRCNN):
         _ensure_frcnn_head(model, model_num_classes, logging_logger)
+        model.to(device)
 
     try:
         if val_mode == "metrics":

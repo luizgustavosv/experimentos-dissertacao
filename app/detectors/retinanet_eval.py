@@ -19,6 +19,7 @@ from app.detectors.torchvision_train import (
     _safe_stream,
     ensure_weights_size,
     resolve_device,
+    run_val_loss_loop,
     run_val_coco_metrics,
 )
 
@@ -232,6 +233,9 @@ def validate_retinanet_post_train(
     *,
     logger: Optional[Logger] = None,
     log_cb: Optional[Callable[[str], None]] = None,
+    output_dir: Optional[Path] = None,
+    conf_threshold: float = 0.05,
+    iou_threshold: float = 0.5,
 ) -> dict:
     log_dir = Path(config.log_dir).expanduser().resolve()
     safe_stdout = _safe_stream("retinanet_val_stdout", log_dir)
@@ -255,6 +259,14 @@ def validate_retinanet_post_train(
         logging_logger.warning(message)
 
     _emit(f"[RETINANET][VAL-POST] Logger inicializado em {log_path}")
+    val_mode_requested = getattr(config, "val_mode", "metrics")
+    if val_mode_requested not in {"loss", "metrics"}:
+        logging_logger.warning("[RETINANET][VAL-POST] val_mode desconhecido %s; forçando 'metrics'", val_mode_requested)
+        val_mode_requested = "metrics"
+    _emit(
+        f"[RETINANET][VAL-POST] Modo={val_mode_requested} "
+        f"conf_threshold={conf_threshold} iou_threshold={iou_threshold}"
+    )
 
     device_str = resolve_device(config.device)
     device = torch.device(device_str)
@@ -266,14 +278,16 @@ def validate_retinanet_post_train(
         dataset_dir,
         train_ann,
         val_ann,
-        replace(config, val_mode="metrics"),
+        replace(config, val_mode=val_mode_requested),
         logging_logger,
         expects_background=False,
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(config.log_dir).expanduser().resolve() / "retinanet" / "val_post" / timestamp
+    output_root = Path(output_dir).expanduser().resolve() if output_dir else Path(config.log_dir).expanduser().resolve() / "retinanet" / "val_post"
+    out_dir = output_root / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
+    _emit(f"[RETINANET][VAL-POST] Diretório de saída: {out_dir}")
 
     loaded = torch.load(weights_path.expanduser().resolve(), map_location="cpu")
     meta = _extract_checkpoint_meta(loaded)
@@ -336,25 +350,39 @@ def validate_retinanet_post_train(
         label_map = dict(label_map)
         label_map[1] = only_cat
 
-    results = run_val_coco_metrics(
-        model,
-        val_loader,
-        device_str,
-        val_ann,
-        logging_logger,
-        tag="[RETINANET][VAL]",
-        output_dir=out_dir,
-        label_to_cat_id=label_map,
-        legacy_drop_label=0 if legacy_mode else None,
-    )
-
-    metrics_valid = metrics_valid and results.get("metrics_valid", True)
-
-    pr_metrics = _compute_classic_pr_metrics(
-        Path(results["predictions_coco_json"]),
-        Path(results["gt_annotations"]),
-        logging_logger,
-    )
+    if val_mode_requested == "metrics":
+        results = run_val_coco_metrics(
+            model,
+            val_loader,
+            device_str,
+            val_ann,
+            logging_logger,
+            tag="[RETINANET][VAL]",
+            output_dir=out_dir,
+            label_to_cat_id=label_map,
+            legacy_drop_label=0 if legacy_mode else None,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+        )
+        metrics_valid = metrics_valid and results.get("metrics_valid", True)
+        pr_metrics = _compute_classic_pr_metrics(
+            Path(results["predictions_coco_json"]),
+            Path(results["gt_annotations"]),
+            logging_logger,
+            iou_threshold=iou_threshold,
+        )
+    else:
+        results = run_val_loss_loop(
+            model,
+            val_loader,
+            device_str,
+            num_classes=model_num_classes,
+            expects_background=False,
+            label_offset=1,
+            logging_logger=logging_logger,
+            tag="[RETINANET][VAL-LOSS]",
+        )
+        pr_metrics = {}
 
     results_payload = {
         "dataset": str(dataset_dir),
@@ -375,8 +403,10 @@ def validate_retinanet_post_train(
         "weights_head_mismatch": head_mismatch,
         "metrics_valid": metrics_valid,
         "ignored_head_keys": ignored_keys,
-        "val_mode_requested": "metrics",
-        "val_mode": "metrics",
+        "val_mode_requested": val_mode_requested,
+        "val_mode": val_mode_requested,
+        "conf_threshold": conf_threshold,
+        "iou_threshold": iou_threshold,
         **results,
         **pr_metrics,
     }

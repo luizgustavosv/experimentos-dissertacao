@@ -21,6 +21,9 @@ _VALID_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
 def resolve_device(preferred: Optional[str] = None) -> str:
     if preferred:
+        preferred = str(preferred).strip()
+        if preferred.isdigit():
+            return f"cuda:{preferred}"
         return preferred
     return "cuda" if torch.cuda.is_available() else "cpu"
 

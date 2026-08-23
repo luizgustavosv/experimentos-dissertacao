@@ -30,6 +30,10 @@ class RetinaNetDetector(FasterRCNNDetector):
         logger=None,
         log_cb=None,
         val_mode=None,
+        output_dir=None,
+        device=None,
+        conf_threshold=0.05,
+        iou_threshold=0.5,
     ) -> dict:
         dataset_dir = dataset_dir.expanduser().resolve()
         if train_ann is None or val_ann is None:
@@ -38,15 +42,30 @@ class RetinaNetDetector(FasterRCNNDetector):
         def _build_model(num_classes: int):
             return self._prepare_model(num_classes, None, logger)
 
+        config_updates = {}
+        if val_mode:
+            config_updates["val_mode"] = val_mode
+        if device:
+            config_updates["device"] = device
+        if config_updates:
+            from dataclasses import replace
+
+            config_to_use = replace(self.config, **config_updates)
+        else:
+            config_to_use = self.config
+
         return validate_retinanet_post_train(
             _build_model,
             dataset_dir,
             train_ann=train_ann,
             val_ann=val_ann,
             weights_path=weights_path,
-            config=self.config,
+            config=config_to_use,
             logger=logger,
             log_cb=log_cb,
+            output_dir=output_dir,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
         )
 
     def _prepare_model(self, num_classes: int, pretrained_weights, logger):  # type: ignore[override]

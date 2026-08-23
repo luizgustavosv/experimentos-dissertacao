@@ -60,6 +60,7 @@ class DetectorApp(tk.Tk):
             "yolo_eval_weights": tk.StringVar(),
             "yolo_eval_out": tk.StringVar(),
             "val_annotations": tk.StringVar(),
+            "validation_out": tk.StringVar(),
         }
         self.epochs_var = tk.IntVar(value=10)
         self.pedestrian_only_var = tk.BooleanVar(value=False)
@@ -73,6 +74,7 @@ class DetectorApp(tk.Tk):
         self.yolo_imgsz_var = tk.IntVar(value=640)
         self.yolo_batch_var = tk.IntVar(value=16)
         self.yolo_device_var = tk.StringVar(value="cpu")
+        self.validation_device_var = tk.StringVar(value="cpu")
         self.val_mode_var = tk.StringVar(value="loss")
         self.max_epochs_enabled_var = tk.BooleanVar(value=False)
         self.max_epochs_var = tk.IntVar(value=10)
@@ -276,10 +278,11 @@ class DetectorApp(tk.Tk):
                     "validation_weights",
                     filetypes=get_weights_filetypes(algorithm),
                 )
-                if algorithm == "Faster R-CNN":
-                    self._add_val_mode_selector()
-                    self._add_conf_threshold_selector(label="Limite de confiança (Faster R-CNN)")
-                    self._add_iou_threshold_selector(label="Limite de IoU (Faster R-CNN)")
+                self._add_path_selector("Pasta para salvar métricas", "validation_out", is_dir=True)
+                self._add_device_selector(variable=self.validation_device_var)
+                self._add_val_mode_selector()
+                self._add_conf_threshold_selector(label=f"Limite de confiança ({algorithm})")
+                self._add_iou_threshold_selector(label=f"Limite de IoU ({algorithm})")
         elif action == "Normalizar dataset":
             self._add_dataset_type_selector()
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
@@ -414,17 +417,18 @@ class DetectorApp(tk.Tk):
         gpu_indices = [str(idx) for idx in range(torch.cuda.device_count())]
         return ["cpu", *gpu_indices]
 
-    def _add_device_selector(self) -> None:
+    def _add_device_selector(self, variable: Optional[tk.Variable] = None) -> None:
+        device_var = variable or self.yolo_device_var
         options = self._build_device_options()
-        if self.yolo_device_var.get() not in options:
-            self.yolo_device_var.set("cpu")
+        if device_var.get() not in options:
+            device_var.set("cpu")
 
         frame = tk.Frame(self.dynamic_frame, bg="#12233d")
         frame.pack(fill="x", padx=10, pady=6)
         tk.Label(frame, text="Dispositivo", bg="#12233d", fg="white").pack(anchor="w")
         combo = ttk.Combobox(
             frame,
-            textvariable=self.yolo_device_var,
+            textvariable=device_var,
             values=options,
             state="readonly",
             width=20,
@@ -800,6 +804,9 @@ class DetectorApp(tk.Tk):
                 val_annotations_raw = self.path_vars["val_annotations"].get().strip()
                 val_annotations = Path(val_annotations_raw) if val_annotations_raw else None
                 weights = Path(self.path_vars["validation_weights"].get())
+                output_dir_raw = self.path_vars["validation_out"].get().strip()
+                output_dir = Path(output_dir_raw) if output_dir_raw else None
+                device = self.validation_device_var.get().strip() or "cpu"
                 conf_threshold = float(self.conf_threshold_var.get())
                 iou_threshold = float(self.iou_threshold_var.get())
 
@@ -812,11 +819,11 @@ class DetectorApp(tk.Tk):
                             "val": val_annotations or "auto",
                             "imagens": images_dir,
                             "pesos": weights,
-                            **(
-                                {"conf_threshold": conf_threshold, "iou_threshold": iou_threshold}
-                                if algorithm_key == "Faster R-CNN"
-                                else {}
-                            ),
+                            "saida": output_dir or "logs",
+                            "device": device,
+                            "modo": self.val_mode_var.get(),
+                            "conf_threshold": conf_threshold,
+                            "iou_threshold": iou_threshold,
                         },
                     )
                 )
@@ -830,6 +837,8 @@ class DetectorApp(tk.Tk):
                             weights_path=weights,
                             val_annotations=val_annotations,
                             val_mode=self.val_mode_var.get(),
+                            output_dir=output_dir,
+                            device=device,
                             conf_threshold=conf_threshold,
                             iou_threshold=iou_threshold,
                             logger=prompt_logger,
@@ -841,6 +850,11 @@ class DetectorApp(tk.Tk):
                         images_dir=images_dir,
                         weights_path=weights,
                         val_annotations=val_annotations,
+                        val_mode=self.val_mode_var.get(),
+                        output_dir=output_dir,
+                        device=device,
+                        conf_threshold=conf_threshold,
+                        iou_threshold=iou_threshold,
                         logger=prompt_logger,
                         log_cb=lambda msg: self._emit_gui(msg, stdout=False),
                     )
