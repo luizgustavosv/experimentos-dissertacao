@@ -8,13 +8,18 @@ from typing import Any, Callable, Iterable, Optional
 
 import numpy as np
 
+from app.avaliacao.config import (
+    DEFAULT_CONF_THRESHOLD,
+    DEFAULT_CURVE_CONF_THRESHOLD,
+    DEFAULT_IOU_ASSOCIATION_THRESHOLD,
+    DEFAULT_MAX_DETECTIONS,
+)
+from app.avaliacao.figuras import generate_evaluation_figures
 
 Logger = Optional[Callable[[str], None]]
 
-DEFAULT_CONF_THRESHOLD = 0.25
-DEFAULT_IOU_ASSOCIATION_THRESHOLD = 0.5
-DEFAULT_MAX_DETECTIONS = 300
 VISDRONE_VAL_IMAGES = 548
+HERIDAL_VAL_IMAGES = 310
 
 METRIC_KEYS = [
     "map50",
@@ -26,6 +31,8 @@ METRIC_KEYS = [
     "ar1",
     "ar10",
     "ar100",
+    "ar_maxdet",
+    "ar_maxdet_5000",
     "ar_small",
     "ar_medium",
     "ar_large",
@@ -45,6 +52,8 @@ def expected_validation_images(dataset_name: str | None, annotations_path: Path 
     path_text = str(annotations_path or "").lower()
     if "visdrone" in name or "visdrone" in path_text:
         return VISDRONE_VAL_IMAGES
+    if "heridal" in name or "heridal" in path_text:
+        return HERIDAL_VAL_IMAGES
     return None
 
 
@@ -78,19 +87,40 @@ def assert_official_validation_split(
 
 def check_train_val_disjoint(train_annotations: Path | None, val_annotations: Path) -> dict[str, Any]:
     if train_annotations is None:
-        return {"checked": False, "disjoint": None, "intersection_count": None, "intersection_sample": []}
+        return {
+            "checked": False,
+            "disjoint": None,
+            "intersection_count": None,
+            "intersection_sample": [],
+            "key": "file_name",
+        }
     train_data = read_coco_json(train_annotations)
     val_data = read_coco_json(val_annotations)
+
+    def _image_key(img: dict[str, Any]) -> str | None:
+        file_name = img.get("file_name")
+        if not file_name:
+            return None
+        return Path(str(file_name)).name.lower()
+
+    train_keys = {key for img in train_data.get("images", []) if (key := _image_key(img))}
+    val_keys = {key for img in val_data.get("images", []) if (key := _image_key(img))}
+    intersection = sorted(train_keys & val_keys)
+
     train_ids = {int(img["id"]) for img in train_data.get("images", []) if "id" in img}
     val_ids = {int(img["id"]) for img in val_data.get("images", []) if "id" in img}
-    intersection = sorted(train_ids & val_ids)
+    id_intersection = sorted(train_ids & val_ids)
     return {
         "checked": True,
         "disjoint": len(intersection) == 0,
-        "train_images": len(train_ids),
-        "val_images": len(val_ids),
+        "key": "file_name",
+        "train_images": len(train_keys),
+        "val_images": len(val_keys),
         "intersection_count": len(intersection),
         "intersection_sample": intersection[:20],
+        "image_id_disjoint": len(id_intersection) == 0,
+        "image_id_intersection_count": len(id_intersection),
+        "image_id_intersection_sample": id_intersection[:20],
     }
 
 
@@ -129,6 +159,19 @@ def _filter_and_cap_predictions(
         items_sorted = sorted(items, key=lambda item: float(item.get("score", 0.0)), reverse=True)
         capped.extend(items_sorted[:max_detections])
     return capped
+
+
+def _weights_policy(weights_path: Path | None) -> str | None:
+    if weights_path is None:
+        return None
+    name = Path(weights_path).name.lower()
+    if name.startswith("best"):
+        return "best_checkpoint_by_training_metric"
+    if name.startswith("last"):
+        return "last_checkpoint_at_epoch_budget"
+    if "checkpoint_epoch" in name:
+        return "explicit_epoch_checkpoint"
+    return "explicit_weights_file"
 
 
 def _compute_pr_and_confusion(
@@ -288,6 +331,27 @@ def _coco_stats_from_eval(evaluator: Any, max_detections: int) -> list[float | N
     ]
 
 
+def _log_coco_summary(logger: Logger, stats: list[float | None], max_detections: int) -> None:
+    if not logger:
+        return
+    labels = [
+        f"AP@[IoU=0.50:0.95 | all | maxDets={max_detections}]",
+        f"AP@[IoU=0.50 | all | maxDets={max_detections}]",
+        f"AP@[IoU=0.75 | all | maxDets={max_detections}]",
+        f"AP@[IoU=0.50:0.95 | small | maxDets={max_detections}]",
+        f"AP@[IoU=0.50:0.95 | medium | maxDets={max_detections}]",
+        f"AP@[IoU=0.50:0.95 | large | maxDets={max_detections}]",
+        "AR@[IoU=0.50:0.95 | all | maxDets=1]",
+        "AR@[IoU=0.50:0.95 | all | maxDets=10]",
+        f"AR@[IoU=0.50:0.95 | all | maxDets={max_detections}]",
+        f"AR@[IoU=0.50:0.95 | small | maxDets={max_detections}]",
+        f"AR@[IoU=0.50:0.95 | medium | maxDets={max_detections}]",
+        f"AR@[IoU=0.50:0.95 | large | maxDets={max_detections}]",
+    ]
+    for label, value in zip(labels, stats):
+        logger(f"[EVAL][COCO] {label} = {value if value is not None else 'null'}")
+
+
 def evaluate_coco_predictions(
     *,
     gt_annotations: Path,
@@ -321,27 +385,42 @@ def evaluate_coco_predictions(
     disjoint_check = check_train_val_disjoint(train_annotations, gt_annotations)
     if disjoint_check["checked"] and not disjoint_check["disjoint"]:
         raise AssertionError(
-            f"IDs de imagem de treino e validação não são disjuntos: interseção={disjoint_check['intersection_count']}"
+            f"Imagens de treino e validação não são disjuntas por file_name: "
+            f"interseção={disjoint_check['intersection_count']}"
         )
 
     raw_predictions = json.loads(predictions_json.read_text(encoding="utf-8"))
-    predictions = _filter_and_cap_predictions(
+    predictions_for_integrated_metrics = _filter_and_cap_predictions(
+        raw_predictions,
+        conf_threshold=DEFAULT_CURVE_CONF_THRESHOLD,
+        max_detections=max_detections,
+    )
+    integrated_predictions_path = output_dir / "predictions_coco_for_map_ar_curves.json"
+    integrated_predictions_path.write_text(
+        json.dumps(predictions_for_integrated_metrics, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    predictions_for_operating_point = _filter_and_cap_predictions(
         raw_predictions,
         conf_threshold=conf_threshold,
         max_detections=max_detections,
     )
     filtered_predictions_path = output_dir / "predictions_coco_filtered.json"
-    filtered_predictions_path.write_text(json.dumps(predictions, indent=2, ensure_ascii=False), encoding="utf-8")
+    filtered_predictions_path.write_text(
+        json.dumps(predictions_for_operating_point, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     coco_gt = COCO(str(gt_annotations))
-    if predictions:
-        coco_dt = coco_gt.loadRes(str(filtered_predictions_path))
+    if predictions_for_integrated_metrics:
+        coco_dt = coco_gt.loadRes(str(integrated_predictions_path))
         evaluator = COCOeval(coco_gt, coco_dt, iouType="bbox")
         evaluator.params.maxDets = [1, 10, int(max_detections)]
         evaluator.evaluate()
         evaluator.accumulate()
-        evaluator.summarize()
         stats = _coco_stats_from_eval(evaluator, int(max_detections))
+        _log_coco_summary(logger, stats, int(max_detections))
         precision_array = evaluator.eval.get("precision")
     else:
         stats = [0.0] * 12
@@ -357,6 +436,8 @@ def evaluate_coco_predictions(
         "ar1": stats[6],
         "ar10": stats[7],
         "ar100": stats[8],
+        "ar_maxdet": stats[8],
+        "ar_maxdet_5000": stats[8] if int(max_detections) == 5000 else None,
         "ar_small": stats[9],
         "ar_medium": stats[10],
         "ar_large": stats[11],
@@ -364,7 +445,7 @@ def evaluate_coco_predictions(
 
     per_class: dict[str, Any] = {}
     categories = gt_data.get("categories", [])
-    if predictions and precision_array is not None:
+    if predictions_for_integrated_metrics and precision_array is not None:
         for idx, cat_id in enumerate(evaluator.params.catIds):
             cat = next((c for c in categories if int(c.get("id")) == int(cat_id)), {"name": str(cat_id)})
             cls_all = precision_array[:, :, idx, 0, 2]
@@ -378,23 +459,34 @@ def evaluate_coco_predictions(
             }
     else:
         for cat in categories:
-            per_class[str(cat.get("id"))] = {"name": cat.get("name"), "ap50": None, "ap50_95": None}
+            per_class[str(cat.get("id"))] = {"name": cat.get("name"), "ap50": 0.0, "ap50_95": 0.0}
 
     metrics["per_class"] = per_class
     metrics.update(
         _compute_pr_and_confusion(
             gt_data,
-            predictions,
+            predictions_for_operating_point,
             conf_threshold=conf_threshold,
             iou_threshold=iou_threshold,
         )
     )
 
     by_image_counts: dict[int, int] = defaultdict(int)
-    for pred in predictions:
+    for pred in predictions_for_integrated_metrics:
         by_image_counts[int(pred["image_id"])] += 1
+    gt_image_count = len(gt_data.get("images", []))
+    max_observed_detections = max(by_image_counts.values(), default=0)
+    mean_detections_per_image = len(predictions_for_integrated_metrics) / gt_image_count if gt_image_count else 0.0
     saturation_count = sum(1 for count in by_image_counts.values() if count >= max_detections)
     saturation_alert = saturation_count > 0
+    metrics_block = {key: metrics.get(key) for key in METRIC_KEYS}
+    figures = generate_evaluation_figures(
+        gt_data=gt_data,
+        predictions_for_curves=predictions_for_integrated_metrics,
+        metrics=metrics_block,
+        output_dir=output_dir,
+        iou_threshold=DEFAULT_IOU_ASSOCIATION_THRESHOLD,
+    )
 
     result = {
         "schema_version": "unified-detection-eval-v1",
@@ -404,6 +496,7 @@ def evaluate_coco_predictions(
         "gt_annotations": str(gt_annotations),
         "train_annotations": str(Path(train_annotations).expanduser().resolve()) if train_annotations else None,
         "predictions_coco_json": str(predictions_json),
+        "predictions_coco_for_map_ar_curves_json": str(integrated_predictions_path),
         "predictions_coco_filtered_json": str(filtered_predictions_path),
         "output_dir": str(output_dir),
         "weights_path": str(Path(weights_path).expanduser().resolve()) if weights_path is not None else None,
@@ -411,29 +504,52 @@ def evaluate_coco_predictions(
         "epoch_accumulated": epoch_accumulated,
         "parameters": {
             "conf_threshold": float(conf_threshold),
+            "curve_conf_threshold": DEFAULT_CURVE_CONF_THRESHOLD,
             "iou_association_threshold": float(iou_threshold),
             "max_detections_per_image": int(max_detections),
-            "weights_policy": "last_checkpoint_at_epoch_budget",
+            "recall_metric_maxdet_key": "ar_maxdet",
+            "recall_metric_maxdet_value": int(max_detections),
+            "weights_policy": _weights_policy(weights_path),
             "device": device,
             "input_size": input_size,
             "class_mapping": "COCO category_id preserved; torchvision internal labels reserve/adjust background before export",
         },
+        "prediction_sources": {
+            "map_ar_per_class_and_curves": {
+                "path": str(integrated_predictions_path),
+                "confidence_filter_applied_in_evaluator": DEFAULT_CURVE_CONF_THRESHOLD,
+                "expected_export_conf_threshold": DEFAULT_CURVE_CONF_THRESHOLD,
+                "max_detections_per_image": int(max_detections),
+                "num_detections": len(predictions_for_integrated_metrics),
+            },
+            "operating_point_precision_recall_f1_and_confusion_matrix": {
+                "path": str(filtered_predictions_path),
+                "confidence_filter": float(conf_threshold),
+                "iou_threshold": float(iou_threshold),
+                "max_detections_per_image": int(max_detections),
+                "num_detections": len(predictions_for_operating_point),
+            },
+        },
         "validation_split_check": split_check,
         "train_val_disjoint_check": disjoint_check,
         "num_images": len(gt_data.get("images", [])),
-        "num_detections": len(predictions),
-        "num_prediction_categories": len({int(p["category_id"]) for p in predictions}),
+        "num_detections": len(predictions_for_integrated_metrics),
+        "num_detections_filtered": len(predictions_for_operating_point),
+        "num_prediction_categories": len({int(p["category_id"]) for p in predictions_for_integrated_metrics}),
         "saturation_alert": saturation_alert,
         "saturation": {
             "images_at_detection_cap": saturation_count,
             "max_detections_per_image": int(max_detections),
+            "max_observed_detections_per_image": int(max_observed_detections),
+            "mean_detections_per_image": float(mean_detections_per_image),
             "message": (
-                "Há imagens no teto de detecções; investigue possível saturação."
+                f"Há imagens no teto de detecções; eleve max_detections_per_image acima de {int(max_detections)}."
                 if saturation_alert
                 else None
             ),
         },
-        "metrics": {key: metrics.get(key) for key in METRIC_KEYS},
+        "metrics": metrics_block,
+        "figures": figures,
         "extra": extra or {},
         "created_at": datetime.now().isoformat(),
     }

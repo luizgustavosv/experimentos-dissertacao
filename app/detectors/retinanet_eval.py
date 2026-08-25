@@ -280,6 +280,7 @@ def validate_retinanet_post_train(
         val_ann,
         replace(config, val_mode=val_mode_requested),
         logging_logger,
+        override_val_ratio=0.0,
         expects_background=False,
     )
 

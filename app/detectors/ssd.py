@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from app.avaliacao.config import DEFAULT_MAX_DETECTIONS
 from app.datasets.heridal_to_voc import make_split
 from app.datasets.visdrone_to_voc import find_visdrone_splits
 from app.detectors.base import DetectorContext, Logger
@@ -261,6 +262,7 @@ class SSDDetector(TorchvisionDetector):
 
         constructor_num_classes = num_classes
         model = ssd300_vgg16(weights=None, weights_backbone=weights_backbone, num_classes=constructor_num_classes)
+        model.detections_per_img = DEFAULT_MAX_DETECTIONS
 
         if logger:
             logger(f"[SSD][WEIGHTS] checkpoint_path={checkpoint_label}")

@@ -29,6 +29,7 @@ from torchvision.models.detection.retinanet import RetinaNet
 
 from app.datasets.class_mapping import summarize_class_mapping
 from app.avaliacao.metricas import (
+    DEFAULT_CURVE_CONF_THRESHOLD,
     DEFAULT_MAX_DETECTIONS,
     evaluate_coco_predictions,
 )
@@ -1638,22 +1639,24 @@ def run_val_coco_metrics(
     predictions_path = output_dir / "predictions_coco.json"
     predictions_path.unlink(missing_ok=True)
     conf_threshold_to_use = 0.0 if conf_threshold is None else float(conf_threshold)
+    export_conf_threshold = min(DEFAULT_CURVE_CONF_THRESHOLD, conf_threshold_to_use)
     iou_threshold_to_use = None if iou_threshold is None else float(iou_threshold)
     if not 0.0 <= conf_threshold_to_use <= 1.0:
         raise ValueError(f"{tag} conf_threshold deve estar entre 0.0 e 1.0.")
     if iou_threshold_to_use is not None and not 0.0 < iou_threshold_to_use <= 1.0:
         raise ValueError(f"{tag} iou_threshold deve estar no intervalo (0.0, 1.0].")
     if isinstance(model, FasterRCNN):
-        model.roi_heads.score_thresh = conf_threshold_to_use
+        model.roi_heads.score_thresh = export_conf_threshold
         model.roi_heads.detections_per_img = int(max_detections)
     if isinstance(model, RetinaNet):
-        model.score_thresh = conf_threshold_to_use
+        model.score_thresh = export_conf_threshold
         model.detections_per_img = int(max_detections)
 
     logging_logger.info("%s Gerando predictions_coco.json em %s", tag, predictions_path)
     logging_logger.info(
-        "%s Thresholds: conf_threshold=%.4f iou_threshold=%s",
+        "%s Thresholds: export_conf_threshold=%.4f operating_conf_threshold=%.4f iou_threshold=%s",
         tag,
+        export_conf_threshold,
         conf_threshold_to_use,
         f"{iou_threshold_to_use:.4f}" if iou_threshold_to_use is not None else "COCO-default",
     )
@@ -1776,7 +1779,7 @@ def run_val_coco_metrics(
                     max_label_observed = max(max_label_observed, int(labels_cpu.max()))
 
                 for box, score, label in zip(boxes_cpu, scores_cpu, labels_cpu):
-                    if float(score) < conf_threshold_to_use:
+                    if float(score) < export_conf_threshold:
                         continue
 
                     raw_label = int(label)
@@ -1885,54 +1888,10 @@ def run_val_coco_metrics(
     valid_pred_img_ids = set(int(p["image_id"]) for p in filtered_predictions)
     valid_pred_cat_ids = set(int(p["category_id"]) for p in filtered_predictions)
     if not filtered_predictions:
-        if not is_retinanet:
-            raise RuntimeError(f"{tag} Nenhuma predição válida após auditoria. Abortando COCOeval.")
-
         logging_logger.warning(
-            "%s No predictions to evaluate (likely undertrained in early epochs). Skipping COCOeval.",
+            "%s Nenhuma predição válida após auditoria; o avaliador unificado gravará métricas zero e figuras diagnósticas.",
             tag,
         )
-
-        stats = [0.0] * 12
-        metrics = {
-            "AP": 0.0,
-            "AP50": 0.0,
-            "AP75": 0.0,
-            "APs": 0.0,
-            "APm": 0.0,
-            "APl": 0.0,
-            "AR1": 0.0,
-            "AR10": 0.0,
-            "AR100": 0.0,
-            "ARs": 0.0,
-            "ARm": 0.0,
-            "ARl": 0.0,
-        }
-
-        gt_summary = {
-            "num_images": len(gt_img_ids),
-            "num_categories": len(gt_cat_ids),
-            "min_image_id": min(gt_img_ids) if gt_img_ids else None,
-            "max_image_id": max(gt_img_ids) if gt_img_ids else None,
-        }
-        pred_summary = {
-            "num_detections": 0,
-            "unique_image_ids": 0,
-            "unique_category_ids": 0,
-        }
-
-        return {
-            "coco_metrics": metrics,
-            "coco_stats": stats,
-            "predictions_coco_json": str(predictions_path),
-            "per_class": {},
-            "gt_summary": gt_summary,
-            "pred_summary": pred_summary,
-            "gt_annotations": str(val_ann),
-            "num_predictions": 0,
-            "reason": "no_predictions",
-            "metrics_valid": False,
-        }
     if num_invalid_img_ids > 0:
         logging_logger.info(
             "%s [VAL-METRICS][AUDIT] %d image_id(s) inválidos foram filtrados", tag, num_invalid_img_ids
@@ -2075,6 +2034,7 @@ def run_post_training_validation(
         val_ann,
         config,
         logging_logger,
+        override_val_ratio=0.0,
         expects_background=expects_background,
         force_dataset_num_classes=force_dataset_classes,
     )
@@ -2207,7 +2167,9 @@ def run_post_training_validation(
         "train_annotations": str(train_ann),
         "val_annotations": str(val_ann),
         "split": "val",
-        "val_ratio": config.val_ratio,
+        "val_ratio": 0.0,
+        "configured_val_ratio": config.val_ratio,
+        "validation_split_policy": "official_val_only",
         "seed": config.seed,
         "imgsz": config.imgsz,
         "batch_size": config.batch_size,

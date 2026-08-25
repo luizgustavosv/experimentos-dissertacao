@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from app.avaliacao.metricas import DEFAULT_MAX_DETECTIONS, evaluate_coco_predictions
+from app.avaliacao.metricas import DEFAULT_CURVE_CONF_THRESHOLD, DEFAULT_MAX_DETECTIONS, evaluate_coco_predictions
 from app.detectors.base import Logger
 from app.detectors.dataset_voc import PascalVOCDataset
 from app.detectors.torchvision_models import build_ssd
@@ -55,6 +55,21 @@ def _filter_predictions(output: Dict[str, torch.Tensor], threshold: float, max_d
 def _xyxy_to_xywh(box: torch.Tensor) -> list[float]:
     x1, y1, x2, y2 = [float(x) for x in box.detach().cpu().tolist()]
     return [x1, y1, max(0.0, x2 - x1), max(0.0, y2 - y1)]
+
+
+def _voc_image_name(dataset_root: Path, image_id: str) -> str:
+    for path in (dataset_root / "JPEGImages").glob(f"{image_id}.*"):
+        if path.is_file():
+            return path.name
+    return f"{image_id}.jpg"
+
+
+def _build_coco_image_index(dataset_root: Path, image_ids: Sequence[str], categories: list[dict[str, object]]) -> dict:
+    images = [
+        {"id": idx, "file_name": _voc_image_name(dataset_root, image_id)}
+        for idx, image_id in enumerate(image_ids, start=1)
+    ]
+    return {"images": images, "annotations": [], "categories": categories}
 
 
 def evaluate_torchvision_ssd_voc(
@@ -147,8 +162,9 @@ def evaluate_torchvision_ssd_voc(
     )
     model.to(torch_device)
     model.eval()
+    export_conf_threshold = min(DEFAULT_CURVE_CONF_THRESHOLD, float(conf_threshold))
     if hasattr(model, "score_thresh"):
-        model.score_thresh = float(conf_threshold)
+        model.score_thresh = export_conf_threshold
     if hasattr(model, "detections_per_img"):
         model.detections_per_img = DEFAULT_MAX_DETECTIONS
 
@@ -191,7 +207,7 @@ def evaluate_torchvision_ssd_voc(
                     )
                     ann_id += 1
 
-                preds = _filter_predictions(output, conf_threshold, DEFAULT_MAX_DETECTIONS)
+                preds = _filter_predictions(output, export_conf_threshold, DEFAULT_MAX_DETECTIONS)
                 for box, score, label in zip(preds["boxes"].detach().cpu(), preds["scores"].detach().cpu(), preds["labels"].detach().cpu()):
                     predictions.append(
                         {
@@ -215,14 +231,21 @@ def evaluate_torchvision_ssd_voc(
     output_dir = Path(out_dir) if out_dir else Path(weights_path).expanduser().resolve().parent / "eval"
     output_dir.mkdir(parents=True, exist_ok=True)
     gt_path = output_dir / "gt_coco.json"
+    train_gt_path = output_dir / "gt_coco_train_index.json" if split_normalized != "train" else None
     predictions_path = output_dir / "predictions_coco.json"
     categories = [{"id": idx + 1, "name": name} for idx, name in enumerate(class_names)]
     gt_payload = {"images": coco_images, "annotations": coco_annotations, "categories": categories}
     gt_path.write_text(json.dumps(gt_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    if train_gt_path is not None:
+        train_gt_path.write_text(
+            json.dumps(_build_coco_image_index(dataset_root, train_ids, categories), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     predictions_path.write_text(json.dumps(predictions, indent=2, ensure_ascii=False), encoding="utf-8")
 
     result = evaluate_coco_predictions(
         gt_annotations=gt_path,
+        train_annotations=train_gt_path,
         predictions_json=predictions_path,
         output_dir=output_dir,
         model_name="SSD300",

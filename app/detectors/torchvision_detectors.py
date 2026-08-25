@@ -9,6 +9,7 @@ import torch
 from torchvision import transforms
 from torchvision.utils import draw_bounding_boxes
 
+from app.avaliacao.config import DEFAULT_MAX_DETECTIONS
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.torchvision_train import train_torchvision_detector
@@ -424,6 +425,7 @@ class TorchvisionDetector(DetectionAlgorithm):
                     logger(f"[INFER] Aviso: pesos inesperados ignorados: {unexpected}")
             class_names = [str(idx) for idx in range(num_classes)]
             weights_label = weights_path
+        model.roi_heads.detections_per_img = DEFAULT_MAX_DETECTIONS
         model.to(device_str)
         model.eval()
         return model, class_names, weights_label
@@ -466,6 +468,7 @@ class TorchvisionDetector(DetectionAlgorithm):
                     logger(f"[INFER] Aviso: pesos inesperados ignorados: {unexpected}")
             class_names = [str(idx) for idx in range(num_classes)]
             weights_label = weights_path
+        model.detections_per_img = DEFAULT_MAX_DETECTIONS
         model.to(device_str)
         model.eval()
         return model, class_names, weights_label

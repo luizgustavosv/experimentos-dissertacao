@@ -628,14 +628,12 @@ class YoloDetector(DetectionAlgorithm):
         run_dir = Path(result.get("output_dir") or plots_dir / report_out.stem)
 
         report_builder = ReportBuilder(self.context.name)
-        metrics_plot = run_dir / "metrics_summary.png"
-        report_builder.save_plot(metrics_plot, metrics)
         report_builder.save_report(
             report_path=report_out,
             metrics=metrics,
             operation="Validação",
             source_dir=yaml_path_abs.parent,
-            plot_path=metrics_plot,
+            plot_path=None,
             weights_path=weights_resolved,
         )
 

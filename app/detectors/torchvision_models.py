@@ -4,6 +4,8 @@ import torchvision
 from torchvision.models import ResNet50_Weights, VGG16_Weights
 from torchvision.models.detection import SSD300_VGG16_Weights
 
+from app.avaliacao.config import DEFAULT_MAX_DETECTIONS
+
 
 def build_faster_rcnn(num_classes: int):
     # Evitar carregar cabeças pré-treinadas do COCO; usa apenas o backbone pré-treinado
@@ -13,11 +15,11 @@ def build_faster_rcnn(num_classes: int):
             weights=None,
             weights_backbone=backbone_weights,
             num_classes=num_classes,
-            box_detections_per_img=300,
+            box_detections_per_img=DEFAULT_MAX_DETECTIONS,
         )
     except TypeError:
         model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights=None, num_classes=num_classes)
-        model.roi_heads.detections_per_img = 300
+        model.roi_heads.detections_per_img = DEFAULT_MAX_DETECTIONS
         return model
 
 
@@ -28,10 +30,10 @@ def build_retinanet(num_classes: int):
     # Carrega apenas backbone/FPN pré-treinados no COCO e recria o head para o dataset alvo.
     weights = RetinaNet_ResNet50_FPN_Weights.COCO_V1
     try:
-        model = retinanet_resnet50_fpn(weights=weights, detections_per_img=300)
+        model = retinanet_resnet50_fpn(weights=weights, detections_per_img=DEFAULT_MAX_DETECTIONS)
     except TypeError:
         model = retinanet_resnet50_fpn(weights=weights)
-        model.detections_per_img = 300
+        model.detections_per_img = DEFAULT_MAX_DETECTIONS
 
     classification_head = model.head.classification_head
     num_anchors = classification_head.num_anchors
@@ -46,11 +48,11 @@ def build_retinanet(num_classes: int):
 def build_ssd(num_classes: int):
     try:
         return torchvision.models.detection.ssd300_vgg16(
-            weights=None, weights_backbone=VGG16_Weights.DEFAULT, num_classes=num_classes, detections_per_img=300
+            weights=None, weights_backbone=VGG16_Weights.DEFAULT, num_classes=num_classes, detections_per_img=DEFAULT_MAX_DETECTIONS
         )
     except TypeError:
         model = torchvision.models.detection.ssd300_vgg16(
             weights=None, weights_backbone=VGG16_Weights.DEFAULT, num_classes=num_classes
         )
-        model.detections_per_img = 300
+        model.detections_per_img = DEFAULT_MAX_DETECTIONS
         return model

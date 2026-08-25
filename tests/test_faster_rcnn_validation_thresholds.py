@@ -73,10 +73,14 @@ def test_faster_rcnn_post_validation_loss_mode_has_default_retinanet_flags(monke
 
     seen = {}
 
+    def fake_build_val_loader_and_classes(*args, **kwargs):
+        seen["override_val_ratio"] = kwargs.get("override_val_ratio")
+        return [], 2, 1, 0
+
     monkeypatch.setattr(
         torchvision_train,
         "_build_val_loader_and_classes",
-        lambda *args, **kwargs: ([], 2, 1, 0),
+        fake_build_val_loader_and_classes,
     )
     monkeypatch.setattr(torchvision_train.torch, "load", lambda *args, **kwargs: {})
     monkeypatch.setattr(torchvision_train, "ensure_weights_size", lambda *args, **kwargs: None)
@@ -105,7 +109,10 @@ def test_faster_rcnn_post_validation_loss_mode_has_default_retinanet_flags(monke
         run_tag="faster_rcnn",
     )
 
-    assert seen == {"expects_background": False, "label_offset": 0}
+    assert seen == {"override_val_ratio": 0.0, "expects_background": False, "label_offset": 0}
+    assert result["val_ratio"] == 0.0
+    assert result["configured_val_ratio"] == 0.1
+    assert result["validation_split_policy"] == "official_val_only"
     assert Path(result["output_dir"]).parent == tmp_path / "metrics"
 
 

@@ -9,7 +9,7 @@ import yaml
 from PIL import Image
 from ultralytics import YOLO
 
-from app.avaliacao.metricas import DEFAULT_MAX_DETECTIONS, evaluate_coco_predictions
+from app.avaliacao.metricas import DEFAULT_CURVE_CONF_THRESHOLD, DEFAULT_MAX_DETECTIONS, evaluate_coco_predictions
 from app.detectors.base import Logger
 
 
@@ -108,6 +108,12 @@ def _build_coco_gt(images: list[Path], class_names: list[str]) -> tuple[dict, di
     return {"images": coco_images, "annotations": coco_annotations, "categories": categories}, image_id_by_path
 
 
+def _build_coco_image_index(images: list[Path], class_names: list[str]) -> dict:
+    categories = [{"id": idx + 1, "name": name} for idx, name in enumerate(class_names)]
+    coco_images = [{"id": image_id, "file_name": image_path.name} for image_id, image_path in enumerate(images, start=1)]
+    return {"images": coco_images, "annotations": [], "categories": categories}
+
+
 def evaluate_yolo(
     data_yaml: str,
     weights_path: str,
@@ -146,6 +152,14 @@ def evaluate_yolo(
 
     gt_payload, image_id_by_path = _build_coco_gt(images, class_names)
     gt_path = output_dir / "gt_coco.json"
+    train_gt_path: Path | None = None
+    if split != "train" and data.get("train") is not None:
+        train_images = _list_images(_resolve_split_path(data, data_path, "train"))
+        train_gt_path = output_dir / "gt_coco_train_index.json"
+        train_gt_path.write_text(
+            json.dumps(_build_coco_image_index(train_images, class_names), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     predictions_path = output_dir / "predictions_coco.json"
     gt_path.write_text(json.dumps(gt_payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -153,7 +167,8 @@ def evaluate_yolo(
         logger,
         log_cb,
         f"[EVAL][YOLO] Inferência unificada: data={data_path}, split={split}, imagens={len(images)}, "
-        f"weights={weights}, imgsz={imgsz}, batch={batch}, device={device}, conf={conf}, iou={iou}, max_det={DEFAULT_MAX_DETECTIONS}",
+        f"weights={weights}, imgsz={imgsz}, batch={batch}, device={device}, "
+        f"export_conf={DEFAULT_CURVE_CONF_THRESHOLD}, operating_conf={conf}, iou={iou}, max_det={DEFAULT_MAX_DETECTIONS}",
     )
 
     model = YOLO(str(weights))
@@ -162,7 +177,7 @@ def evaluate_yolo(
         imgsz=imgsz,
         batch=batch,
         device=device,
-        conf=conf,
+        conf=DEFAULT_CURVE_CONF_THRESHOLD,
         iou=iou,
         max_det=DEFAULT_MAX_DETECTIONS,
         verbose=True,
@@ -190,6 +205,7 @@ def evaluate_yolo(
 
     result = evaluate_coco_predictions(
         gt_annotations=gt_path,
+        train_annotations=train_gt_path,
         predictions_json=predictions_path,
         output_dir=output_dir,
         model_name="YOLOv12n",
