@@ -33,6 +33,12 @@ class PascalVOCDataset(Dataset):
         self.annotations_dir = self.dataset_root / "Annotations"
         self.image_ids = [img_id.strip() for img_id in image_ids if img_id.strip()]
         self.class_to_idx = {name: int(idx) for name, idx in dict(class_to_idx).items()}
+        self.class_to_idx_normalized: dict[str, int] = {}
+        for name, idx in self.class_to_idx.items():
+            key = str(name).strip().lower()
+            if key in self.class_to_idx_normalized and self.class_to_idx_normalized[key] != idx:
+                raise ValueError(f"Classe VOC duplicada apÃ³s normalizaÃ§Ã£o: {name!r}")
+            self.class_to_idx_normalized[key] = int(idx)
         self.transforms = transforms
         self.logger = logger
         self.debug = debug
@@ -96,6 +102,7 @@ class PascalVOCDataset(Dataset):
                 if len(parsed) >= 4 and not isinstance(clamp_count, (int, float)) and isinstance(parsed[3], (int, float)):
                     extras.insert(0, clamp_count)
                     clamp_count = parsed[3]
+                annotation_balance = next((extra for extra in extras if isinstance(extra, dict)), None)
             else:
                 raise ValueError(
                     f"{stage_base}{meta_hint} parse_annotation retornou menos de 3 itens (idx={idx} ann_path={annotation_path} img_path={image_path})"
@@ -104,6 +111,15 @@ class PascalVOCDataset(Dataset):
             raise TypeError(
                 f"{stage_base}{meta_hint} parse_annotation deve retornar tuple/list (idx={idx} ann_path={annotation_path} img_path={image_path})"
             )
+        if annotation_balance is None:
+            annotation_balance = {
+                "source_format": "VOC",
+                "objects_read": len(boxes_list),
+                "converted": len(boxes_list),
+                "discarded": 0,
+                "discarded_by_cause": {},
+                "clamped_boxes": 0,
+            }
 
         if extras and self.logger and self.logger.isEnabledFor(logging.DEBUG):
             try:
@@ -149,6 +165,14 @@ class PascalVOCDataset(Dataset):
 
         label_mask = torch.isfinite(labels_tensor.float()) & (labels_tensor > 0)
         valid &= label_mask
+        invalid_count = int((~valid).sum().item()) if valid.numel() > 0 else 0
+        if invalid_count:
+            annotation_balance = dict(annotation_balance)
+            causes = dict(annotation_balance.get("discarded_by_cause", {}))
+            causes["post_filter_invalid_box_or_label"] = causes.get("post_filter_invalid_box_or_label", 0) + invalid_count
+            annotation_balance["discarded_by_cause"] = causes
+            annotation_balance["discarded"] = int(annotation_balance.get("discarded", 0)) + invalid_count
+            annotation_balance["converted"] = max(0, int(annotation_balance.get("converted", 0)) - invalid_count)
 
         if valid.any():
             boxes_tensor = boxes_tensor[valid]
@@ -173,6 +197,7 @@ class PascalVOCDataset(Dataset):
             "area": areas_tensor,
             "iscrowd": torch.zeros(boxes_tensor.shape[0], dtype=torch.int64),
             "img_path": str(image_path),
+            "annotation_balance": annotation_balance,
         }
 
         if self.transforms:
@@ -216,6 +241,20 @@ class PascalVOCDataset(Dataset):
         labels = []
         areas = []
         clamp_count = 0
+        balance: dict[str, Any] = {
+            "source_format": "VOC",
+            "annotation_path": str(annotation_path),
+            "objects_read": 0,
+            "converted": 0,
+            "discarded": 0,
+            "discarded_by_cause": {},
+            "clamped_boxes": 0,
+        }
+
+        def _discard(cause: str) -> None:
+            balance["discarded"] += 1
+            causes = balance["discarded_by_cause"]
+            causes[cause] = int(causes.get(cause, 0)) + 1
 
         if self.debug and self.logger:
             self.logger.debug(
@@ -223,16 +262,24 @@ class PascalVOCDataset(Dataset):
             )
 
         for obj in root.findall("object"):
+            balance["objects_read"] += 1
             name = obj.findtext("name")
             if name is None:
+                _discard("missing_class_name")
                 continue
 
             class_name = name.lower().strip()
-            if class_name not in ("pedestrian", "human"):
-                continue
+            class_idx = self.class_to_idx_normalized.get(class_name)
+            if class_idx is None:
+                expected = ", ".join(sorted(self.class_to_idx_normalized))
+                raise ValueError(
+                    f"[STAGE=annotation{meta_hint}] classe desconhecida {class_name!r} em {annotation_path}. "
+                    f"Classes esperadas: {expected}"
+                )
 
             bndbox = obj.find("bndbox")
             if bndbox is None:
+                _discard("missing_bndbox")
                 continue
             try:
                 xmin = float(bndbox.findtext("xmin"))
@@ -240,6 +287,7 @@ class PascalVOCDataset(Dataset):
                 xmax = float(bndbox.findtext("xmax"))
                 ymax = float(bndbox.findtext("ymax"))
             except (TypeError, ValueError):
+                _discard("invalid_coordinate_value")
                 continue
 
             if not all(math.isfinite(v) for v in (xmin, ymin, xmax, ymax)):
@@ -254,9 +302,11 @@ class PascalVOCDataset(Dataset):
 
             if xmax > width or ymax > height or xmin < 0 or ymin < 0:
                 clamp_count += 1
+                balance["clamped_boxes"] += 1
             boxes.append([xmin, ymin, xmax, ymax])
-            labels.append(1)  # background=0, person=1
+            labels.append(class_idx)
             areas.append(max(0.0, (xmax - xmin) * (ymax - ymin)))
+            balance["converted"] += 1
 
         if self.debug and self.logger:
             self.logger.debug(
@@ -269,4 +319,4 @@ class PascalVOCDataset(Dataset):
                 ),
             )
 
-        return boxes, labels, areas, clamp_count
+        return boxes, labels, areas, clamp_count, balance

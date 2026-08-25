@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from app.avaliacao.config import DEFAULT_MAX_DETECTIONS
-from app.avaliacao.metricas import evaluate_coco_predictions, assert_official_validation_split, check_train_val_disjoint
+from app.avaliacao.metricas import (
+    assert_official_validation_split,
+    assert_reference_integrity,
+    check_train_val_disjoint,
+    evaluate_coco_predictions,
+)
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -95,6 +100,27 @@ def test_heridal_validation_count_is_asserted(tmp_path: Path) -> None:
 
     with pytest.raises(AssertionError, match="esperado 310 imagens"):
         assert_official_validation_split(gt, dataset_name="HERIDAL")
+
+
+def test_visdrone_reference_integrity_rejects_missing_classes() -> None:
+    data = {
+        "images": [{"id": idx, "file_name": f"{idx:07d}.jpg"} for idx in range(1, 549)],
+        "annotations": [
+            {
+                "id": idx,
+                "image_id": ((idx - 1) % 548) + 1,
+                "category_id": 1,
+                "bbox": [0, 0, 10, 10],
+                "area": 100,
+                "iscrowd": 0,
+            }
+            for idx in range(1, 8845)
+        ],
+        "categories": [{"id": idx, "name": f"class_{idx}"} for idx in range(1, 11)],
+    }
+
+    with pytest.raises(AssertionError, match="perda silenciosa"):
+        assert_reference_integrity(data, dataset_name="VisDrone", split="val")
 
 
 def test_map_uses_unfiltered_predictions_but_operating_point_uses_conf_threshold(tmp_path: Path) -> None:

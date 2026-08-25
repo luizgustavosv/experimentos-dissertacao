@@ -21,6 +21,21 @@ Logger = Optional[Callable[[str], None]]
 VISDRONE_VAL_IMAGES = 548
 HERIDAL_VAL_IMAGES = 310
 
+REFERENCE_EXPECTATIONS = {
+    ("visdrone", "val"): {
+        "num_images": VISDRONE_VAL_IMAGES,
+        "num_categories": 10,
+        "num_annotations": 38759,
+        "require_all_declared_categories_present": True,
+    },
+    ("heridal", "val"): {
+        "num_images": HERIDAL_VAL_IMAGES,
+        "num_categories": 1,
+        "num_annotations": 685,
+        "require_all_declared_categories_present": True,
+    },
+}
+
 METRIC_KEYS = [
     "map50",
     "map50_95",
@@ -55,6 +70,136 @@ def expected_validation_images(dataset_name: str | None, annotations_path: Path 
     if "heridal" in name or "heridal" in path_text:
         return HERIDAL_VAL_IMAGES
     return None
+
+
+def _dataset_family(dataset_name: str | None, annotations_path: Path | None = None) -> str | None:
+    text = f"{dataset_name or ''} {annotations_path or ''}".lower()
+    if "visdrone" in text:
+        return "visdrone"
+    if "heridal" in text:
+        return "heridal"
+    return None
+
+
+def _reference_summary(gt_data: dict[str, Any]) -> dict[str, Any]:
+    categories = gt_data.get("categories", [])
+    annotations = gt_data.get("annotations", [])
+    category_names = {int(cat["id"]): str(cat.get("name", cat["id"])) for cat in categories if "id" in cat}
+    counts = {int(cat_id): 0 for cat_id in category_names}
+    for ann in annotations:
+        cat_id = int(ann["category_id"])
+        counts[cat_id] = counts.get(cat_id, 0) + 1
+    per_class = {
+        str(cat_id): {"name": category_names.get(cat_id, str(cat_id)), "num_annotations": int(count)}
+        for cat_id, count in sorted(counts.items())
+    }
+    zero_categories = [
+        {"id": int(cat_id), "name": category_names.get(cat_id, str(cat_id))}
+        for cat_id, count in sorted(counts.items())
+        if count == 0
+    ]
+    return {
+        "num_images": len(gt_data.get("images", [])),
+        "num_categories": len(categories),
+        "num_reference_instances": len(annotations),
+        "per_class": per_class,
+        "zero_annotation_categories": zero_categories,
+    }
+
+
+def assert_reference_integrity(
+    gt_data: dict[str, Any],
+    *,
+    dataset_name: str | None,
+    split: str,
+    annotations_path: Path | None = None,
+) -> dict[str, Any]:
+    summary = _reference_summary(gt_data)
+    family = _dataset_family(dataset_name, annotations_path)
+    expectation = REFERENCE_EXPECTATIONS.get((family or "", split.lower().strip()))
+    failures: list[str] = []
+    if expectation:
+        if summary["num_images"] != expectation["num_images"]:
+            failures.append(f"imagens={summary['num_images']} esperado={expectation['num_images']}")
+        if summary["num_categories"] != expectation["num_categories"]:
+            failures.append(f"categorias={summary['num_categories']} esperado={expectation['num_categories']}")
+        if summary["num_reference_instances"] != expectation["num_annotations"]:
+            failures.append(
+                f"instancias={summary['num_reference_instances']} esperado={expectation['num_annotations']}"
+            )
+        if expectation.get("require_all_declared_categories_present") and summary["zero_annotation_categories"]:
+            names = ", ".join(str(item["name"]) for item in summary["zero_annotation_categories"])
+            failures.append(f"classes declaradas sem anotacoes: {names}")
+    if failures:
+        raise AssertionError(
+            "ReferÃªncia de validaÃ§Ã£o invÃ¡lida; possÃ­vel perda silenciosa de classes/instÃ¢ncias: "
+            + "; ".join(failures)
+        )
+    return {
+        "checked": expectation is not None,
+        "passed": True,
+        "dataset_family": family,
+        "expected": expectation,
+        "summary": summary,
+    }
+
+
+def _default_annotation_conversion_balance(gt_data: dict[str, Any]) -> dict[str, Any]:
+    annotations = len(gt_data.get("annotations", []))
+    return {
+        "source_format": "COCO",
+        "objects_read": annotations,
+        "converted": annotations,
+        "discarded": 0,
+        "discarded_by_cause": {},
+        "clamped_boxes": 0,
+        "images": len(gt_data.get("images", [])),
+        "note": "ReferÃªncia jÃ¡ fornecida em COCO; sem conversÃ£o intermediÃ¡ria neste avaliador.",
+    }
+
+
+def _reference_consistency_check(
+    *,
+    output_dir: Path,
+    dataset_name: str,
+    split: str,
+    current_summary: dict[str, Any],
+) -> dict[str, Any]:
+    family = _dataset_family(dataset_name)
+    if family is None or output_dir.parent == output_dir:
+        return {"checked": False, "consistent": None, "comparison_count": 0, "mismatches": []}
+    mismatches: list[dict[str, Any]] = []
+    comparisons = 0
+    for result_path in output_dir.parent.rglob("results_unified.json"):
+        try:
+            data = json.loads(result_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(data.get("split", "")).lower() != split.lower():
+            continue
+        if _dataset_family(str(data.get("dataset") or ""), Path(str(data.get("gt_annotations") or ""))) != family:
+            continue
+        other_summary = data.get("reference_summary")
+        if not isinstance(other_summary, dict):
+            gt_path = data.get("gt_annotations")
+            if gt_path and Path(str(gt_path)).exists():
+                try:
+                    other_summary = _reference_summary(read_coco_json(Path(str(gt_path))))
+                except Exception:
+                    other_summary = None
+        if not isinstance(other_summary, dict):
+            continue
+        comparisons += 1
+        keys = ("num_images", "num_categories", "num_reference_instances")
+        diffs = {key: {"current": current_summary.get(key), "other": other_summary.get(key)} for key in keys if current_summary.get(key) != other_summary.get(key)}
+        if diffs:
+            mismatches.append({"results_path": str(result_path), "differences": diffs})
+    return {
+        "checked": comparisons > 0,
+        "consistent": len(mismatches) == 0 if comparisons > 0 else None,
+        "comparison_count": comparisons,
+        "mismatches": mismatches[:20],
+    }
 
 
 def read_coco_json(path: Path) -> dict[str, Any]:
@@ -382,6 +527,13 @@ def evaluate_coco_predictions(
 
     gt_data = read_coco_json(gt_annotations)
     split_check = assert_official_validation_split(gt_annotations, dataset_name=dataset_name)
+    reference_integrity_check = assert_reference_integrity(
+        gt_data,
+        dataset_name=dataset_name,
+        split=split,
+        annotations_path=gt_annotations,
+    )
+    reference_summary = reference_integrity_check["summary"]
     disjoint_check = check_train_val_disjoint(train_annotations, gt_annotations)
     if disjoint_check["checked"] and not disjoint_check["disjoint"]:
         raise AssertionError(
@@ -390,6 +542,22 @@ def evaluate_coco_predictions(
         )
 
     raw_predictions = json.loads(predictions_json.read_text(encoding="utf-8"))
+    extra_data = extra or {}
+    annotation_conversion_balance = extra_data.get("annotation_conversion_balance")
+    if not isinstance(annotation_conversion_balance, dict):
+        annotation_conversion_balance = _default_annotation_conversion_balance(gt_data)
+    representation = extra_data.get("dataset_representation")
+    if not isinstance(representation, dict):
+        representation = {
+            "source_format": "COCO",
+            "reference_annotations": str(gt_annotations),
+        }
+    reference_consistency_check = _reference_consistency_check(
+        output_dir=output_dir,
+        dataset_name=dataset_name,
+        split=split,
+        current_summary=reference_summary,
+    )
     predictions_for_integrated_metrics = _filter_and_cap_predictions(
         raw_predictions,
         conf_threshold=DEFAULT_CURVE_CONF_THRESHOLD,
@@ -531,6 +699,11 @@ def evaluate_coco_predictions(
             },
         },
         "validation_split_check": split_check,
+        "reference_integrity_check": reference_integrity_check,
+        "reference_summary": reference_summary,
+        "annotation_conversion_balance": annotation_conversion_balance,
+        "dataset_representation": representation,
+        "reference_consistency_check": reference_consistency_check,
         "train_val_disjoint_check": disjoint_check,
         "num_images": len(gt_data.get("images", [])),
         "num_detections": len(predictions_for_integrated_metrics),
@@ -550,7 +723,7 @@ def evaluate_coco_predictions(
         },
         "metrics": metrics_block,
         "figures": figures,
-        "extra": extra or {},
+        "extra": extra_data,
         "created_at": datetime.now().isoformat(),
     }
 

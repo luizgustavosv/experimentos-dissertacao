@@ -72,6 +72,30 @@ def _build_coco_image_index(dataset_root: Path, image_ids: Sequence[str], catego
     return {"images": images, "annotations": [], "categories": categories}
 
 
+def _empty_annotation_balance() -> dict[str, object]:
+    return {
+        "source_format": "VOC",
+        "objects_read": 0,
+        "converted": 0,
+        "discarded": 0,
+        "discarded_by_cause": {},
+        "clamped_boxes": 0,
+        "images": 0,
+    }
+
+
+def _merge_annotation_balance(total: dict[str, object], item: object) -> None:
+    if not isinstance(item, dict):
+        return
+    total["images"] = int(total.get("images", 0)) + 1
+    for key in ("objects_read", "converted", "discarded", "clamped_boxes"):
+        total[key] = int(total.get(key, 0)) + int(item.get(key, 0) or 0)
+    causes_total = total.setdefault("discarded_by_cause", {})
+    if isinstance(causes_total, dict):
+        for cause, count in dict(item.get("discarded_by_cause", {}) or {}).items():
+            causes_total[str(cause)] = int(causes_total.get(str(cause), 0)) + int(count or 0)
+
+
 def evaluate_torchvision_ssd_voc(
     voc_root: str,
     weights_path: str,
@@ -180,6 +204,7 @@ def evaluate_torchvision_ssd_voc(
     predictions: list[dict[str, object]] = []
     coco_images: list[dict[str, object]] = []
     coco_annotations: list[dict[str, object]] = []
+    annotation_balance = _empty_annotation_balance()
     ann_id = 1
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(dataloader, start=1):
@@ -190,6 +215,7 @@ def evaluate_torchvision_ssd_voc(
                 img_path = str(target.get("img_path", ""))
                 height, width = int(image_tensor.shape[-2]), int(image_tensor.shape[-1])
                 coco_images.append({"id": image_id, "file_name": Path(img_path).name if img_path else str(image_id), "width": width, "height": height})
+                _merge_annotation_balance(annotation_balance, target.get("annotation_balance"))
 
                 gt_boxes = target.get("boxes", torch.zeros((0, 4), dtype=torch.float32)).detach().cpu().float()
                 gt_labels = target.get("labels", torch.zeros((0,), dtype=torch.int64)).detach().cpu().long()
@@ -260,7 +286,16 @@ def evaluate_torchvision_ssd_voc(
         epoch_relative=checkpoint_epoch,
         epoch_accumulated=checkpoint_epoch,
         logger=_emit,
-        extra={"classes": class_names, "checkpoint_meta": meta},
+        extra={
+            "classes": class_names,
+            "checkpoint_meta": meta,
+            "annotation_conversion_balance": annotation_balance,
+            "dataset_representation": {
+                "source_format": "VOC",
+                "source_root": str(dataset_root),
+                "split_file": str(dataset_root / "ImageSets" / "Main" / f"{split_normalized}.txt"),
+            },
+        },
     )
     metrics = result.get("metrics", {})
     json_path = output_dir / "metrics.json"
