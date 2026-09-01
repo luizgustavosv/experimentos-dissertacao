@@ -4,6 +4,10 @@ Codigo experimental de apoio a uma dissertacao de Mestrado em Ciencia da Computa
 
 O repositorio contem uma aplicacao Tkinter para normalizacao de datasets, treinamento, inferencia, avaliacao pos-treinamento, benchmark de inferencia e leitura de metadados de checkpoints. A prioridade do projeto e reprodutibilidade experimental, rastreabilidade e transparencia sobre limitacoes conhecidas.
 
+Autor: Luiz Gustavo.
+Instituicao/programa: preencher antes da publicacao, conforme a versao final da dissertacao.
+Licenca: pendente de escolha explicita. Sem um arquivo `LICENSE`, o codigo fica publicamente visivel, mas sem permissao clara de reutilizacao por terceiros.
+
 ## Modelos
 
 - YOLO: backend Ultralytics.

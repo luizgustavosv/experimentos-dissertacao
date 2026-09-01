@@ -3,8 +3,8 @@ message: "If you use this repository, cite the associated master's dissertation 
 title: "Redes Neurais Profundas Para Deteccao de Pessoas em Imagens Aereas Geradas Por Drones: Um enfoque comparativo"
 type: software
 authors:
-  - name: "Autor da dissertacao nao informado no repositorio"
-repository-code: "https://github.com/REPLACE-WITH-REPOSITORY-URL"
+  - name: "Luiz Gustavo"
+repository-code: "https://github.com/luizgustavosv/experimentos-dissertacao"
 abstract: "Codigo experimental para comparacao de YOLOv12n, SSD300, Faster R-CNN e RetinaNet em datasets de imagens aereas geradas por drones."
 keywords:
   - object detection
