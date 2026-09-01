@@ -1,10 +1,10 @@
-# Laboratorio de deteccao de objetos em imagens aereas
+# Laboratório de detecção de objetos em imagens aéreas
 
-Codigo experimental de apoio a dissertacao de mestrado **"Redes Neurais Profundas Para Deteccao de Pessoas em Imagens Aereas Geradas Por Drones: Um enfoque comparativo"**, de Luiz Gustavo Santos Verissimo, Programa de Pos-Graduacao em Ciencia da Computacao, Instituto de Informatica, Universidade Federal de Goias (UFG), Goiania, Goias, Brasil.
+Código experimental de apoio a dissertação de mestrado **"Redes Neurais Profundas Para Detecção de Pessoas em Imagens Aéreas Geradas Por Drones: Um enfoque comparativo"**, de Luiz Gustavo Santos Verissimo, Programa de Pós-graduação em Ciência da Computação, Instituto de Informática, Universidade Federal de Goiás (UFG), Goiânia, Goiás, Brasil.
 
-O repositorio contem uma aplicacao Tkinter para normalizacao de datasets, treinamento, inferencia, avaliacao pos-treinamento, benchmark de inferencia e leitura de metadados de checkpoints. A prioridade do projeto e reprodutibilidade experimental, rastreabilidade e transparencia sobre limitacoes conhecidas.
+O repositório contém uma aplicação Tkinter para normalização de datasets, treinamento, inferência, avaliação pós-treinamento, benchmark de inferência e leitura de metadados de checkpoints. A prioridade do projeto e reprodutibilidade experimental, rastreabilidade e transparência sobre limitações conhecidas.
 
-## Escopo cientifico
+## Escopo científico
 
 Modelos comparados:
 
@@ -15,43 +15,43 @@ Modelos comparados:
 
 Datasets principais:
 
-- HERIDAL: copia Kaggle com 1.546 imagens, dividida de forma reprodutivel em 1.236 treino e 310 validacao, `seed=42`.
-- VisDrone2019-DET: validacao oficial com 548 imagens, 38.759 instancias e 10 categorias.
+- HERIDAL: copia Kaggle com 1.546 imagens, dividida de forma reprodutível em 1.236 treino e 310 validacao, `seed=42`.
+- VisDrone2019-DET: validação oficial com 548 imagens, 38.759 instancias e 10 categorias.
 
-Os datasets e checkpoints nao devem ser versionados neste repositorio. Consulte as licencas e paginas oficiais antes de redistribuir dados ou pesos treinados.
+Os datasets e checkpoints não devem ser versionados neste repositório. Consulte as licenças e páginas oficiais antes de redistribuir dados ou pesos treinados.
 
-## Estado do codigo
+## Estado do código
 
-A versao publica foi auditada para remover problemas que comprometeriam novas execucoes:
+A versão publica foi auditada para remover problemas que comprometeriam novas execuções:
 
-- todos os campos de `TrainConfig` sao expostos como hiperparametros na GUI;
-- filtros por classe foram removidos dos fluxos de inferencia/normalizacao;
+- todos os campos de `TrainConfig` sao expostos como hiperparâmetros na GUI;
+- filtros por classe foram removidos dos fluxos de inferência/normalização;
 - o leitor VOC/SSD atual preserva as classes existentes;
-- anotacoes de validacao sao obrigatorias em processos COCO de validacao;
-- testes de regressao cobrem preservacao multiclasse do VisDrone.
+- anotações de validação são obrigatórias em processos COCO de validação;
+- testes de regressão cobrem preservação multiclasse do VisDrone.
 
-Essas correcoes sao posteriores a parte dos experimentos historicos. Portanto, resultados ja reportados na dissertacao nao devem ser reinterpretados como se tivessem sido produzidos pelo codigo corrigido atual.
+Essas correções são posteriores a parte dos experimentos históricos. Portanto, resultados já reportados na dissertação não devem ser reinterpretados como se tivessem sido produzidos pelo código corrigido atual.
 
-## Documentos de leitura obrigatoria
+## Documentos de leitura obrigatória
 
-- `REPRODUCIBILITY.md`: protocolo historico, ambiente, datasets, checkpoints, metricas e diferencas entre codigo historico e atual.
-- `KNOWN_ISSUES.md`: limitacoes conhecidas, incluindo o problema historico SSD300/VisDrone.
-- `AUDIT_REPORT.md`: relatorio de auditoria tecnica e cientifica.
-- `SHA256SUMS.txt`: hashes SHA-256 dos checkpoints historicos localizados em `C:\Experimentos`.
-- `SECURITY.md`: politica de seguranca e orientacoes para reportar problemas.
+- `REPRODUCIBILITY.md`: protocolo histórico, ambiente, datasets, checkpoints, métricas e diferenças entre código histórico e atual.
+- `KNOWN_ISSUES.md`: limitações conhecidas, incluindo o problema histórico SSD300/VisDrone.
+- `AUDIT_REPORT.md`: relatório de auditoria técnica e cientifica.
+- `SHA256SUMS.txt`: hashes SHA-256 dos checkpoints históricos localizados em `C:\Experimentos`.
+- `SECURITY.md`: política de segurança e orientações para reportar problemas.
 
 ## Estrutura
 
-- `app/gui.py`: interface grafica e coleta de parametros.
-- `app/controller.py`: orquestracao dos pipelines.
-- `app/datasets/`: representacao intermediaria, readers e exporters YOLO/VOC/COCO.
-- `app/detectors/`: modelos, treino, validacao, inferencia e utilitarios.
-- `app/avaliacao/`: metricas COCO, metricas operacionais e figuras.
+- `app/gui.py`: interface gráfica e coleta de parâmetros.
+- `app/controller.py`: orquestração dos pipelines.
+- `app/datasets/`: representação intermediaria, readers e exporters YOLO/VOC/COCO.
+- `app/detectors/`: modelos, treino, validação, inferência e utilitários.
+- `app/avaliacao/`: métricas COCO, métricas operacionais e figuras.
 - `app/training/`: checkpointing e early stopping.
-- `tests/`: testes rapidos de regressao cientifica e smoke tests.
+- `tests/`: testes rápidos de regressão cientifica e smoke tests.
 - `tools/`: scripts auxiliares de auditoria; podem exigir ajuste de caminhos locais antes de uso.
 
-## Instalacao
+## Instalação
 
 ```bash
 python -m venv .venv
@@ -62,21 +62,21 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-As versoes em `requirements.txt` refletem dependencias conhecidas da aplicacao publica. Para reproducao historica estrita, use tambem as versoes e ressalvas em `REPRODUCIBILITY.md`.
+As versões em `requirements.txt` refletem dependências conhecidas da aplicação publica. Para reprodução histórica estrita, use também as versões e ressalvas em `REPRODUCIBILITY.md`.
 
-## Execucao
+## Execução
 
 ```bash
 python -m app.main
 ```
 
-Na GUI, selecione algoritmo, acao e caminhos. Para reproduzir uma execucao historica, informe explicitamente os hiperparametros do respectivo experimento; nao assuma que os defaults atuais representam todos os treinos reportados na dissertacao.
+Na GUI, selecione algoritmo, acao e caminhos. Para reproduzir uma execução histórica, informe explicitamente os hiperparâmetros do respectivo experimento; não assuma que os defaults atuais representam todos os treinos reportados na dissertação.
 
-## Validacao e metricas
+## Validação e métricas
 
-As avaliacoes COCO exigem anotacoes de validacao explicitas. O codigo atual evita inferencia automatica silenciosa de `instances_val.json`.
+As avaliações COCO exigem anotações de validação explicitas. O código atual evita inferência automática silenciosa de `instances_val.json`.
 
-AP/mAP/AR usam avaliacao COCO e preservam predicoes de baixa confianca para ranking. Precision/Recall/F1 e matriz de confusao sao calculadas separadamente no ponto operacional documentado.
+AP/mAP/AR usam avaliacao COCO e preservam predições de baixa confiança para ranking. Precision/Recall/F1 e matriz de confusão são calculadas separadamente no ponto operacional documentado.
 
 ## Testes
 
@@ -84,8 +84,8 @@ AP/mAP/AR usam avaliacao COCO e preservam predicoes de baixa confianca para rank
 pytest -q
 ```
 
-Os testes nao executam treinamento completo. Eles cobrem parsing de datasets, preservacao multiclasse do VisDrone, convencoes de classes, metricas sinteticas, checkpointing rapido e consistencia basica dos parametros de treino.
+Os testes não executam treinamento completo. Eles cobrem parsing de datasets, preservação multiclasse do VisDrone, convenções de classes, métricas sintéticas, checkpointing rápido e consistência básica dos parâmetros de treino.
 
-## Licenca
+## Licença
 
-O codigo deste repositorio esta sob licenca MIT, conforme `LICENSE`. Dependencias e datasets possuem licencas proprias; em especial, confira as condicoes de uso do Ultralytics e dos datasets antes de redistribuir artefatos.
+O código deste repositório está sob licenca MIT, conforme `LICENSE`. Dependências e datasets possuem licenças próprias; em especial, confira as condições de uso do Ultralytics e dos datasets antes de redistribuir artefatos.
