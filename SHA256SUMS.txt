@@ -1,0 +1,14 @@
+# SHA-256 hashes of historical checkpoints located in C:\Experimentos on 2026-09-01.
+# Checkpoints and datasets are not versioned in this Git repository.
+#
+# Format:
+# <sha256>  <historical label>  <bytes>  <local source path>
+
+3b33ae64b4f86ed413d890adfbd7d53f54d58d90f6a2c3214e89f6dbd48caa5a  YOLOv12n/HERIDAL best.pt  5511706  C:\Experimentos\CNNs\YOLO\yolo12n_heridal_100epochs\best.pt
+83bee7f4d1f1cf93e7bee7f1137bc50efb45788b7124b41e392a41704f511f3b  YOLOv12n/VisDrone best.pt  5495827  C:\Experimentos\CNNs\YOLO\yolo12n_visdrone\pesos\yolo_visdrone3\weights\best.pt
+569cda923831aa718c406b0831000af5e7245c5c8051798fa2bd9a86a751b004  SSD300/HERIDAL best_by_monitor.pth  95010565  C:\Experimentos\CNNs\SSD300\ssd_heridal\best_by_monitor.pth
+6ece155d204dddc42d9a3ead2da91b415d967da2a6374d0e89bcdf3f4b74d325  SSD300/VisDrone ssd_last_epoch_0100.pth  199495070  C:\Experimentos\CNNs\SSD300\ssd_visdrone\pesos\checkpoints\ssd_last_epoch_0100.pth
+109259d19a39db2384841461ca9d4a615da8bd90e359349756d56755aa2ae775  Faster-R-CNN/HERIDAL checkpoint_epoch_65.pth  330098908  C:\Experimentos\CNNs\FASTER R-CNN\faster_rcnn_heridal_100epochs\2-round\checkpoints\checkpoint_epoch_65.pth
+a3d3685dfec4010af1d0b0040a67406008c2beff6d106846d89c6a773f5a2d22  Faster-R-CNN/VisDrone checkpoint_epoch_49.pth  330296668  C:\Experimentos\CNNs\FASTER R-CNN\faster_rcnn_visdrone_100epochs\3run\checkpoints\checkpoint_epoch_49.pth
+0574745e0170ac066767ab1799f32abb77d934466a3132ceadb2c29a498a2de5  RetinaNet/HERIDAL checkpoint_epoch_100.pth  256953468  C:\Experimentos\CNNs\RETINANET\retinanet_heridal_100epochs\checkpoints\checkpoint_epoch_100.pth
+33fa93b51e66862216d2428a2cac3ddf3a4a2df656b2c6381fcac9dfe00aa219  RetinaNet/VisDrone checkpoint_epoch_48.pth  258447164  C:\Experimentos\CNNs\RETINANET\retinanet_visdrone_100epochs\checkpoints\checkpoint_epoch_48.pth

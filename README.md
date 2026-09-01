@@ -1,26 +1,44 @@
 # Laboratorio de deteccao de objetos em imagens aereas
 
-Codigo experimental de apoio a uma dissertacao de Mestrado em Ciencia da Computacao sobre deteccao de pessoas em imagens aereas geradas por drones, com comparacao entre YOLOv12n, SSD300, Faster R-CNN e RetinaNet nos datasets HERIDAL e VisDrone.
+Codigo experimental de apoio a dissertacao de mestrado **"Redes Neurais Profundas Para Deteccao de Pessoas em Imagens Aereas Geradas Por Drones: Um enfoque comparativo"**, de Luiz Gustavo Santos Verissimo, Programa de Pos-Graduacao em Ciencia da Computacao, Instituto de Informatica, Universidade Federal de Goias (UFG), Goiania, Goias, Brasil.
 
 O repositorio contem uma aplicacao Tkinter para normalizacao de datasets, treinamento, inferencia, avaliacao pos-treinamento, benchmark de inferencia e leitura de metadados de checkpoints. A prioridade do projeto e reprodutibilidade experimental, rastreabilidade e transparencia sobre limitacoes conhecidas.
 
-Autor: Luiz Gustavo.
-Instituicao/programa: preencher antes da publicacao, conforme a versao final da dissertacao.
-Licenca: pendente de escolha explicita. Sem um arquivo `LICENSE`, o codigo fica publicamente visivel, mas sem permissao clara de reutilizacao por terceiros.
+## Escopo cientifico
 
-## Modelos
+Modelos comparados:
 
-- YOLO: backend Ultralytics.
-- SSD300: `torchvision.models.detection.ssd300_vgg16`.
-- Faster R-CNN: `torchvision.models.detection.fasterrcnn_resnet50_fpn`.
-- RetinaNet: `torchvision.models.detection.retinanet_resnet50_fpn`.
+- YOLOv12n, via Ultralytics.
+- SSD300, via `torchvision.models.detection.ssd300_vgg16`.
+- Faster R-CNN, via `torchvision.models.detection.fasterrcnn_resnet50_fpn`.
+- RetinaNet, via `torchvision.models.detection.retinanet_resnet50_fpn`.
 
-## Datasets
+Datasets principais:
 
-- HERIDAL: esperado em estrutura com `train/_annotations.csv` ou `train/annotations.csv`, conforme o fluxo usado.
-- VisDrone: esperado em splits `VisDrone2019-DET-train`, `VisDrone2019-DET-val` e, quando aplicavel, `VisDrone2019-DET-test-*`, com subpastas `images/` e `annotations/`.
+- HERIDAL: copia Kaggle com 1.546 imagens, dividida de forma reprodutivel em 1.236 treino e 310 validacao, `seed=42`.
+- VisDrone2019-DET: validacao oficial com 548 imagens, 38.759 instancias e 10 categorias.
 
-Datasets e checkpoints nao devem ser versionados neste repositorio. Consulte as licencas e paginas oficiais de cada dataset antes de redistribuir dados.
+Os datasets e checkpoints nao devem ser versionados neste repositorio. Consulte as licencas e paginas oficiais antes de redistribuir dados ou pesos treinados.
+
+## Estado do codigo
+
+A versao publica foi auditada para remover problemas que comprometeriam novas execucoes:
+
+- todos os campos de `TrainConfig` sao expostos como hiperparametros na GUI;
+- filtros por classe foram removidos dos fluxos de inferencia/normalizacao;
+- o leitor VOC/SSD atual preserva as classes existentes;
+- anotacoes de validacao sao obrigatorias em processos COCO de validacao;
+- testes de regressao cobrem preservacao multiclasse do VisDrone.
+
+Essas correcoes sao posteriores a parte dos experimentos historicos. Portanto, resultados ja reportados na dissertacao nao devem ser reinterpretados como se tivessem sido produzidos pelo codigo corrigido atual.
+
+## Documentos de leitura obrigatoria
+
+- `REPRODUCIBILITY.md`: protocolo historico, ambiente, datasets, checkpoints, metricas e diferencas entre codigo historico e atual.
+- `KNOWN_ISSUES.md`: limitacoes conhecidas, incluindo o problema historico SSD300/VisDrone.
+- `AUDIT_REPORT.md`: relatorio de auditoria tecnica e cientifica.
+- `SHA256SUMS.txt`: hashes SHA-256 dos checkpoints historicos localizados em `C:\Experimentos`.
+- `SECURITY.md`: politica de seguranca e orientacoes para reportar problemas.
 
 ## Estrutura
 
@@ -44,7 +62,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-As versoes em `requirements.txt` refletem dependencias conhecidas, mas nem todas as versoes historicas foram recuperadas. Para reproducao estrita, veja `REPRODUCIBILITY.md`.
+As versoes em `requirements.txt` refletem dependencias conhecidas da aplicacao publica. Para reproducao historica estrita, use tambem as versoes e ressalvas em `REPRODUCIBILITY.md`.
 
 ## Execucao
 
@@ -52,13 +70,13 @@ As versoes em `requirements.txt` refletem dependencias conhecidas, mas nem todas
 python -m app.main
 ```
 
-Na GUI, selecione algoritmo, acao e caminhos. Todos os campos do `TrainConfig` sao expostos como hiperparametros de treinamento.
+Na GUI, selecione algoritmo, acao e caminhos. Para reproduzir uma execucao historica, informe explicitamente os hiperparametros do respectivo experimento; nao assuma que os defaults atuais representam todos os treinos reportados na dissertacao.
 
 ## Validacao e metricas
 
 As avaliacoes COCO exigem anotacoes de validacao explicitas. O codigo atual evita inferencia automatica silenciosa de `instances_val.json`.
 
-As metricas integradas de AP/mAP/AR usam avaliacao COCO e preservam predicoes de baixa confianca para ranking. Precision/Recall/F1 e matriz de confusao sao calculadas separadamente em um ponto operacional de confianca.
+AP/mAP/AR usam avaliacao COCO e preservam predicoes de baixa confianca para ranking. Precision/Recall/F1 e matriz de confusao sao calculadas separadamente no ponto operacional documentado.
 
 ## Testes
 
@@ -66,13 +84,8 @@ As metricas integradas de AP/mAP/AR usam avaliacao COCO e preservam predicoes de
 pytest -q
 ```
 
-Os testes nao executam treinamento completo. Eles cobrem parsing de datasets, preservacao multiclasse do VisDrone, convencoes de classes, metricas sinteticas e checkpointing rapido.
+Os testes nao executam treinamento completo. Eles cobrem parsing de datasets, preservacao multiclasse do VisDrone, convencoes de classes, metricas sinteticas, checkpointing rapido e consistencia basica dos parametros de treino.
 
-## Limitacoes conhecidas
+## Licenca
 
-Leia `KNOWN_ISSUES.md` antes de interpretar resultados. Em particular, ha registro de defeito historico no pipeline SSD300/VisDrone: o leitor usado no treinamento historico reteve apenas a categoria `pedestrian`. O codigo atual foi corrigido para comportamento multiclasse, mas resultados historicos nao devem ser reinterpretados como se tivessem sido gerados com o leitor corrigido.
-
-Luiz Gustavo Santos Veríssimo
-Programa de Pós-Graduação em Ciência da Computação
-Instituto de Informática
-Universidade Federal de Goiás (UFG)
+O codigo deste repositorio esta sob licenca MIT, conforme `LICENSE`. Dependencias e datasets possuem licencas proprias; em especial, confira as condicoes de uso do Ultralytics e dos datasets antes de redistribuir artefatos.

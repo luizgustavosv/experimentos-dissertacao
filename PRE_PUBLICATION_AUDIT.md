@@ -2,18 +2,18 @@
 
 Classificacao final: **SAFE TO PUBLISH AFTER MINOR FIXES**.
 
-Nao foram encontrados segredos por padroes fortes no working tree nem no historico Git varrido localmente. O repositorio ainda nao esta pronto para publicacao imediata por tres motivos praticos: nao ha `LICENSE`, existem dois PRs abertos obsoletos no GitHub mencionando `pedestrian_only`, e ha artefatos locais grandes/ignorados que devem continuar fora do Git. A correcao cientifica sobre filtros de classe e a documentacao de rastreabilidade ja foram aplicadas.
+Nao foram encontrados segredos por padroes fortes no working tree nem no historico Git varrido localmente. O repositorio esta em condicao tecnica substancialmente melhor apos a auditoria: ha `LICENSE`, a identidade academica foi preenchida, a versao final da dissertacao foi confrontada com o repositorio, filtros de classe foram removidos do codigo atual e a documentacao de rastreabilidade foi atualizada. Permanecem acoes manuais visiveis: fechar PRs obsoletos no GitHub, manter artefatos locais grandes fora do Git e revisar conscientemente a exposicao de e-mail pessoal no historico.
 
 # Problemas encontrados
 
 | Severidade | Categoria | Arquivo/commit | Problema | Risco | Acao necessaria | Resolvido? |
 |---|---|---|---|---|---|---|
-| HIGH | LICENSE | Repositorio/GitHub | Nao ha arquivo `LICENSE`; GitHub reporta `license: null`. | Codigo publico sem permissao clara de reutilizacao; pode confundir banca e usuarios externos. | Escolher explicitamente MIT, BSD-3-Clause, Apache-2.0, GPL-3.0 ou outra licenca adequada; adicionar `LICENSE` antes da publicacao. | Nao |
-| MEDIUM | HISTORY | GitHub PRs #109 e #110 | PRs abertos antigos mencionam `pedestrian_only` e uma correcao que ficou obsoleta pela auditoria atual. | Contradicao publica e ruido cientifico/profissional. | Fechar manualmente os PRs #109 e #110 como obsoletos, referenciando a auditoria/correcao atual. | Nao |
+| HIGH | LICENSE | Repositorio/GitHub | O repositorio estava sem licenca explicita durante a auditoria inicial. | Codigo publico sem permissao clara de reutilizacao; podia confundir banca e usuarios externos. | `LICENSE` MIT adicionado. | Sim |
+| MEDIUM | HISTORY | GitHub PRs #109 e #110 | PRs abertos antigos mencionam uma opcao de filtro de classe que ficou obsoleta pela auditoria atual. | Contradicao publica e ruido cientifico/profissional. | Fechar manualmente os PRs #109 e #110 como obsoletos, referenciando a auditoria/correcao atual. | Nao |
 | MEDIUM | REPRODUCIBILITY | `KNOWN_ISSUES.md`; `AUDIT_REPORT.md`; codigo historico | Resultados historicos SSD300/VisDrone nao devem ser interpretados como gerados pelo leitor multiclasse corrigido. | Risco de parecer que resultados foram recalculados ou melhorados apos o experimento. | Manter documentacao de codigo historico vs codigo corrigido; criar tag/release do estado associado a dissertacao. | Parcial |
 | MEDIUM | PORTABILITY | Historico Git: `MANUAL_TESTS.md`, `app/detectors/yolo.py`, `app/detectors/train_yolo_visdrone_instrumented.py` | Commits antigos contem exemplos de caminhos locais como unidades Windows e diretorios de dataset. | Baixo risco de privacidade; principalmente portabilidade e estetica historica. | Nao reescrever historico por isso; manter versao atual parametrizada. | Sim no estado atual |
 | MEDIUM | HISTORY | Banco de objetos local; arquivo `experimentos-dissertacao.zip` | ZIP local de ~316 MB existe no workspace e aparece como blob no banco de objetos local, mas nao foi associado a commit por `git log --all --full-history`. | Pode aumentar clone/push se algum ref local oculto o carregar; pode conter material indevido se publicado por engano. | Nao versionar; remover do workspace apenas com decisao do autor; executar `git gc/prune` local se confirmado que nao e necessario. | Nao |
-| MEDIUM | DOCUMENTATION | `CITATION.cff` | CITATION tinha URL placeholder e autor nao informado. | Apresentacao publica incompleta. | Atualizado para reposititorio real e autor "Luiz Gustavo"; revisar nome academico completo antes da publicacao. | Parcial |
+| MEDIUM | DOCUMENTATION | `CITATION.cff` | CITATION tinha URL placeholder, autor incompleto e marcadores de conflito Git. | Apresentacao publica incompleta e arquivo CFF invalido. | Atualizado para repositorio real, nome academico completo, afiliacao e sintaxe CFF valida. | Sim |
 | LOW | PRIVACY | Historico de commits | Autoria alterna entre `luizgsv@protonmail.com` e `108900071+luizgustavosv@users.noreply.github.com`. | Exposicao de e-mail pessoal ja presente no historico. | Aceitar se esse e-mail puder ser publico; reescrever historico so se houver razao forte de privacidade. | Revisar |
 | LOW | SECURITY | Codigo Python | Uso amplo de `torch.load` em checkpoints informados pelo usuario. | `torch.load` pode executar payload malicioso se o checkpoint vier de origem nao confiavel; contexto e app local de pesquisa. | Documentar que checkpoints devem ser confiaveis; preferir `weights_only=True` quando compativel. | Parcial |
 | LOW | ACTIONS | `.github/workflows` | Nao existe diretorio local `.github`; API de contents retornou 404 para workflows. | Sem risco observado em workflows versionados. Logs remotos antigos nao foram auditados integralmente. | Revisar aba Actions no GitHub antes de tornar publico, se houver runs historicos. | Parcial |
@@ -55,7 +55,7 @@ Commits:
 Serao expostos:
 
 - Usuario GitHub `luizgustavosv`.
-- Nome `Luiz Gustavo` em commits/PRs/CITATION.
+- Nome academico `Luiz Gustavo Santos Verissimo` na documentacao publica.
 - E-mail `luizgsv@protonmail.com` em commits recentes.
 - E-mail noreply do GitHub em commits anteriores.
 
@@ -63,16 +63,9 @@ Nao foram encontrados CPF, RG, telefone, endereco residencial ou credenciais ins
 
 # Licencas
 
-O repositorio ainda nao tem `LICENSE`. Nao escolhi uma licenca automaticamente.
+O repositorio contem `LICENSE` MIT.
 
-Opcoes comuns:
-
-- MIT: simples e permissiva.
-- BSD-3-Clause: permissiva, com clausula contra endosso.
-- Apache-2.0: permissiva, com linguagem explicita sobre patentes.
-- GPL-3.0: copyleft forte; exige que derivados distribuido preservem a mesma liberdade.
-
-Dependencias principais incluem PyTorch, torchvision, Ultralytics, pycocotools, torchmetrics e outras bibliotecas instaladas via `requirements.txt`. Nao identifiquei codigo vendorizado de terceiros que bloqueie uma licenca permissiva, mas a licenca do proprio repositorio deve ser escolhida pelo autor/orientacao.
+Dependencias principais incluem PyTorch, torchvision, Ultralytics, pycocotools, torchmetrics e outras bibliotecas instaladas via `requirements.txt`. Nao identifiquei codigo vendorizado de terceiros que bloqueie a licenca escolhida, mas dependencias, datasets e checkpoints possuem licencas/termos proprios.
 
 # Datasets
 
@@ -88,7 +81,7 @@ Recomendacao:
 
 A distincao entre codigo historico e codigo corrigido esta documentada em `README.md`, `KNOWN_ISSUES.md`, `REPRODUCIBILITY.md` e `AUDIT_REPORT.md`. A correcao atual remove filtros de classe e preserva categorias, mas os resultados historicos nao devem ser reinterpretados como se tivessem sido produzidos por essa versao corrigida.
 
-Pendencia: o arquivo da dissertacao nao estava no workspace, portanto a comparacao literal entre texto final e codigo ainda precisa ser feita.
+A comparacao literal com a versao final da dissertacao foi concluida em 2026-09-01 usando `C:\Experimentos\Dissertacao_corrigida.zip`. As divergencias factuais relevantes foram registradas em `REPRODUCIBILITY.md`, `KNOWN_ISSUES.md` e `AUDIT_REPORT.md`, com destaque para SSD300/VisDrone e a evidencia inconclusiva sobre o otimizador historico do YOLO.
 
 # GitHub Actions
 
@@ -126,14 +119,15 @@ Resultado de testes: `27 passed`.
 
 # Acoes manuais obrigatorias antes de tornar publico
 
-[ ] Escolher e adicionar um arquivo `LICENSE`.
+[x] Escolher e adicionar um arquivo `LICENSE`.
 [ ] Fechar ou marcar como obsoletos os PRs abertos #109 e #110.
 [ ] Revisar se `luizgsv@protonmail.com` pode ficar publico no historico.
 [ ] Confirmar que `experimentos-dissertacao.zip`, `app.log`, `logs/`, `runs/`, `reports/` e datasets locais nao serao adicionados ao commit.
 [ ] Revisar a aba Actions/logs no GitHub, se houver runs historicos.
 [ ] Revisar Issues/PRs restantes alem da primeira pagina amostrada se houver metadados privados.
-[ ] Preencher instituicao/programa e nome academico completo no README/CITATION.
-[ ] Comparar a versao final da dissertacao com `KNOWN_ISSUES.md` e `REPRODUCIBILITY.md`.
+[x] Preencher instituicao/programa e nome academico completo no README/CITATION.
+[x] Comparar a versao final da dissertacao com `KNOWN_ISSUES.md` e `REPRODUCIBILITY.md`.
+[ ] Revisar manualmente a divergencia YOLO/AdamW antes de qualquer afirmacao publica adicional sobre o otimizador efetivo dos checkpoints historicos.
 
 # Acoes recomendadas, mas nao obrigatorias
 
@@ -146,10 +140,10 @@ Resultado de testes: `27 passed`.
 
 # Parecer final
 
-Eu tornaria este repositorio publico neste momento? **NAO, ainda nao**.
+Eu tornaria este repositorio publico neste momento? **SIM, com ressalvas manuais pequenas e visiveis**.
 
-Eu nao vi nenhum indicio de segredo real, chave privada ou dataset indevidamente versionado que bloqueie a publicacao por seguranca imediata. A base tecnica tambem esta em melhor estado apos a auditoria cientifica: filtros `pedestrian_only` foram removidos e a rastreabilidade dos problemas historicos foi documentada.
+Eu nao vi nenhum indicio de segredo real, chave privada ou dataset indevidamente versionado que bloqueie a publicacao por seguranca imediata. A base tecnica tambem esta em melhor estado apos a auditoria cientifica: filtros por classe foram removidos e a rastreabilidade dos problemas historicos foi documentada.
 
-Mesmo assim, eu aguardaria as pequenas correcoes manuais: adicionar `LICENSE`, fechar PRs obsoletos que contradizem o estado atual e confirmar conscientemente a exposicao do e-mail pessoal no historico. Essas pendencias sao pequenas, mas visiveis para banca e leitores externos.
+Ainda assim, eu fecharia os PRs obsoletos que contradizem o estado atual e confirmaria conscientemente a exposicao do e-mail pessoal no historico antes de anunciar o repositorio a banca. Essas pendencias sao pequenas, mas visiveis para banca e leitores externos.
 
 Depois dessas acoes, meu parecer passa a ser favoravel a publicacao, desde que datasets, logs gigantes, zips e checkpoints locais continuem fora do Git comum ou sejam publicados separadamente com justificativa cientifica.

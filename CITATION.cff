@@ -3,13 +3,10 @@ message: "If you use this repository, cite the associated master's dissertation 
 title: "Redes Neurais Profundas Para Deteccao de Pessoas em Imagens Aereas Geradas Por Drones: Um enfoque comparativo"
 type: software
 authors:
-<<<<<<< HEAD
-  - name: "Luiz Gustavo"
+  - family-names: "Verissimo"
+    given-names: "Luiz Gustavo Santos"
+    affiliation: "Universidade Federal de Goias (UFG), Instituto de Informatica, Programa de Pos-Graduacao em Ciencia da Computacao"
 repository-code: "https://github.com/luizgustavosv/experimentos-dissertacao"
-=======
-  - name: "Luiz Gustavo Santos Veríssimo"
-repository-code: "https://github.com/REPLACE-WITH-REPOSITORY-URL"
->>>>>>> 3a917063d3e115193fb4f80679f379087b8c8d0e
 abstract: "Codigo experimental para comparacao de YOLOv12n, SSD300, Faster R-CNN e RetinaNet em datasets de imagens aereas geradas por drones."
 keywords:
   - object detection
@@ -19,3 +16,4 @@ keywords:
   - Torchvision
   - Ultralytics
 license: "MIT"
+year: 2026
