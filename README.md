@@ -67,3 +67,8 @@ Os testes nao executam treinamento completo. Eles cobrem parsing de datasets, pr
 ## Limitacoes conhecidas
 
 Leia `KNOWN_ISSUES.md` antes de interpretar resultados. Em particular, ha registro de defeito historico no pipeline SSD300/VisDrone: o leitor usado no treinamento historico reteve apenas a categoria `pedestrian`. O codigo atual foi corrigido para comportamento multiclasse, mas resultados historicos nao devem ser reinterpretados como se tivessem sido gerados com o leitor corrigido.
+
+Luiz Gustavo Santos Veríssimo
+Programa de Pós-Graduação em Ciência da Computação
+Instituto de Informática
+Universidade Federal de Goiás (UFG)
