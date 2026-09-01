@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from app.datasets.exporters import export_coco, export_voc, export_yolo
 from app.datasets.ir import DatasetIR

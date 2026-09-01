@@ -4,7 +4,7 @@ import torchvision
 from torchvision.models import ResNet50_Weights, VGG16_Weights
 from torchvision.models.detection import SSD300_VGG16_Weights
 
-from app.avaliacao.config import DEFAULT_MAX_DETECTIONS
+from app.avaliacao.config import DEFAULT_MAX_DETECTIONS, FASTER_RCNN_EXPORT_MAX_DETECTIONS
 
 
 def build_faster_rcnn(num_classes: int):
@@ -15,11 +15,11 @@ def build_faster_rcnn(num_classes: int):
             weights=None,
             weights_backbone=backbone_weights,
             num_classes=num_classes,
-            box_detections_per_img=DEFAULT_MAX_DETECTIONS,
+            box_detections_per_img=FASTER_RCNN_EXPORT_MAX_DETECTIONS,
         )
     except TypeError:
         model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights=None, num_classes=num_classes)
-        model.roi_heads.detections_per_img = DEFAULT_MAX_DETECTIONS
+        model.roi_heads.detections_per_img = FASTER_RCNN_EXPORT_MAX_DETECTIONS
         return model
 
 

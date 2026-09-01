@@ -222,7 +222,7 @@ def _parse_csv_annotations(csv_path: Path, known_keys: Set[str]) -> Tuple[Annota
 
 def _map_class(src_name: str, class_map: Optional[Dict[str, str]]) -> Optional[str]:
     if class_map is None:
-        return "human"
+        return src_name
     if "*" in class_map:
         default_value = class_map["*"]
     else:
@@ -472,7 +472,7 @@ def normalize_to_voc(
     splits_state[split] = [s.canonical_id for s in processed]
     state["splits"] = splits_state
     existing_classes = set(state.get("classes", []))
-    state["classes"] = sorted(existing_classes.union(seen_classes or {"human"}))
+    state["classes"] = sorted(existing_classes.union(seen_classes))
     _save_state(out_root, state)
 
     build_imagesets_main(out_root, splits_state)

@@ -298,21 +298,22 @@ def evaluate_torchvision_ssd_voc(
         },
     )
     metrics = result.get("metrics", {})
+    diagnostic_metrics = metrics.get("diagnostic", {}) if isinstance(metrics.get("diagnostic"), dict) else metrics
     json_path = output_dir / "metrics.json"
     csv_path = output_dir / "metrics.csv"
 
     json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    csv_fields = ["created_at", "split", "map50_95", "map50", "ar100", "precision_micro", "recall_micro", "conf_threshold", "iou_threshold", "weights_path", "num_images", "device"]
+    csv_fields = ["created_at", "split", "map50_95", "map50", "ar_maxdet_5000", "precision_micro", "recall_micro", "conf_threshold", "iou_threshold", "weights_path", "num_images", "device"]
     with csv_path.open("w", newline="", encoding="utf-8") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=csv_fields)
         writer.writeheader()
         row = {
             "created_at": result.get("created_at"),
             "split": result.get("split"),
-            "map50_95": metrics.get("map50_95"),
-            "map50": metrics.get("map50"),
-            "ar100": metrics.get("ar100"),
+            "map50_95": diagnostic_metrics.get("map50_95"),
+            "map50": diagnostic_metrics.get("map50"),
+            "ar_maxdet_5000": diagnostic_metrics.get("ar_maxdet_5000"),
             "precision_micro": metrics.get("precision_micro"),
             "recall_micro": metrics.get("recall_micro"),
             "conf_threshold": result.get("parameters", {}).get("conf_threshold"),
@@ -325,7 +326,7 @@ def evaluate_torchvision_ssd_voc(
 
     _emit(f"[EVAL] Resultado salvo em {output_dir}")
     _emit(
-        f"[EVAL] mAP@0.5:0.95={metrics.get('map50_95')} | mAP@0.5={metrics.get('map50')} | Precision={metrics.get('precision_micro')} | Recall={metrics.get('recall_micro')}"
+        f"[EVAL] mAP@0.5:0.95={diagnostic_metrics.get('map50_95')} | mAP@0.5={diagnostic_metrics.get('map50')} | Precision={metrics.get('precision_micro')} | Recall={metrics.get('recall_micro')}"
     )
 
     return result

@@ -7,12 +7,14 @@ from pathlib import Path
 from queue import Queue
 from threading import Thread
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import Optional, Any
 
 import torch
 
 from app.controller import ExperimentController, OperationResult
+from app.detectors.config import TrainConfig
 from app.logging_utils import PromptLogForwarder, capture_prompt_output
+from app.weights_metadata import format_weights_metadata
 
 
 def get_weights_filetypes(algo: str) -> list[tuple[str, str]]:
@@ -35,10 +37,10 @@ class DetectorApp(tk.Tk):
         self.controller = ExperimentController()
         self.cuda_available = torch.cuda.is_available()
         self.algorithm_actions: dict[str, list[str]] = {
-            "YOLO": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Avaliar YOLO", "Normalizar dataset"],
-            "SSD": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Avaliar SSD", "Normalizar dataset"],
-            "Faster R-CNN": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Validar", "Normalizar dataset"],
-            "RetinaNet": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Validar", "Normalizar dataset"],
+            "YOLO": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Avaliar YOLO", "Ler metadados dos pesos", "Normalizar dataset"],
+            "SSD": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Avaliar SSD", "Ler metadados dos pesos", "Normalizar dataset"],
+            "Faster R-CNN": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Validar", "Ler metadados dos pesos", "Normalizar dataset"],
+            "RetinaNet": ["Treinar", "Inferir", "Inferência Rápida / Benchmark", "Validar", "Ler metadados dos pesos", "Normalizar dataset"],
         }
         self.algorithm_var = tk.StringVar(value="YOLO")
         self.action_var = tk.StringVar(value=self.algorithm_actions["YOLO"][0])
@@ -59,12 +61,12 @@ class DetectorApp(tk.Tk):
             "eval_out": tk.StringVar(),
             "yolo_eval_dataset": tk.StringVar(),
             "yolo_eval_weights": tk.StringVar(),
+            "metadata_weights": tk.StringVar(),
             "yolo_eval_out": tk.StringVar(),
             "val_annotations": tk.StringVar(),
             "validation_out": tk.StringVar(),
         }
         self.epochs_var = tk.IntVar(value=10)
-        self.pedestrian_only_var = tk.BooleanVar(value=False)
         self.eval_split_var = tk.StringVar(value="val")
         self.conf_threshold_var = tk.DoubleVar(value=0.25)
         self.iou_threshold_var = tk.DoubleVar(value=0.5)
@@ -84,6 +86,48 @@ class DetectorApp(tk.Tk):
         self.early_min_delta_var = tk.DoubleVar(value=0.0)
         self.early_min_epochs_var = tk.IntVar(value=10)
         self.early_ema_alpha_var = tk.DoubleVar(value=0.2)
+        default_config = TrainConfig()
+        self.train_hparam_vars: dict[str, tk.Variable] = {
+            "batch_size": tk.IntVar(value=default_config.batch_size),
+            "lr": tk.DoubleVar(value=default_config.lr),
+            "momentum": tk.DoubleVar(value=default_config.momentum),
+            "device": tk.StringVar(value=default_config.device or "auto"),
+            "num_workers": tk.IntVar(value=default_config.num_workers),
+            "imgsz": tk.IntVar(value=default_config.imgsz),
+            "seed": tk.IntVar(value=default_config.seed),
+            "weight_decay": tk.DoubleVar(value=default_config.weight_decay),
+            "lr_step_size": tk.IntVar(value=default_config.lr_step_size),
+            "lr_gamma": tk.DoubleVar(value=default_config.lr_gamma),
+            "verbose": tk.BooleanVar(value=default_config.verbose),
+            "log_every": tk.IntVar(value=default_config.log_every),
+            "debug_dataloader": tk.BooleanVar(value=default_config.debug_dataloader),
+            "log_dir": tk.StringVar(value=str(default_config.log_dir)),
+            "yolo_save_dir": tk.StringVar(value=""),
+            "log_every_seconds": tk.IntVar(value=default_config.log_every_seconds),
+            "pin_memory": tk.BooleanVar(value=default_config.pin_memory),
+            "persistent_workers": tk.BooleanVar(value=default_config.persistent_workers),
+            "prefetch_factor": tk.IntVar(value=default_config.prefetch_factor or 0),
+            "drop_last": tk.BooleanVar(value=default_config.drop_last),
+            "smoke_test_val_loss": tk.BooleanVar(value=default_config.smoke_test_val_loss),
+            "smoke_test_samples": tk.IntVar(value=default_config.smoke_test_samples),
+            "audit_datasets": tk.BooleanVar(value=default_config.audit_datasets),
+            "dataset_num_classes": tk.IntVar(value=0),
+            "num_classes": tk.IntVar(value=0),
+            "val_mode": tk.StringVar(value=default_config.val_mode),
+            "val_ratio": tk.DoubleVar(value=default_config.val_ratio),
+            "early_stop_enabled": self.early_stop_enabled_var,
+            "early_stop_patience": self.early_patience_var,
+            "early_stop_min_delta": self.early_min_delta_var,
+            "early_stop_min_epochs": self.early_min_epochs_var,
+            "early_stop_ema_alpha": self.early_ema_alpha_var,
+            "legacy_retinanet_compat": tk.BooleanVar(value=default_config.legacy_retinanet_compat),
+            "save_final": tk.BooleanVar(value=default_config.save_final),
+            "save_best": tk.BooleanVar(value=default_config.save_best),
+            "save_every": tk.IntVar(value=default_config.save_every),
+            "keep_last_k": tk.IntVar(value=default_config.keep_last_k),
+            "monitor_metric": tk.StringVar(value=default_config.monitor_metric),
+            "mode": tk.StringVar(value=default_config.mode),
+        }
         self.run_button_text = tk.StringVar(value="Executar")
         self._variable_traces: list[tuple[tk.Variable, str]] = []
 
@@ -168,8 +212,23 @@ class DetectorApp(tk.Tk):
         )
         self.btn_execute.grid(row=0, column=1, sticky="e", padx=(12, 0))
 
-        self.dynamic_frame = tk.LabelFrame(container, text="Parâmetros", bg="#12233d", fg="white")
-        self.dynamic_frame.pack(fill="x", pady=5)
+        self.dynamic_outer = tk.LabelFrame(container, text="Parâmetros", bg="#12233d", fg="white")
+        self.dynamic_outer.pack(fill="both", pady=5)
+        self.dynamic_canvas = tk.Canvas(self.dynamic_outer, height=320, bg="#12233d", highlightthickness=0)
+        dynamic_scrollbar = ttk.Scrollbar(self.dynamic_outer, orient="vertical", command=self.dynamic_canvas.yview)
+        self.dynamic_canvas.configure(yscrollcommand=dynamic_scrollbar.set)
+        self.dynamic_canvas.pack(side="left", fill="both", expand=True)
+        dynamic_scrollbar.pack(side="right", fill="y")
+        self.dynamic_frame = tk.Frame(self.dynamic_canvas, bg="#12233d")
+        self._dynamic_window_id = self.dynamic_canvas.create_window((0, 0), window=self.dynamic_frame, anchor="nw")
+        self.dynamic_frame.bind(
+            "<Configure>",
+            lambda _event: self.dynamic_canvas.configure(scrollregion=self.dynamic_canvas.bbox("all")),
+        )
+        self.dynamic_canvas.bind(
+            "<Configure>",
+            lambda event: self.dynamic_canvas.itemconfigure(self._dynamic_window_id, width=event.width),
+        )
 
         self._update_action_options()
 
@@ -201,6 +260,7 @@ class DetectorApp(tk.Tk):
                 self._add_path_selector("Pasta do dataset Pascal VOC", "dataset", is_dir=True)
             elif algorithm in {"RetinaNet", "Faster R-CNN"}:
                 self._add_path_selector("Anotações COCO (.json)", "annotations", filetypes=[("COCO JSON", "*.json")])
+                self._add_path_selector("Anotações COCO de validação (.json)", "val_annotations", filetypes=[("COCO JSON", "*.json")])
                 self._add_path_selector(
                     "Pasta de imagens COCO (deve conter train/ e val/)", "images", is_dir=True
                 )
@@ -213,13 +273,13 @@ class DetectorApp(tk.Tk):
             self._add_epoch_selector()
             self._add_max_epoch_selector()
             self._add_early_stopping_controls()
+            self._add_training_hyperparameter_controls()
         elif action in {"Inferir", "Inferência Rápida / Benchmark"}:
             self._add_path_selector("Pesos para inferência", "inference_weights")
             self._add_path_selector("Imagens para inferência", "images", is_dir=True)
             self._add_path_selector("Relatório PDF da inferência", "report", is_file=True, defaultextension=".pdf")
             if algorithm == "SSD":
                 self._add_ssd_infer_threshold_selector()
-            self._add_pedestrian_filter_selector()
         elif action == "Avaliar SSD":
             if algorithm != "SSD":
                 tk.Label(
@@ -269,7 +329,7 @@ class DetectorApp(tk.Tk):
             else:
                 self._add_path_selector("Anotações COCO de treino (.json)", "annotations", filetypes=[("COCO JSON", "*.json")])
                 self._add_path_selector(
-                    "Anotações COCO de validação (.json) [opcional]",
+                    "Anotações COCO de validação (.json)",
                     "val_annotations",
                     filetypes=[("COCO JSON", "*.json")],
                 )
@@ -284,6 +344,12 @@ class DetectorApp(tk.Tk):
                 self._add_val_mode_selector()
                 self._add_conf_threshold_selector(label=f"Limite de confiança ({algorithm})")
                 self._add_iou_threshold_selector(label=f"Limite de IoU ({algorithm})")
+        elif action == "Ler metadados dos pesos":
+            self._add_path_selector(
+                f"Pesos do {algorithm}",
+                "metadata_weights",
+                filetypes=get_weights_filetypes(algorithm),
+            )
         elif action == "Normalizar dataset":
             self._add_dataset_type_selector()
             self._add_path_selector("Dataset bruto", "dataset", is_dir=True)
@@ -544,13 +610,71 @@ class DetectorApp(tk.Tk):
 
         _toggle(self.early_stop_enabled_var.get())
 
-    def _add_pedestrian_filter_selector(self) -> None:
-        frame = tk.Frame(self.dynamic_frame, bg="#12233d")
+    def _add_training_hyperparameter_controls(self) -> None:
+        frame = tk.LabelFrame(self.dynamic_frame, text="Hiperparâmetros de treinamento", bg="#12233d", fg="white")
         frame.pack(fill="x", padx=10, pady=6)
+
+        numeric_fields = [
+            ("batch_size", "Batch size"),
+            ("lr", "Learning rate"),
+            ("momentum", "Momentum"),
+            ("num_workers", "Num workers"),
+            ("imgsz", "Tamanho da imagem"),
+            ("seed", "Seed"),
+            ("weight_decay", "Weight decay"),
+            ("lr_step_size", "LR step size"),
+            ("lr_gamma", "LR gamma"),
+            ("log_every", "Log a cada N batches"),
+            ("log_every_seconds", "Heartbeat em segundos"),
+            ("yolo_save_dir", "Diretório da run YOLO (vazio = padrão)"),
+            ("prefetch_factor", "Prefetch factor (0 = automático/desativado)"),
+            ("smoke_test_samples", "Amostras do smoke test"),
+            ("dataset_num_classes", "Classes do dataset (0 = inferir)"),
+            ("num_classes", "Classes do modelo (0 = inferir)"),
+            ("val_ratio", "Val ratio"),
+            ("save_every", "Salvar checkpoint a cada N épocas"),
+            ("keep_last_k", "Manter últimos K checkpoints"),
+        ]
+        for key, label in numeric_fields:
+            self._add_hparam_entry(frame, label, key)
+
+        self._add_hparam_combo(frame, "Dispositivo de treino", "device", ["auto", "cpu", *self._cuda_device_options()])
+        self._add_hparam_combo(frame, "Modo de validação no treino", "val_mode", ["loss", "metrics", "both"])
+        self._add_hparam_combo(frame, "Métrica monitorada", "monitor_metric", ["val_map", "val_loss", "train_loss"])
+        self._add_hparam_combo(frame, "Modo do monitor", "mode", ["max", "min"])
+        self._add_hparam_entry(frame, "Diretório de logs", "log_dir")
+
+        for key, label in [
+            ("verbose", "Verbose"),
+            ("debug_dataloader", "Debug dataloader"),
+            ("pin_memory", "Pin memory"),
+            ("persistent_workers", "Persistent workers"),
+            ("drop_last", "Drop last batch"),
+            ("smoke_test_val_loss", "Smoke test de val loss"),
+            ("audit_datasets", "Auditar datasets"),
+            ("legacy_retinanet_compat", "Compatibilidade legada RetinaNet"),
+            ("save_final", "Salvar checkpoint final"),
+            ("save_best", "Salvar melhor checkpoint"),
+        ]:
+            self._add_hparam_check(frame, label, key)
+
+    def _add_hparam_entry(self, parent: tk.Widget, label: str, key: str) -> None:
+        row = tk.Frame(parent, bg="#12233d")
+        row.pack(fill="x", padx=10, pady=2)
+        tk.Label(row, text=label, bg="#12233d", fg="white", width=34, anchor="w").pack(side="left")
+        ttk.Entry(row, textvariable=self.train_hparam_vars[key], width=18).pack(side="left")
+
+    def _add_hparam_combo(self, parent: tk.Widget, label: str, key: str, values: list[str]) -> None:
+        row = tk.Frame(parent, bg="#12233d")
+        row.pack(fill="x", padx=10, pady=2)
+        tk.Label(row, text=label, bg="#12233d", fg="white", width=34, anchor="w").pack(side="left")
+        ttk.Combobox(row, textvariable=self.train_hparam_vars[key], values=values, state="readonly", width=18).pack(side="left")
+
+    def _add_hparam_check(self, parent: tk.Widget, label: str, key: str) -> None:
         check = tk.Checkbutton(
-            frame,
-            text="Manter apenas detecções da classe pedestrian (classe 0) em inferência/validação",
-            variable=self.pedestrian_only_var,
+            parent,
+            text=label,
+            variable=self.train_hparam_vars[key],
             onvalue=True,
             offvalue=False,
             bg="#12233d",
@@ -558,11 +682,30 @@ class DetectorApp(tk.Tk):
             selectcolor="#0b172a",
             activebackground="#12233d",
             activeforeground="white",
-            anchor="w",
-            justify="left",
-            wraplength=760,
         )
-        check.pack(anchor="w")
+        check.pack(anchor="w", padx=10, pady=1)
+
+    def _training_config_overrides(self) -> dict[str, Any]:
+        overrides: dict[str, Any] = {}
+        for key, variable in self.train_hparam_vars.items():
+            value = variable.get()
+            if key in {"dataset_num_classes", "num_classes", "prefetch_factor"} and int(value) <= 0:
+                overrides[key] = None
+            elif key == "device" and str(value).strip().lower() == "auto":
+                overrides[key] = None
+            elif key in {"log_dir", "yolo_save_dir"}:
+                if key == "yolo_save_dir" and not str(value).strip():
+                    overrides[key] = None
+                    continue
+                overrides[key] = Path(str(value).strip() or "logs")
+            else:
+                overrides[key] = value
+        return overrides
+
+    def _cuda_device_options(self) -> list[str]:
+        if not self.cuda_available:
+            return []
+        return [str(idx) for idx in range(torch.cuda.device_count())]
 
     def append_log(self, message: str) -> None:
         self.log_widget.insert("end", message + "\n")
@@ -630,6 +773,7 @@ class DetectorApp(tk.Tk):
                 min_delta = float(self.early_min_delta_var.get())
                 min_epochs = int(self.early_min_epochs_var.get())
                 ema_alpha = float(self.early_ema_alpha_var.get())
+                config_overrides = self._training_config_overrides()
 
                 if pretrained and not pretrained.exists():
                     messagebox.showerror("Erro", "O arquivo de pesos pré-treinados não existe.")
@@ -645,9 +789,18 @@ class DetectorApp(tk.Tk):
                     exec_kwargs = {"dataset_path": dataset_arg}
                 elif algorithm_key in {"RetinaNet", "Faster R-CNN"}:
                     annotations = Path(self.path_vars["annotations"].get())
+                    val_annotations_raw = self.path_vars["val_annotations"].get().strip()
+                    if not val_annotations_raw:
+                        raise ValueError("Informe as anotações COCO de validação (.json) para o treinamento.")
+                    val_annotations = Path(val_annotations_raw)
                     images = Path(self.path_vars["images"].get())
                     prompt_dataset = annotations
-                    exec_kwargs = {"dataset_path": annotations, "images_dir": images, "annotations_path": annotations}
+                    exec_kwargs = {
+                        "dataset_path": annotations,
+                        "images_dir": images,
+                        "annotations_path": annotations,
+                        "val_annotations_path": val_annotations,
+                    }
                 else:
                     raise ValueError(f"Algoritmo desconhecido para treinamento: {algorithm_key}")
 
@@ -662,7 +815,14 @@ class DetectorApp(tk.Tk):
                             "epocas": epochs,
                             **({"max_epochs": max_epochs} if max_epochs else {}),
                             **({"early_stop": "on"} if early_stop_enabled else {}),
+                            "batch_size": config_overrides["batch_size"],
+                            "lr": config_overrides["lr"],
+                            "momentum": config_overrides["momentum"],
+                            "device": config_overrides["device"] or "auto",
+                            "imgsz": config_overrides["imgsz"],
+                            "seed": config_overrides["seed"],
                             **({"imagens": exec_kwargs.get("images_dir")} if exec_kwargs.get("images_dir") else {}),
+                            **({"val_annotations": exec_kwargs.get("val_annotations_path")} if exec_kwargs.get("val_annotations_path") else {}),
                         },
                     )
                 )
@@ -681,6 +841,7 @@ class DetectorApp(tk.Tk):
                         early_stop_min_delta=min_delta,
                         early_stop_min_epochs=min_epochs,
                         early_stop_ema_alpha=ema_alpha,
+                        config_overrides=config_overrides,
                     )
 
             elif action in {"Inferir", "Inferência Rápida / Benchmark"}:
@@ -688,7 +849,6 @@ class DetectorApp(tk.Tk):
                 weights_raw = self.path_vars["inference_weights"].get().strip()
                 weights = Path(weights_raw) if weights_raw else None
                 report = Path(self.path_vars["report"].get())
-                pedestrian_only = bool(self.pedestrian_only_var.get())
                 benchmark_mode = action == "Inferência Rápida / Benchmark"
                 ssd_score_threshold = (
                     float(self.ssd_infer_threshold_var.get()) if algorithm_key == "SSD" else None
@@ -702,7 +862,6 @@ class DetectorApp(tk.Tk):
                             "pesos": weights or "padrão",
                             "relatorio": report,
                             "modo": "benchmark" if benchmark_mode else "normal",
-                            "apenas_pedestrian": pedestrian_only,
                             **({"ssd_score_threshold": ssd_score_threshold} if algorithm_key == "SSD" else {}),
                         },
                     )
@@ -714,8 +873,7 @@ class DetectorApp(tk.Tk):
                         images,
                         weights,
                         report,
-                        pedestrian_only,
-                        prompt_logger,
+                        logger=prompt_logger,
                         ssd_score_threshold=ssd_score_threshold,
                         benchmark_mode=benchmark_mode,
                     )
@@ -803,7 +961,9 @@ class DetectorApp(tk.Tk):
                 train_annotations = Path(self.path_vars["annotations"].get())
                 images_dir = Path(self.path_vars["images"].get())
                 val_annotations_raw = self.path_vars["val_annotations"].get().strip()
-                val_annotations = Path(val_annotations_raw) if val_annotations_raw else None
+                if not val_annotations_raw:
+                    raise ValueError("Informe as anotações COCO de validação (.json).")
+                val_annotations = Path(val_annotations_raw)
                 weights = Path(self.path_vars["validation_weights"].get())
                 output_dir_raw = self.path_vars["validation_out"].get().strip()
                 output_dir = Path(output_dir_raw) if output_dir_raw else None
@@ -817,7 +977,7 @@ class DetectorApp(tk.Tk):
                         algorithm_key,
                         {
                             "treino": train_annotations,
-                            "val": val_annotations or "auto",
+                            "val": val_annotations,
                             "imagens": images_dir,
                             "pesos": weights,
                             "saida": output_dir or "logs",
@@ -858,6 +1018,26 @@ class DetectorApp(tk.Tk):
                         iou_threshold=iou_threshold,
                         logger=prompt_logger,
                         log_cb=lambda msg: self._emit_gui(msg, stdout=False),
+                        )
+
+            elif action == "Ler metadados dos pesos":
+                weights = Path(self.path_vars["metadata_weights"].get())
+                if not weights.is_file():
+                    raise FileNotFoundError(f"Arquivo de pesos não encontrado: {weights}")
+
+                prompt_logger(
+                    self._build_prompt_command(
+                        "ler_metadados_pesos",
+                        algorithm_key,
+                        {"pesos": weights},
+                    )
+                )
+
+                def run_action() -> OperationResult:
+                    return self.controller.execute_read_weights_metadata(
+                        algorithm_key,
+                        weights,
+                        logger=prompt_logger,
                     )
 
             elif action == "Normalizar dataset":
@@ -942,18 +1122,23 @@ class DetectorApp(tk.Tk):
         self._worker_thread.start()
 
     def _on_action_complete(self, result: OperationResult) -> None:
+        if result.metadata:
+            formatted_metadata = format_weights_metadata(result.metadata)
+            self.append_log(formatted_metadata)
+            self._show_metadata_window(formatted_metadata)
         if result.results_path and result.results_path.exists():
             try:
                 payload = json.loads(result.results_path.read_text(encoding="utf-8"))
                 params = payload.get("parameters", {})
                 metrics = payload.get("metrics", {})
+                diagnostic_metrics = metrics.get("diagnostic", {}) if isinstance(metrics.get("diagnostic"), dict) else metrics
                 self.append_log(
                     "[RESULTADO][UNIFICADO] "
                     f"arquivo={result.results_path} imagens={payload.get('num_images')} "
                     f"detecções={payload.get('num_detections')} "
                     f"conf={params.get('conf_threshold')} iou={params.get('iou_association_threshold')} "
                     f"max_det={params.get('max_detections_per_image')} device={params.get('device')} "
-                    f"map50={metrics.get('map50')} map50_95={metrics.get('map50_95')}"
+                    f"map50_diag={diagnostic_metrics.get('map50')} map50_95_diag={diagnostic_metrics.get('map50_95')}"
                 )
             except Exception as exc:
                 self.append_log(f"[RESULTADO][UNIFICADO] Não foi possível ler {result.results_path}: {exc}")
@@ -970,6 +1155,29 @@ class DetectorApp(tk.Tk):
         self.append_log(result.message)
         self._set_running(False)
         messagebox.showinfo("Concluído", result.message)
+
+    def _show_metadata_window(self, content: str) -> None:
+        window = tk.Toplevel(self)
+        window.title("Metadados dos pesos")
+        window.geometry("900x620")
+        window.configure(bg="#0b172a")
+
+        frame = tk.Frame(window, bg="#0b172a")
+        frame.pack(fill="both", expand=True, padx=12, pady=12)
+
+        text = tk.Text(frame, wrap="none", bg="#0f1b2d", fg="#c7d5ed")
+        y_scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        x_scroll = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
+        text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        text.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        text.insert("1.0", content)
+        text.configure(state="disabled")
 
     def _on_action_error(self, exc: Exception) -> None:
         self._set_running(False)

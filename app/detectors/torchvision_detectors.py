@@ -9,7 +9,7 @@ import torch
 from torchvision import transforms
 from torchvision.utils import draw_bounding_boxes
 
-from app.avaliacao.config import DEFAULT_MAX_DETECTIONS
+from app.avaliacao.config import DEFAULT_MAX_DETECTIONS, FASTER_RCNN_EXPORT_MAX_DETECTIONS
 from app.detectors.base import DetectionAlgorithm, DetectorContext, Logger
 from app.detectors.config import TrainConfig
 from app.detectors.torchvision_train import train_torchvision_detector
@@ -29,7 +29,6 @@ from app.metrics import InferencePerformance
 from app.reporting.reports import ReportBuilder
 
 SSD_DEFAULT_SCORE_THRESHOLD = 0.05
-SSD_PEDESTRIAN_LABEL_ID = 1
 
 
 class TorchvisionDetector(DetectionAlgorithm):
@@ -87,41 +86,9 @@ class TorchvisionDetector(DetectionAlgorithm):
             train_ann,
             val_ann,
             output_dir,
-            TrainConfig(
-                epochs=epochs or self.config.epochs,
-                batch_size=self.config.batch_size,
-                lr=self.config.lr,
-                device=self.config.device,
-                num_workers=self.config.num_workers,
-                seed=self.config.seed,
-                weight_decay=self.config.weight_decay,
-                lr_step_size=self.config.lr_step_size,
-                lr_gamma=self.config.lr_gamma,
-                verbose=self.config.verbose,
-                log_every=self.config.log_every,
-                debug_dataloader=self.config.debug_dataloader,
-                log_dir=self.config.log_dir,
-                pin_memory=self.config.pin_memory,
-                persistent_workers=self.config.persistent_workers,
-                prefetch_factor=self.config.prefetch_factor,
-                drop_last=self.config.drop_last,
-                val_mode=self.config.val_mode,
-                dataset_num_classes=dataset_num_classes,
-                num_classes=model_num_classes,
-                max_epochs=self.config.max_epochs,
-                early_stop_enabled=self.config.early_stop_enabled,
-                early_stop_patience=self.config.early_stop_patience,
-                early_stop_min_delta=self.config.early_stop_min_delta,
-                early_stop_min_epochs=self.config.early_stop_min_epochs,
-                early_stop_ema_alpha=self.config.early_stop_ema_alpha,
-                save_final=self.config.save_final,
-                save_best=self.config.save_best,
-                save_every=self.config.save_every,
-                keep_last_k=self.config.keep_last_k,
-                monitor_metric=self.config.monitor_metric,
-                mode=self.config.mode,
-            ),
+            self._training_config(epochs, dataset_num_classes=dataset_num_classes, model_num_classes=model_num_classes),
             logger=logger,
+            pretrained_weights_source=pretrained_weights,
         )
 
         ensure_weights_size(output_dir)
@@ -132,7 +99,6 @@ class TorchvisionDetector(DetectionAlgorithm):
         images_dir: Path,
         weights_path: Optional[Path],
         report_out: Path,
-        pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
         ssd_score_threshold: Optional[float] = None,
         benchmark_mode: bool = False,
@@ -153,14 +119,8 @@ class TorchvisionDetector(DetectionAlgorithm):
             score_threshold = float(ssd_score_threshold)
         elif self.context.architecture != "SSD":
             score_threshold = 0.5
-        pedestrian_label = (
-            self._resolve_pedestrian_label_id(class_names, logger=logger) if self.context.architecture == "SSD" else 0
-        )
         if logger and self.context.architecture == "SSD":
-            logger(
-                f"[SSD][INFER] score_threshold={score_threshold:.4f} pedestrian_only={pedestrian_only} "
-                f"pedestrian_label_id={pedestrian_label}"
-            )
+            logger(f"[SSD][INFER] score_threshold={score_threshold:.4f}")
 
         save_dir: Optional[Path] = None
         if not benchmark_mode:
@@ -184,7 +144,6 @@ class TorchvisionDetector(DetectionAlgorithm):
             filtered_output, diag = filter_torchvision_predictions(
                 output,
                 score_threshold=score_threshold,
-                target_label=pedestrian_label if pedestrian_only else None,
             )
             boxes = filtered_output["boxes"]
             scores = filtered_output["scores"]
@@ -213,7 +172,7 @@ class TorchvisionDetector(DetectionAlgorithm):
                 else:
                     logger(
                         f"[INFER] {image_path.name}: {diag['final_count']} detecções "
-                        f"(raw={diag['raw_count']}, score_threshold={score_threshold}, pedestrian_only={pedestrian_only})"
+                        f"(raw={diag['raw_count']}, score_threshold={score_threshold})"
                     )
 
         self._cuda_sync(device)
@@ -274,7 +233,6 @@ class TorchvisionDetector(DetectionAlgorithm):
         weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
-        pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
     ):
         raise NotImplementedError("Validação não implementada neste escopo de treino.")
@@ -376,24 +334,7 @@ class TorchvisionDetector(DetectionAlgorithm):
                     return ["background", *class_names]
                 if len(class_names) == num_classes:
                     return class_names
-        return ["background", "human"] if num_classes == 2 else [str(idx) for idx in range(num_classes)]
-
-    @staticmethod
-    def _resolve_pedestrian_label_id(class_names: Sequence[str], logger: Optional[Logger] = None) -> int:
-        if len(class_names) > SSD_PEDESTRIAN_LABEL_ID:
-            if logger:
-                logger(
-                    f"[SSD][INFER] pedestrian_label_id fixado em {SSD_PEDESTRIAN_LABEL_ID} "
-                    "(convenção SSD/VOC com background=0)."
-                )
-            return SSD_PEDESTRIAN_LABEL_ID
-        fallback = 0
-        if logger:
-            logger(
-                "[SSD][INFER][WARN] checkpoint sem classe foreground suficiente; "
-                f"usando fallback pedestrian_label_id={fallback}."
-            )
-        return fallback
+        return ["background", *[f"class_{idx}" for idx in range(1, num_classes)]]
 
     def _load_faster_rcnn_for_inference(
         self, weights_path: Optional[Path], device_str: str, logger: Optional[Logger]
@@ -425,7 +366,7 @@ class TorchvisionDetector(DetectionAlgorithm):
                     logger(f"[INFER] Aviso: pesos inesperados ignorados: {unexpected}")
             class_names = [str(idx) for idx in range(num_classes)]
             weights_label = weights_path
-        model.roi_heads.detections_per_img = DEFAULT_MAX_DETECTIONS
+        model.roi_heads.detections_per_img = FASTER_RCNN_EXPORT_MAX_DETECTIONS
         model.to(device_str)
         model.eval()
         return model, class_names, weights_label
@@ -503,7 +444,16 @@ class TorchvisionDetector(DetectionAlgorithm):
         name = class_names[idx] if idx < len(class_names) else str(idx)
         return f"{name}: {score:.2f}"
 
+    def _training_config(self, epochs: int, *, dataset_num_classes: int, model_num_classes: int) -> TrainConfig:
+        config = TrainConfig(**vars(self.config))
+        config.epochs = epochs or self.config.epochs
+        config.dataset_num_classes = dataset_num_classes
+        config.num_classes = model_num_classes
+        return config
+
     @staticmethod
     def _list_images(root: Path) -> List[Path]:
         extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
         return sorted([p for p in root.iterdir() if p.suffix.lower() in extensions and p.is_file()])
+
+

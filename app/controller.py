@@ -3,13 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from app.detectors import load_detectors
 from app.detectors.base import DetectionAlgorithm, Logger
 from app.detectors.torchvision_eval import evaluate_torchvision_ssd_voc
 from app.detectors.yolo_eval import evaluate_yolo
 from app.metrics import InferencePerformance, Metrics
+from app.weights_metadata import format_weights_metadata, read_weights_metadata
 
 
 @dataclass
@@ -18,6 +19,7 @@ class OperationResult:
     inference_performance: Optional[InferencePerformance] = None
     message: str = ""
     results_path: Optional[Path] = None
+    metadata: Optional[dict] = None
 
 
 class ExperimentController:
@@ -34,12 +36,14 @@ class ExperimentController:
         logger: Optional[Logger] = None,
         images_dir: Optional[Path] = None,
         annotations_path: Optional[Path] = None,
+        val_annotations_path: Optional[Path] = None,
         max_epochs: Optional[int] = None,
         early_stop_enabled: bool = False,
         early_stop_patience: int = 10,
         early_stop_min_delta: float = 0.0,
         early_stop_min_epochs: int = 10,
         early_stop_ema_alpha: float = 0.2,
+        config_overrides: Optional[dict[str, Any]] = None,
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
         metrics: Optional[Metrics]
@@ -51,6 +55,10 @@ class ExperimentController:
             detector.config.early_stop_min_delta = early_stop_min_delta
             detector.config.early_stop_min_epochs = early_stop_min_epochs
             detector.config.early_stop_ema_alpha = early_stop_ema_alpha
+            for key, value in (config_overrides or {}).items():
+                if not hasattr(detector.config, key):
+                    raise ValueError(f"HiperparÃ¢metro desconhecido: {key}")
+                setattr(detector.config, key, value)
 
         if algorithm_key == "YOLO":
             dataset_yaml = dataset_path.expanduser().resolve()
@@ -67,7 +75,9 @@ class ExperimentController:
         elif algorithm_key in {"RetinaNet", "Faster R-CNN"}:
             coco_ann = self._validate_coco_annotation_path(annotations_path or dataset_path)
             images_root = self._validate_coco_images_root(images_dir)
-            val_ann = self._resolve_coco_val_annotation(coco_ann, images_root)
+            if val_annotations_path is None:
+                raise ValueError("AnotaÃ§Ãµes COCO de validaÃ§Ã£o sÃ£o obrigatÃ³rias para treinamento com validaÃ§Ã£o.")
+            val_ann = self._validate_coco_annotation_path(val_annotations_path)
             dataset_root = images_root.parent if images_root.name.lower() == "images" else images_root
             metrics = detector.train(
                 dataset_root,
@@ -90,7 +100,6 @@ class ExperimentController:
         images_dir: Path,
         weights_path: Optional[Path],
         report_out: Path,
-        pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
         ssd_score_threshold: Optional[float] = None,
         benchmark_mode: bool = False,
@@ -101,7 +110,6 @@ class ExperimentController:
                 images_dir,
                 weights_path,
                 report_out,
-                pedestrian_only=pedestrian_only,
                 logger=logger,
                 ssd_score_threshold=ssd_score_threshold,
                 benchmark_mode=benchmark_mode,
@@ -111,7 +119,6 @@ class ExperimentController:
                 images_dir,
                 weights_path,
                 report_out,
-                pedestrian_only=pedestrian_only,
                 logger=logger,
                 benchmark_mode=benchmark_mode,
             )
@@ -124,14 +131,13 @@ class ExperimentController:
         weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
-        pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
     ) -> OperationResult:
         detector = self._get_detector(algorithm_key)
         dataset_dir = dataset_dir.expanduser()
         dataset_yaml_path = (dataset_dir / "dataset.yaml").resolve()
         metrics = detector.validate(
-            dataset_yaml_path, weights_path, report_out, plots_dir, pedestrian_only=pedestrian_only, logger=logger
+            dataset_yaml_path, weights_path, report_out, plots_dir, logger=logger
         )
         return OperationResult(metrics=metrics, message="Validação concluída.")
 
@@ -146,6 +152,22 @@ class ExperimentController:
         detector = self._get_detector(algorithm_key)
         detector.normalize_dataset(dataset_type, dataset_dir, normalized_dir, logger)
         return OperationResult(metrics=None, message="Normalização concluída.")
+
+    def execute_read_weights_metadata(
+        self,
+        algorithm_key: str,
+        weights_path: Path,
+        logger: Optional[Logger] = None,
+    ) -> OperationResult:
+        metadata = read_weights_metadata(weights_path, algorithm_key)
+        formatted = format_weights_metadata(metadata)
+        if logger:
+            logger(formatted)
+        epoch = metadata.get("ultima_epoca")
+        accumulated_epoch = metadata.get("epoca_acumulada")
+        timestamp = metadata.get("timestamp")
+        message = f"Metadados lidos. Época acumulada={accumulated_epoch}; última época={epoch}; timestamp={timestamp}."
+        return OperationResult(message=message, metadata=metadata)
 
     def execute_eval_ssd(
         self,
@@ -179,15 +201,16 @@ class ExperimentController:
         )
 
         result_metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+        diagnostic_metrics = result_metrics.get("diagnostic", {}) if isinstance(result_metrics.get("diagnostic"), dict) else result_metrics
         metrics = Metrics(
             precision=float(result_metrics.get("precision_micro", 0.0) or 0.0),
             recall=float(result_metrics.get("recall_micro", 0.0) or 0.0),
-            map50=float(result_metrics.get("map50", 0.0) or 0.0),
-            map50_95=float(result_metrics.get("map50_95", 0.0) or 0.0),
+            map50=float(diagnostic_metrics.get("map50", 0.0) or 0.0),
+            map50_95=float(diagnostic_metrics.get("map50_95", 0.0) or 0.0),
             device=result.get("device"),
             weights_path=weights_path,
             map_computed=True,
-            extra={"ar100": result_metrics.get("ar100")},
+            extra={"ar_maxdet_5000": diagnostic_metrics.get("ar_maxdet_5000")},
         )
 
         output_dir = Path(out_dir) if out_dir else Path(weights_path).expanduser().resolve().parent / "eval"
@@ -257,7 +280,9 @@ class ExperimentController:
 
         coco_ann = self._validate_coco_annotation_path(train_annotations)
         images_root = self._validate_coco_images_root(images_dir)
-        val_ann = self._validate_coco_annotation_path(val_annotations) if val_annotations else self._resolve_coco_val_annotation(coco_ann, images_root)
+        if val_annotations is None:
+            raise ValueError("AnotaÃ§Ãµes COCO de validaÃ§Ã£o sÃ£o obrigatÃ³rias para validaÃ§Ã£o pÃ³s-treinamento.")
+        val_ann = self._validate_coco_annotation_path(val_annotations)
         dataset_root = images_root.parent if images_root.name.lower() == "images" else images_root
 
         detector = self._get_detector(algorithm_key)
@@ -301,9 +326,9 @@ class ExperimentController:
 
         coco_ann = self._validate_coco_annotation_path(train_annotations)
         images_root = self._validate_coco_images_root(images_dir)
-        val_ann = self._validate_coco_annotation_path(val_annotations) if val_annotations else self._resolve_coco_val_annotation(
-            coco_ann, images_root
-        )
+        if val_annotations is None:
+            raise ValueError("AnotaÃ§Ãµes COCO de validaÃ§Ã£o sÃ£o obrigatÃ³rias para validaÃ§Ã£o pÃ³s-treinamento.")
+        val_ann = self._validate_coco_annotation_path(val_annotations)
         dataset_root = images_root.parent if images_root.name.lower() == "images" else images_root
 
         detector = self._get_detector(algorithm_key)
@@ -378,19 +403,3 @@ class ExperimentController:
             raise FileNotFoundError("Estrutura COCO incompleta: pastas train/ e val/ são obrigatórias dentro do diretório de imagens.")
         return images_root
 
-    def _resolve_coco_val_annotation(self, train_ann: Path, images_root: Path) -> Path:
-        candidates = []
-        name_lower = train_ann.name.lower()
-        if "train" in name_lower:
-            candidates.append(train_ann.with_name(train_ann.name.replace("train", "val")))
-        candidates.append(train_ann.parent / "instances_val.json")
-        dataset_root = images_root.parent if images_root.name.lower() == "images" else images_root
-        candidates.append(dataset_root / "annotations" / "instances_val.json")
-        candidates.append(dataset_root / "val.json")
-
-        for candidate in candidates:
-            if candidate.exists():
-                return self._validate_coco_annotation_path(candidate)
-        raise FileNotFoundError(
-            "Arquivo de validação COCO não encontrado. Esperado algo como 'instances_val.json' ao lado do JSON de treino."
-        )

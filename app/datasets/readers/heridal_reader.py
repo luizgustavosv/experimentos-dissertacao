@@ -10,15 +10,16 @@ from app.datasets.utils import is_image_file
 from app.detectors.base import Logger
 
 
-def _parse_row(row: Dict[str, str]) -> Tuple[str, int, int, int, int, int, int]:
+def _parse_row(row: Dict[str, str]) -> Tuple[str, str, int, int, int, int, int, int]:
     filename = row["filename"]
+    class_name = (row.get("class") or "human").strip() or "human"
     width = int(row["width"])
     height = int(row["height"])
     xmin = int(row["xmin"])
     ymin = int(row["ymin"])
     xmax = int(row["xmax"])
     ymax = int(row["ymax"])
-    return filename, width, height, xmin, ymin, xmax, ymax
+    return filename, class_name, width, height, xmin, ymin, xmax, ymax
 
 
 def read_heridal(
@@ -35,22 +36,21 @@ def read_heridal(
 
     images: Dict[str, ImageRecord] = {}
     annotations: List[AnnotationRecord] = []
-    discarded: Dict[str, int] = {"non_human_class": 0}
+    discarded: Dict[str, int] = {}
     warnings: List[str] = []
-    human_class = "human"
-    class_id = 0
+    class_to_id: Dict[str, int] = {}
 
     with annotations_path.open("r", encoding="utf-8") as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
-            if row.get("class") != human_class:
-                discarded["non_human_class"] += 1
-                continue
-            filename, width, height, xmin, ymin, xmax, ymax = _parse_row(row)
+            filename, class_name, width, height, xmin, ymin, xmax, ymax = _parse_row(row)
             image_path = train_dir / filename
             if not image_path.exists() or not is_image_file(image_path):
                 warnings.append(f"Imagem ausente ou inválida referenciada no CSV: {filename}")
                 continue
+            if class_name not in class_to_id:
+                class_to_id[class_name] = len(class_to_id)
+            class_id = class_to_id[class_name]
             if filename not in images:
                 image_id = len(images) + 1
                 images[filename] = ImageRecord(
@@ -69,7 +69,7 @@ def read_heridal(
                     id=ann_id,
                     image_id=image_id,
                     class_id=class_id,
-                    class_name=human_class,
+                    class_name=class_name,
                     xmin=xmin,
                     ymin=ymin,
                     xmax=xmax,
@@ -82,5 +82,6 @@ def read_heridal(
     for img in images.values():
         img.split = split_assignments.get(img.filename, "train")
 
-    dataset = DatasetIR(classes=[human_class], images=list(images.values()), annotations=annotations)
+    classes = [name for name, _ in sorted(class_to_id.items(), key=lambda item: item[1])] or ["human"]
+    dataset = DatasetIR(classes=classes, images=list(images.values()), annotations=annotations)
     return dataset, discarded, warnings, True

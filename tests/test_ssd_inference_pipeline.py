@@ -26,24 +26,24 @@ def _detector() -> TorchvisionDetector:
     return TorchvisionDetector(context=context, build_model=lambda _: torch.nn.Identity())
 
 
-def test_filter_torchvision_predictions_applies_score_and_class_filters() -> None:
+def test_filter_torchvision_predictions_applies_score_without_class_filter() -> None:
     output = {
         "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0], [2.0, 2.0, 12.0, 12.0], [3.0, 3.0, 8.0, 8.0]]),
         "scores": torch.tensor([0.02, 0.06, 0.9]),
-        "labels": torch.tensor([2, 1, 1]),
+        "labels": torch.tensor([2, 1, 2]),
     }
 
-    filtered, diag = filter_torchvision_predictions(output, score_threshold=0.05, target_label=1)
+    filtered, diag = filter_torchvision_predictions(output, score_threshold=0.05)
 
     assert filtered["boxes"].shape[0] == 2
-    assert filtered["labels"].tolist() == [1, 1]
+    assert filtered["labels"].tolist() == [1, 2]
     assert diag["raw_count"] == 3
     assert diag["after_score"] == 2
     assert diag["after_class"] == 2
     assert diag["final_count"] == 2
 
 
-def test_controller_forwards_ssd_threshold_only_for_ssd() -> None:
+def test_controller_forwards_ssd_threshold_to_ssd() -> None:
     class SSDDummy:
         def __init__(self) -> None:
             self.received_threshold = None
@@ -87,3 +87,42 @@ def test_controller_forwards_ssd_threshold_only_for_ssd() -> None:
         benchmark_mode=False,
     )
     assert yolo_dummy.received_benchmark_mode is False
+
+
+def test_controller_requires_validation_annotations_for_coco_training(tmp_path: Path) -> None:
+    import pytest
+
+    class DummyDetector:
+        config = types.SimpleNamespace(
+            max_epochs=None,
+            early_stop_enabled=False,
+            early_stop_patience=10,
+            early_stop_min_delta=0.0,
+            early_stop_min_epochs=10,
+            early_stop_ema_alpha=0.2,
+        )
+
+    annotations_dir = tmp_path / "annotations"
+    images_dir = tmp_path / "images"
+    (images_dir / "train").mkdir(parents=True)
+    (images_dir / "val").mkdir(parents=True)
+    annotations_dir.mkdir()
+    train_json = annotations_dir / "instances_train.json"
+    train_json.write_text(
+        '{"images": [], "annotations": [], "categories": [{"id": 1, "name": "class_1"}]}',
+        encoding="utf-8",
+    )
+
+    controller = ExperimentController.__new__(ExperimentController)
+    controller.detectors = {"Faster R-CNN": DummyDetector()}
+
+    with pytest.raises(ValueError, match="valida"):
+        controller.execute_train(
+            "Faster R-CNN",
+            dataset_path=train_json,
+            pretrained_weights=None,
+            output_dir=tmp_path / "weights",
+            epochs=1,
+            images_dir=images_dir,
+            annotations_path=train_json,
+        )

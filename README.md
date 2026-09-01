@@ -1,61 +1,69 @@
-# Laboratório de experimentos — Detecção de pessoas em imagens aéreas
+# Laboratorio de deteccao de objetos em imagens aereas
 
-Aplicação gráfica em Python para conduzir experimentos controlados com os
-arquiteturas YOLO, SSD, Faster R-CNN e RetinaNet. Ela facilita:
+Codigo experimental de apoio a uma dissertacao de Mestrado em Ciencia da Computacao sobre deteccao de pessoas em imagens aereas geradas por drones, com comparacao entre YOLOv12n, SSD300, Faster R-CNN e RetinaNet nos datasets HERIDAL e VisDrone.
 
-- Treinamento com datasets personalizados e salvamento dos pesos.
-- Inferência em lotes de imagens com geração de relatório em PDF.
-- Validação com gráficos de desempenho (precisão, recall, mAP) e relatório em PDF.
-- Normalização de datasets para fluxos de experimento reproduzíveis.
+O repositorio contem uma aplicacao Tkinter para normalizacao de datasets, treinamento, inferencia, avaliacao pos-treinamento, benchmark de inferencia e leitura de metadados de checkpoints. A prioridade do projeto e reprodutibilidade experimental, rastreabilidade e transparencia sobre limitacoes conhecidas.
 
-A implementação usa detectores _stub_ para permitir navegação pela interface e
-registro de artefatos sem depender de downloads pesados. Substitua as chamadas
-pelas implementações reais (por exemplo, `ultralytics.YOLO`, `torchvision.models`
-SSD/Faster R-CNN/RetinaNet) quando quiser treinar de fato.
+## Modelos
 
-## Como executar
+- YOLO: backend Ultralytics.
+- SSD300: `torchvision.models.detection.ssd300_vgg16`.
+- Faster R-CNN: `torchvision.models.detection.fasterrcnn_resnet50_fpn`.
+- RetinaNet: `torchvision.models.detection.retinanet_resnet50_fpn`.
 
-1. Crie um ambiente virtual e instale as dependências:
+## Datasets
 
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
+- HERIDAL: esperado em estrutura com `train/_annotations.csv` ou `train/annotations.csv`, conforme o fluxo usado.
+- VisDrone: esperado em splits `VisDrone2019-DET-train`, `VisDrone2019-DET-val` e, quando aplicavel, `VisDrone2019-DET-test-*`, com subpastas `images/` e `annotations/`.
 
-2. Inicie a interface gráfica:
+Datasets e checkpoints nao devem ser versionados neste repositorio. Consulte as licencas e paginas oficiais de cada dataset antes de redistribuir dados.
 
-   ```bash
-   python -m app.main
-   ```
+## Estrutura
 
-3. Escolha o algoritmo, a ação (Treinar, Inferir, Validar ou Normalizar) e
-   preencha os caminhos solicitados. A aplicação gera relatórios PDF e gráficos
-   simples para registrar os experimentos.
+- `app/gui.py`: interface grafica e coleta de parametros.
+- `app/controller.py`: orquestracao dos pipelines.
+- `app/datasets/`: representacao intermediaria, readers e exporters YOLO/VOC/COCO.
+- `app/detectors/`: modelos, treino, validacao, inferencia e utilitarios.
+- `app/avaliacao/`: metricas COCO, metricas operacionais e figuras.
+- `app/training/`: checkpointing e early stopping.
+- `tests/`: testes rapidos de regressao cientifica e smoke tests.
+- `tools/`: scripts auxiliares de auditoria; podem exigir ajuste de caminhos locais antes de uso.
 
-### Estrutura de código
+## Instalacao
 
-- `app/gui.py`: interface Tkinter e roteamento das ações.
-- `app/controller.py`: orquestra os detectores e resultados.
-- `app/detectors/`: declaracão dos algoritmos e _stubs_.
-- `app/reporting/reports.py`: geração de gráficos e relatórios PDF.
-- `app/metrics.py`: estrutura de métricas usadas na aplicação.
+```bash
+python -m venv .venv
+# Linux/macOS
+source .venv/bin/activate
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
-### Observações sobre modelos reais
+As versoes em `requirements.txt` refletem dependencias conhecidas, mas nem todas as versoes historicas foram recuperadas. Para reproducao estrita, veja `REPRODUCIBILITY.md`.
 
-Os detectores reais podem ser obtidos em repositórios abertos:
+## Execucao
 
-- YOLOv12n: `https://github.com/ultralytics/ultralytics`
-- SSD / Faster R-CNN / RetinaNet: modelos disponíveis em `torchvision` e
-  tutoriais em `https://github.com/pytorch/vision/tree/main/references/detection`
+```bash
+python -m app.main
+```
 
-Substitua os _stubs_ no diretório `app/detectors` quando adicionar os modelos
-reais e ajuste as chamadas de treino/validação conforme o seu pipeline.
+Na GUI, selecione algoritmo, acao e caminhos. Todos os campos do `TrainConfig` sao expostos como hiperparametros de treinamento.
 
-### SSD: formatos de pesos suportados
+## Validacao e metricas
 
-A validação do SSD aceita pesos em dois formatos: `state_dict` puro ou checkpoint
-com metadados (`model_state`/`state_dict`/`model`). Quando disponível, o
-`args.yaml` do run (ou o campo `meta` do checkpoint) define `dataset_num_classes`
-e `model_num_classes` para reconstrução do modelo; caso contrário, o número de
-classes é inferido a partir do próprio `state_dict`.
+As avaliacoes COCO exigem anotacoes de validacao explicitas. O codigo atual evita inferencia automatica silenciosa de `instances_val.json`.
+
+As metricas integradas de AP/mAP/AR usam avaliacao COCO e preservam predicoes de baixa confianca para ranking. Precision/Recall/F1 e matriz de confusao sao calculadas separadamente em um ponto operacional de confianca.
+
+## Testes
+
+```bash
+pytest -q
+```
+
+Os testes nao executam treinamento completo. Eles cobrem parsing de datasets, preservacao multiclasse do VisDrone, convencoes de classes, metricas sinteticas e checkpointing rapido.
+
+## Limitacoes conhecidas
+
+Leia `KNOWN_ISSUES.md` antes de interpretar resultados. Em particular, ha registro de defeito historico no pipeline SSD300/VisDrone: o leitor usado no treinamento historico reteve apenas a categoria `pedestrian`. O codigo atual foi corrigido para comportamento multiclasse, mas resultados historicos nao devem ser reinterpretados como se tivessem sido gerados com o leitor corrigido.

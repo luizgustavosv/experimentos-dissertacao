@@ -11,6 +11,7 @@ import numpy as np
 from app.avaliacao.config import (
     DEFAULT_CONF_THRESHOLD,
     DEFAULT_CURVE_CONF_THRESHOLD,
+    DEFAULT_DIAGNOSTIC_MAX_DETECTIONS,
     DEFAULT_IOU_ASSOCIATION_THRESHOLD,
     DEFAULT_MAX_DETECTIONS,
 )
@@ -37,29 +38,18 @@ REFERENCE_EXPECTATIONS = {
 }
 
 METRIC_KEYS = [
-    "map50",
-    "map50_95",
-    "map75",
-    "map_small",
-    "map_medium",
-    "map_large",
-    "ar1",
-    "ar10",
-    "ar100",
-    "ar_maxdet",
-    "ar_maxdet_5000",
-    "ar_small",
-    "ar_medium",
-    "ar_large",
+    "official",
+    "diagnostic",
     "precision_micro",
     "recall_micro",
     "f1_micro",
     "precision_macro",
     "recall_macro",
     "f1_macro",
-    "per_class",
     "confusion_matrix",
 ]
+
+AP_METRIC_KEYS = ["map50", "map50_95", "map75", "map_small", "map_medium", "map_large"]
 
 
 def expected_validation_images(dataset_name: str | None, annotations_path: Path | None = None) -> int | None:
@@ -306,6 +296,15 @@ def _filter_and_cap_predictions(
     return capped
 
 
+def official_protocol_max_dets(dataset_name: str | None, annotations_path: Path | None = None) -> tuple[list[int], str]:
+    family = _dataset_family(dataset_name, annotations_path)
+    if family == "visdrone":
+        return [1, 10, 100, 500], "VisDrone-DET: AR reportado em maxDets 1, 10, 100 e 500."
+    if family == "heridal":
+        return [1, 10, 100], "HERIDAL sem protocolo de detecÃ§Ã£o publicado; adotado protocolo COCO [1, 10, 100]."
+    return [1, 10, 100], "Dataset sem protocolo especÃ­fico configurado; adotado protocolo COCO [1, 10, 100]."
+
+
 def _weights_policy(weights_path: Path | None) -> str | None:
     if weights_path is None:
         return None
@@ -441,16 +440,14 @@ def _mean_valid(values: np.ndarray) -> float | None:
     return float(np.mean(valid)) if valid.size else None
 
 
-def _coco_stats_from_eval(evaluator: Any, max_detections: int) -> list[float | None]:
+def _coco_stats_from_eval(evaluator: Any, max_detections: int) -> dict[str, Any]:
     precision = evaluator.eval.get("precision")
     recall = evaluator.eval.get("recall")
     if precision is None or recall is None:
-        return [None] * 12
+        return {key: None for key in AP_METRIC_KEYS}
 
     params = evaluator.params
     max_det_idx = list(params.maxDets).index(max_detections)
-    max_det_1_idx = list(params.maxDets).index(1)
-    max_det_10_idx = list(params.maxDets).index(10)
     area_labels = list(params.areaRngLbl)
     all_idx = area_labels.index("all")
     small_idx = area_labels.index("small")
@@ -460,41 +457,89 @@ def _coco_stats_from_eval(evaluator: Any, max_detections: int) -> list[float | N
     iou50_idx = int(np.where(np.isclose(ious, 0.5))[0][0])
     iou75_idx = int(np.where(np.isclose(ious, 0.75))[0][0])
 
-    return [
-        _mean_valid(precision[:, :, :, all_idx, max_det_idx]),
-        _mean_valid(precision[iou50_idx, :, :, all_idx, max_det_idx]),
-        _mean_valid(precision[iou75_idx, :, :, all_idx, max_det_idx]),
-        _mean_valid(precision[:, :, :, small_idx, max_det_idx]),
-        _mean_valid(precision[:, :, :, medium_idx, max_det_idx]),
-        _mean_valid(precision[:, :, :, large_idx, max_det_idx]),
-        _mean_valid(recall[:, :, all_idx, max_det_1_idx]),
-        _mean_valid(recall[:, :, all_idx, max_det_10_idx]),
-        _mean_valid(recall[:, :, all_idx, max_det_idx]),
-        _mean_valid(recall[:, :, small_idx, max_det_idx]),
-        _mean_valid(recall[:, :, medium_idx, max_det_idx]),
-        _mean_valid(recall[:, :, large_idx, max_det_idx]),
-    ]
+    metrics: dict[str, Any] = {
+        "map50_95": _mean_valid(precision[:, :, :, all_idx, max_det_idx]),
+        "map50": _mean_valid(precision[iou50_idx, :, :, all_idx, max_det_idx]),
+        "map75": _mean_valid(precision[iou75_idx, :, :, all_idx, max_det_idx]),
+        "map_small": _mean_valid(precision[:, :, :, small_idx, max_det_idx]),
+        "map_medium": _mean_valid(precision[:, :, :, medium_idx, max_det_idx]),
+        "map_large": _mean_valid(precision[:, :, :, large_idx, max_det_idx]),
+        "ar_small": _mean_valid(recall[:, :, small_idx, max_det_idx]),
+        "ar_medium": _mean_valid(recall[:, :, medium_idx, max_det_idx]),
+        "ar_large": _mean_valid(recall[:, :, large_idx, max_det_idx]),
+    }
+    for det_idx, det_limit in enumerate(params.maxDets):
+        metrics[f"ar_maxdet_{int(det_limit)}"] = _mean_valid(recall[:, :, all_idx, det_idx])
+    return metrics
 
 
-def _log_coco_summary(logger: Logger, stats: list[float | None], max_detections: int) -> None:
+def _log_coco_summary(logger: Logger, metrics: dict[str, Any], max_detections: int, protocol: str) -> None:
     if not logger:
         return
-    labels = [
-        f"AP@[IoU=0.50:0.95 | all | maxDets={max_detections}]",
-        f"AP@[IoU=0.50 | all | maxDets={max_detections}]",
-        f"AP@[IoU=0.75 | all | maxDets={max_detections}]",
-        f"AP@[IoU=0.50:0.95 | small | maxDets={max_detections}]",
-        f"AP@[IoU=0.50:0.95 | medium | maxDets={max_detections}]",
-        f"AP@[IoU=0.50:0.95 | large | maxDets={max_detections}]",
-        "AR@[IoU=0.50:0.95 | all | maxDets=1]",
-        "AR@[IoU=0.50:0.95 | all | maxDets=10]",
-        f"AR@[IoU=0.50:0.95 | all | maxDets={max_detections}]",
-        f"AR@[IoU=0.50:0.95 | small | maxDets={max_detections}]",
-        f"AR@[IoU=0.50:0.95 | medium | maxDets={max_detections}]",
-        f"AR@[IoU=0.50:0.95 | large | maxDets={max_detections}]",
-    ]
-    for label, value in zip(labels, stats):
-        logger(f"[EVAL][COCO] {label} = {value if value is not None else 'null'}")
+    for key, value in metrics.items():
+        if key == "per_class":
+            continue
+        logger(f"[EVAL][COCO][{protocol}] {key} (maxDets principal={max_detections}) = {value if value is not None else 'null'}")
+
+
+def _per_class_from_precision(
+    precision_array: Any,
+    evaluator: Any,
+    categories: list[dict[str, Any]],
+) -> dict[str, Any]:
+    per_class: dict[str, Any] = {}
+    if precision_array is None:
+        for cat in categories:
+            per_class[str(cat.get("id"))] = {"name": cat.get("name"), "ap50": 0.0, "ap50_95": 0.0}
+        return per_class
+    max_det_idx = len(evaluator.params.maxDets) - 1
+    for idx, cat_id in enumerate(evaluator.params.catIds):
+        cat = next((c for c in categories if int(c.get("id")) == int(cat_id)), {"name": str(cat_id)})
+        cls_all = precision_array[:, :, idx, 0, max_det_idx]
+        cls_all = cls_all[cls_all > -1]
+        cls_50 = precision_array[0, :, idx, 0, max_det_idx]
+        cls_50 = cls_50[cls_50 > -1]
+        per_class[str(cat_id)] = {
+            "name": cat.get("name"),
+            "ap50": float(np.mean(cls_50)) if cls_50.size else None,
+            "ap50_95": float(np.mean(cls_all)) if cls_all.size else None,
+        }
+    return per_class
+
+
+def _run_coco_metric_block(
+    coco_gt: Any,
+    predictions_path: Path,
+    predictions: list[dict[str, Any]],
+    *,
+    max_dets: list[int],
+    protocol_name: str,
+    protocol_description: str,
+    categories: list[dict[str, Any]],
+    logger: Logger,
+) -> dict[str, Any]:
+    from pycocotools.cocoeval import COCOeval
+
+    primary_max_det = int(max_dets[-1])
+    if predictions:
+        coco_dt = coco_gt.loadRes(str(predictions_path))
+        evaluator = COCOeval(coco_gt, coco_dt, iouType="bbox")
+        evaluator.params.maxDets = [int(v) for v in max_dets]
+        evaluator.evaluate()
+        evaluator.accumulate()
+        block = _coco_stats_from_eval(evaluator, primary_max_det)
+        block["per_class"] = _per_class_from_precision(evaluator.eval.get("precision"), evaluator, categories)
+    else:
+        block = {key: 0.0 for key in AP_METRIC_KEYS}
+        for det_limit in max_dets:
+            block[f"ar_maxdet_{int(det_limit)}"] = 0.0
+        block.update({"ar_small": 0.0, "ar_medium": 0.0, "ar_large": 0.0, "per_class": _per_class_from_precision(None, None, categories)})
+    block["protocol"] = protocol_name
+    block["max_dets"] = [int(v) for v in max_dets]
+    block["primary_max_det"] = primary_max_det
+    block["description"] = protocol_description
+    _log_coco_summary(logger, block, primary_max_det, protocol_name)
+    return block
 
 
 def evaluate_coco_predictions(
@@ -518,7 +563,6 @@ def evaluate_coco_predictions(
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from pycocotools.coco import COCO
-    from pycocotools.cocoeval import COCOeval
 
     gt_annotations = Path(gt_annotations).expanduser().resolve()
     predictions_json = Path(predictions_json).expanduser().resolve()
@@ -581,63 +625,38 @@ def evaluate_coco_predictions(
     )
 
     coco_gt = COCO(str(gt_annotations))
-    if predictions_for_integrated_metrics:
-        coco_dt = coco_gt.loadRes(str(integrated_predictions_path))
-        evaluator = COCOeval(coco_gt, coco_dt, iouType="bbox")
-        evaluator.params.maxDets = [1, 10, int(max_detections)]
-        evaluator.evaluate()
-        evaluator.accumulate()
-        stats = _coco_stats_from_eval(evaluator, int(max_detections))
-        _log_coco_summary(logger, stats, int(max_detections))
-        precision_array = evaluator.eval.get("precision")
-    else:
-        stats = [0.0] * 12
-        precision_array = None
-
-    metrics: dict[str, Any] = {
-        "map50_95": stats[0],
-        "map50": stats[1],
-        "map75": stats[2],
-        "map_small": stats[3],
-        "map_medium": stats[4],
-        "map_large": stats[5],
-        "ar1": stats[6],
-        "ar10": stats[7],
-        "ar100": stats[8],
-        "ar_maxdet": stats[8],
-        "ar_maxdet_5000": stats[8] if int(max_detections) == 5000 else None,
-        "ar_small": stats[9],
-        "ar_medium": stats[10],
-        "ar_large": stats[11],
-    }
-
-    per_class: dict[str, Any] = {}
     categories = gt_data.get("categories", [])
-    if predictions_for_integrated_metrics and precision_array is not None:
-        for idx, cat_id in enumerate(evaluator.params.catIds):
-            cat = next((c for c in categories if int(c.get("id")) == int(cat_id)), {"name": str(cat_id)})
-            cls_all = precision_array[:, :, idx, 0, 2]
-            cls_all = cls_all[cls_all > -1]
-            cls_50 = precision_array[0, :, idx, 0, 2]
-            cls_50 = cls_50[cls_50 > -1]
-            per_class[str(cat_id)] = {
-                "name": cat.get("name"),
-                "ap50": float(np.mean(cls_50)) if cls_50.size else None,
-                "ap50_95": float(np.mean(cls_all)) if cls_all.size else None,
-            }
-    else:
-        for cat in categories:
-            per_class[str(cat.get("id"))] = {"name": cat.get("name"), "ap50": 0.0, "ap50_95": 0.0}
-
-    metrics["per_class"] = per_class
-    metrics.update(
-        _compute_pr_and_confusion(
-            gt_data,
-            predictions_for_operating_point,
-            conf_threshold=conf_threshold,
-            iou_threshold=iou_threshold,
-        )
+    official_max_dets, official_description = official_protocol_max_dets(dataset_name, gt_annotations)
+    diagnostic_max_dets = [1, 10, int(DEFAULT_DIAGNOSTIC_MAX_DETECTIONS)]
+    metrics: dict[str, Any] = {
+        "official": _run_coco_metric_block(
+            coco_gt,
+            integrated_predictions_path,
+            predictions_for_integrated_metrics,
+            max_dets=official_max_dets,
+            protocol_name="official",
+            protocol_description=official_description,
+            categories=categories,
+            logger=logger,
+        ),
+        "diagnostic": _run_coco_metric_block(
+            coco_gt,
+            integrated_predictions_path,
+            predictions_for_integrated_metrics,
+            max_dets=diagnostic_max_dets,
+            protocol_name="diagnostic",
+            protocol_description="DiagnÃ³stico expandido com maxDets [1, 10, 5000], preservando o procedimento usado anteriormente.",
+            categories=categories,
+            logger=logger,
+        ),
+    }
+    operating_metrics = _compute_pr_and_confusion(
+        gt_data,
+        predictions_for_operating_point,
+        conf_threshold=conf_threshold,
+        iou_threshold=iou_threshold,
     )
+    metrics.update(operating_metrics)
 
     by_image_counts: dict[int, int] = defaultdict(int)
     for pred in predictions_for_integrated_metrics:
@@ -648,12 +667,16 @@ def evaluate_coco_predictions(
     saturation_count = sum(1 for count in by_image_counts.values() if count >= max_detections)
     saturation_alert = saturation_count > 0
     metrics_block = {key: metrics.get(key) for key in METRIC_KEYS}
+    figure_metrics = dict(metrics_block)
+    if isinstance(metrics.get("official"), dict):
+        figure_metrics.update(metrics["official"])
     figures = generate_evaluation_figures(
         gt_data=gt_data,
         predictions_for_curves=predictions_for_integrated_metrics,
-        metrics=metrics_block,
+        metrics=figure_metrics,
         output_dir=output_dir,
         iou_threshold=DEFAULT_IOU_ASSOCIATION_THRESHOLD,
+        max_detections_per_image=int(official_max_dets[-1]),
     )
 
     result = {
@@ -675,8 +698,10 @@ def evaluate_coco_predictions(
             "curve_conf_threshold": DEFAULT_CURVE_CONF_THRESHOLD,
             "iou_association_threshold": float(iou_threshold),
             "max_detections_per_image": int(max_detections),
-            "recall_metric_maxdet_key": "ar_maxdet",
-            "recall_metric_maxdet_value": int(max_detections),
+            "official_max_dets": official_max_dets,
+            "diagnostic_max_dets": diagnostic_max_dets,
+            "diagnostic_recall_metric_maxdet_key": f"ar_maxdet_{int(DEFAULT_DIAGNOSTIC_MAX_DETECTIONS)}",
+            "diagnostic_recall_metric_maxdet_value": int(DEFAULT_DIAGNOSTIC_MAX_DETECTIONS),
             "weights_policy": _weights_policy(weights_path),
             "device": device,
             "input_size": input_size,

@@ -28,6 +28,7 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRC
 from torchvision.models.detection.retinanet import RetinaNet
 
 from app.datasets.class_mapping import summarize_class_mapping
+from app.avaliacao.config import FASTER_RCNN_EXPORT_MAX_DETECTIONS
 from app.avaliacao.metricas import (
     DEFAULT_CURVE_CONF_THRESHOLD,
     DEFAULT_MAX_DETECTIONS,
@@ -289,6 +290,61 @@ def _write_args_yaml(
         logging_logger.info("[RUN] args.yaml salvo em %s", path)
     except Exception:
         logging_logger.exception("[RUN] Falha ao salvar args.yaml em %s", path)
+
+
+def _coerce_non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, float) and value >= 0 and value.is_integer():
+        return int(value)
+    return None
+
+
+def _checkpoint_accumulated_epoch(payload: Any) -> int | None:
+    if not isinstance(payload, dict):
+        return None
+    for container in (payload, payload.get("meta"), payload.get("config")):
+        if not isinstance(container, dict):
+            continue
+        for key in (
+            "epoch_accumulated",
+            "accumulated_epoch",
+            "epochs_accumulated",
+            "epochs_completed",
+            "global_epoch",
+            "total_epoch",
+        ):
+            epoch = _coerce_non_negative_int(container.get(key))
+            if epoch is not None:
+                return epoch
+    return None
+
+
+def _inspect_pretrained_checkpoint(weights_path: Optional[Path], logging_logger: logging.Logger) -> dict[str, Any] | None:
+    if weights_path is None:
+        return None
+    path = Path(weights_path).expanduser().resolve()
+    if not path.is_file():
+        return {"path": str(path), "exists": False}
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except Exception as exc:
+        logging_logger.warning("[WEIGHTS] Não foi possível ler metadados dos pesos pré-treinados %s: %s", path, exc)
+        return {"path": str(path), "exists": True, "readable": False, "error": str(exc)}
+    local_epoch = payload.get("epoch") if isinstance(payload, dict) else None
+    epoch = _coerce_non_negative_int(local_epoch)
+    accumulated = _checkpoint_accumulated_epoch(payload)
+    if accumulated is None:
+        accumulated = epoch
+    return {
+        "path": str(path),
+        "exists": True,
+        "readable": True,
+        "epoch": epoch,
+        "epoch_accumulated": accumulated,
+    }
 
 
 def _current_git_commit() -> str | None:
@@ -1646,6 +1702,8 @@ def run_val_coco_metrics(
     if iou_threshold_to_use is not None and not 0.0 < iou_threshold_to_use <= 1.0:
         raise ValueError(f"{tag} iou_threshold deve estar no intervalo (0.0, 1.0].")
     if isinstance(model, FasterRCNN):
+        if int(max_detections) == int(DEFAULT_MAX_DETECTIONS):
+            max_detections = FASTER_RCNN_EXPORT_MAX_DETECTIONS
         model.roi_heads.score_thresh = export_conf_threshold
         model.roi_heads.detections_per_img = int(max_detections)
     if isinstance(model, RetinaNet):
@@ -1935,19 +1993,20 @@ def run_val_coco_metrics(
         extra={"gt_summary": gt_summary, "pred_summary": pred_summary},
     )
     metrics = unified.get("metrics", {})
+    diagnostic_metrics = metrics.get("diagnostic", {}) if isinstance(metrics.get("diagnostic"), dict) else metrics
     stats = [
-        metrics.get("map50_95"),
-        metrics.get("map50"),
-        metrics.get("map75"),
-        metrics.get("map_small"),
-        metrics.get("map_medium"),
-        metrics.get("map_large"),
-        metrics.get("ar1"),
-        metrics.get("ar10"),
-        metrics.get("ar100"),
-        metrics.get("ar_small"),
-        metrics.get("ar_medium"),
-        metrics.get("ar_large"),
+        diagnostic_metrics.get("map50_95"),
+        diagnostic_metrics.get("map50"),
+        diagnostic_metrics.get("map75"),
+        diagnostic_metrics.get("map_small"),
+        diagnostic_metrics.get("map_medium"),
+        diagnostic_metrics.get("map_large"),
+        diagnostic_metrics.get("ar_maxdet_1"),
+        diagnostic_metrics.get("ar_maxdet_10"),
+        diagnostic_metrics.get("ar_maxdet_5000"),
+        diagnostic_metrics.get("ar_small"),
+        diagnostic_metrics.get("ar_medium"),
+        diagnostic_metrics.get("ar_large"),
     ]
 
     return {
@@ -1955,7 +2014,7 @@ def run_val_coco_metrics(
         "coco_stats": stats,
         "predictions_coco_json": str(predictions_path),
         "predictions_coco_filtered_json": unified.get("predictions_coco_filtered_json"),
-        "per_class": metrics.get("per_class", {}),
+        "per_class": diagnostic_metrics.get("per_class", {}),
         "gt_summary": gt_summary,
         "pred_summary": pred_summary,
         "gt_annotations": str(val_ann),
@@ -2212,6 +2271,7 @@ def train_torchvision_detector(
     val_dataset=None,
     checkpoint_dir: Optional[Path] = None,
     ssd_class_info: Optional[dict[str, Any]] = None,
+    pretrained_weights_source: Optional[Path] = None,
 ) -> Metrics:
     log_dir = Path(config.log_dir).expanduser().resolve()
     safe_stdout = _safe_stream("stdout", log_dir)
@@ -2286,6 +2346,18 @@ def train_torchvision_detector(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     logging_logger.info("[CKPT] output_dir=%s", run_output_dir)
     logging_logger.info("[CKPT] checkpoints_dir=%s", ckpt_dir)
+    pretrained_checkpoint = _inspect_pretrained_checkpoint(pretrained_weights_source, logging_logger)
+    pretrained_accumulated_epoch = (
+        _coerce_non_negative_int(pretrained_checkpoint.get("epoch_accumulated"))
+        if pretrained_checkpoint
+        else None
+    )
+
+    def _current_accumulated_epoch(epoch_value: int) -> int:
+        if pretrained_accumulated_epoch is None:
+            return epoch_value
+        return pretrained_accumulated_epoch + epoch_value
+
     _write_args_yaml(
         ckpt_dir / "args.yaml",
         config,
@@ -2295,6 +2367,7 @@ def train_torchvision_detector(
             "epochs": config.epochs,
             "epochs_to_run": epochs_to_run,
             "val_mode": val_mode_requested,
+            "pretrained_checkpoint": pretrained_checkpoint,
         },
         logging_logger,
     )
@@ -2528,6 +2601,8 @@ def train_torchvision_detector(
             "dataset_name": getattr(train_ds_full, "dataset_name", None),
             "class_source": class_source,
             "git_commit": _current_git_commit(),
+            "pretrained_checkpoint": pretrained_checkpoint,
+            "pretrained_epoch_accumulated": pretrained_accumulated_epoch,
         }
 
         # Os checks abaixo já transferem os batches para o dispositivo selecionado.
@@ -2730,7 +2805,7 @@ def train_torchvision_detector(
         logging_logger.info("[MODEL] Modelo preparado. params=%d | treináveis=%d", total_params, trainable_params)
         logging_logger.info("[SETUP] Preparando otimizador com modelo em %s.", device_str)
         params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.SGD(params, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay)
+        optimizer = torch.optim.SGD(params, lr=config.lr, momentum=config.momentum, weight_decay=config.weight_decay)
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.lr_step_size, gamma=config.lr_gamma)
 
         latest_last_checkpoint = get_latest_last_checkpoint(ckpt_dir, checkpoint_prefix, ".pth")
@@ -2987,6 +3062,8 @@ def train_torchvision_detector(
             }
             last_payload = {
                 "epoch": epoch,
+                "epoch_accumulated": _current_accumulated_epoch(epoch),
+                "pretrained_checkpoint": pretrained_checkpoint,
                 "model": model.state_dict(),
                 "model_state": model.state_dict(),
                 "model_state_dict": model.state_dict(),
@@ -3244,6 +3321,8 @@ def train_torchvision_detector(
 
             epoch_payload = {
                 "epoch": epoch,
+                "epoch_accumulated": _current_accumulated_epoch(epoch),
+                "pretrained_checkpoint": pretrained_checkpoint,
                 "model": model.state_dict(),
                 "model_state": model.state_dict(),
                 "model_state_dict": model.state_dict(),

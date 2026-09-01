@@ -99,42 +99,12 @@ class SSDDetector(TorchvisionDetector):
             train_ann=None,
             val_ann=None,
             weights_out=output_dir,
-            config=TrainConfig(
-                epochs=epochs or self.config.epochs,
-                batch_size=self.config.batch_size,
-                lr=self.config.lr,
-                device=self.config.device,
-                num_workers=self.config.num_workers,
-                seed=self.config.seed,
-                weight_decay=self.config.weight_decay,
-                lr_step_size=self.config.lr_step_size,
-                lr_gamma=self.config.lr_gamma,
-                verbose=self.config.verbose,
-                log_every=self.config.log_every,
-                debug_dataloader=self.config.debug_dataloader,
-                log_dir=self.config.log_dir,
-                pin_memory=self.config.pin_memory,
-                persistent_workers=self.config.persistent_workers,
-                prefetch_factor=self.config.prefetch_factor,
-                drop_last=self.config.drop_last,
-                max_epochs=self.config.max_epochs,
-                early_stop_enabled=self.config.early_stop_enabled,
-                early_stop_patience=self.config.early_stop_patience,
-                early_stop_min_delta=self.config.early_stop_min_delta,
-                early_stop_min_epochs=self.config.early_stop_min_epochs,
-                early_stop_ema_alpha=self.config.early_stop_ema_alpha,
-                dataset_num_classes=dataset_num_classes,
-                save_final=self.config.save_final,
-                save_best=self.config.save_best,
-                save_every=self.config.save_every,
-                keep_last_k=self.config.keep_last_k,
-                monitor_metric=self.config.monitor_metric,
-                mode=self.config.mode,
-            ),
+            config=self._training_config(epochs, dataset_num_classes=dataset_num_classes),
             logger=logger,
             val_ratio=0.0,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
+            pretrained_weights_source=pretrained_weights,
             ssd_class_info={
                 "class_names": class_names,
                 "dataset_num_classes": dataset_num_classes,
@@ -145,6 +115,13 @@ class SSDDetector(TorchvisionDetector):
             },
         )
         return metrics
+
+    def _training_config(self, epochs: int, *, dataset_num_classes: int) -> TrainConfig:
+        config = TrainConfig(**vars(self.config))
+        config.epochs = epochs or self.config.epochs
+        config.dataset_num_classes = dataset_num_classes
+        config.num_classes = dataset_num_classes + 1
+        return config
 
     def normalize_dataset(self, dataset_type: str, dataset_dir: Path, normalized_dir: Path, logger: Optional[Logger] = None):
         dataset_type = dataset_type.lower()
@@ -169,7 +146,6 @@ class SSDDetector(TorchvisionDetector):
                 raise FileNotFoundError(f"Diretório esperado não encontrado para HERIDAL: {train_dir}")
             images = [p for p in train_dir.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}]
             splits = make_split([p.name for p in images], train_ratio=0.8, val_ratio=0.2, test_ratio=0.0)
-            class_map = {"*": "human"}
             for split_name in ("train", "val"):
                 selected = {_canonical_key(name) for name, s in splits.items() if s == split_name}
                 normalize_to_voc(
@@ -177,7 +153,7 @@ class SSDDetector(TorchvisionDetector):
                     src_annotations_dir=str(annotations_dir),
                     out_dir=str(normalized_dir),
                     split=split_name,
-                    class_map=class_map,
+                    class_map=None,
                     keep_skipped=True,
                     selected_original_stems=selected,
                     logger=logger,
@@ -197,7 +173,7 @@ class SSDDetector(TorchvisionDetector):
                         src_annotations_dir=str(annotations_dir),
                         out_dir=str(normalized_dir),
                         split=split_name,
-                        class_map={"*": "human"},
+                        class_map=None,
                         keep_skipped=True,
                         logger=logger,
                     )

@@ -36,7 +36,6 @@ class DetectionAlgorithm:
         images_dir: Path,
         weights_path: Optional[Path],
         report_out: Path,
-        pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
         benchmark_mode: bool = False,
     ) -> InferencePerformance:
@@ -48,7 +47,6 @@ class DetectionAlgorithm:
         weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
-        pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
     ) -> Metrics:
         raise NotImplementedError

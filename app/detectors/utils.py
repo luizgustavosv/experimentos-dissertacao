@@ -259,7 +259,6 @@ def filter_torchvision_predictions(
     output: Dict[str, torch.Tensor],
     *,
     score_threshold: float,
-    target_label: Optional[int] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
     boxes = output.get("boxes", torch.empty((0, 4), dtype=torch.float32))
     scores = output.get("scores", torch.empty((0,), dtype=torch.float32))
@@ -272,11 +271,6 @@ def filter_torchvision_predictions(
     labels = labels[keep_score]
     after_score = int(boxes.shape[0])
 
-    if target_label is not None:
-        keep_class = labels == int(target_label)
-        boxes = boxes[keep_class]
-        scores = scores[keep_class]
-        labels = labels[keep_class]
     after_class = int(boxes.shape[0])
 
     filtered = {

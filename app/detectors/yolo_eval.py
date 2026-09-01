@@ -221,10 +221,11 @@ def evaluate_yolo(
         extra={"data_yaml": str(data_path), "batch": batch, "class_names": class_names},
     )
     metrics = result.get("metrics", {})
+    diagnostic_metrics = metrics.get("diagnostic", {}) if isinstance(metrics.get("diagnostic"), dict) else metrics
     _emit_to(
         logger,
         log_cb,
-        f"[EVAL][YOLO] mAP@0.5={metrics.get('map50')} | mAP@0.5:0.95={metrics.get('map50_95')} | "
+        f"[EVAL][YOLO] mAP@0.5={diagnostic_metrics.get('map50')} | mAP@0.5:0.95={diagnostic_metrics.get('map50_95')} | "
         f"precision_micro={metrics.get('precision_micro')} | recall_micro={metrics.get('recall_micro')}",
     )
     return result

@@ -119,6 +119,25 @@ def _match_predictions(
     return np.asarray(scores, dtype=np.float64), np.asarray(tp, dtype=np.int64), sum(len(v) for v in gts_by_image.values())
 
 
+def _cap_predictions_per_image(
+    predictions: list[dict[str, Any]],
+    max_detections_per_image: int | None,
+) -> list[dict[str, Any]]:
+    if max_detections_per_image is None:
+        return list(predictions)
+
+    by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for pred in predictions:
+        by_image[int(pred["image_id"])].append(pred)
+
+    capped: list[dict[str, Any]] = []
+    for items in by_image.values():
+        capped.extend(
+            sorted(items, key=lambda item: float(item.get("score", 0.0)), reverse=True)[: int(max_detections_per_image)]
+        )
+    return capped
+
+
 def _curve_values(
     scores: np.ndarray,
     tp: np.ndarray,
@@ -191,6 +210,7 @@ def generate_evaluation_figures(
     output_dir: Path,
     iou_threshold: float = 0.5,
     points: int = 1001,
+    max_detections_per_image: int | None = None,
 ) -> dict[str, dict[str, str]]:
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -227,6 +247,8 @@ def generate_evaluation_figures(
     if abs(map50_for_legend - float(metrics.get("map50") or 0.0)) > 0.001:
         raise AssertionError("mAP@0.5 da legenda diverge do arquivo de resultados em mais de 0.001.")
 
+    predictions_for_curves = _cap_predictions_per_image(predictions_for_curves, max_detections_per_image)
+
     if not predictions_for_curves:
         msg = "Nenhuma predição foi emitida; curvas definidas como zero."
         for stem, title in [
@@ -238,7 +260,9 @@ def generate_evaluation_figures(
             figures[stem] = _empty_figure(output_dir, stem, title, msg)
         return figures
 
-    thresholds = np.linspace(0.0, 1.0, max(1001, int(points)))
+    score_thresholds = np.asarray([float(pred.get("score", 0.0)) for pred in predictions_for_curves], dtype=np.float64)
+    thresholds = np.unique(np.concatenate(([0.0, 1.0], score_thresholds)))
+    thresholds.sort()
     colors = _colors(max(1, len(class_ids)))
     per_class_metrics = metrics.get("per_class") or {}
     per_class_curves: dict[int, dict[str, np.ndarray | float | str]] = {}

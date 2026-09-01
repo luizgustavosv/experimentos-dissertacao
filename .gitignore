@@ -2,9 +2,16 @@ __pycache__/
 *.pyc
 .venv/
 .env
+*.zip
 *.pdf
 *.png
 *.log
+*.pt
+*.pth
 runs/
 logs/
+reports/
+datasets/
+data/
+.pytest_cache/
 .claude/

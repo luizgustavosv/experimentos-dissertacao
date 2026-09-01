@@ -46,36 +46,25 @@ def test_unified_metrics_schema_and_default_coco_iou_range(tmp_path: Path) -> No
 
     metrics = result["metrics"]
     assert set(metrics) == {
-        "map50",
-        "map50_95",
-        "map75",
-        "map_small",
-        "map_medium",
-        "map_large",
-        "ar1",
-        "ar10",
-        "ar100",
-        "ar_maxdet",
-        "ar_maxdet_5000",
-        "ar_small",
-        "ar_medium",
-        "ar_large",
+        "official",
+        "diagnostic",
         "precision_micro",
         "recall_micro",
         "f1_micro",
         "precision_macro",
         "recall_macro",
         "f1_macro",
-        "per_class",
         "confusion_matrix",
     }
-    assert metrics["map50"] == pytest.approx(1.0)
-    assert metrics["map75"] == pytest.approx(1.0)
-    assert metrics["map50_95"] == pytest.approx(1.0)
+    assert metrics["diagnostic"]["map50"] == pytest.approx(1.0)
+    assert metrics["diagnostic"]["map75"] == pytest.approx(1.0)
+    assert metrics["diagnostic"]["map50_95"] == pytest.approx(1.0)
+    assert metrics["official"]["map50"] == pytest.approx(1.0)
     assert result["parameters"]["max_detections_per_image"] == DEFAULT_MAX_DETECTIONS
-    assert result["parameters"]["recall_metric_maxdet_key"] == "ar_maxdet"
-    assert result["parameters"]["recall_metric_maxdet_value"] == DEFAULT_MAX_DETECTIONS
-    assert metrics["ar_maxdet_5000"] == metrics["ar_maxdet"]
+    assert result["parameters"]["diagnostic_recall_metric_maxdet_key"] == "ar_maxdet_5000"
+    assert result["parameters"]["diagnostic_recall_metric_maxdet_value"] == DEFAULT_MAX_DETECTIONS
+    assert metrics["diagnostic"]["ar_maxdet_5000"] == pytest.approx(1.0)
+    assert metrics["official"]["ar_maxdet_100"] == pytest.approx(1.0)
     assert result["saturation"]["images_at_detection_cap"] == 0
     assert result["saturation"]["max_observed_detections_per_image"] == 1
     assert result["saturation"]["mean_detections_per_image"] == pytest.approx(1.0)
@@ -141,7 +130,7 @@ def test_map_uses_unfiltered_predictions_but_operating_point_uses_conf_threshold
         max_detections=DEFAULT_MAX_DETECTIONS,
     )
 
-    assert result["metrics"]["map50"] == pytest.approx(1.0)
+    assert result["metrics"]["diagnostic"]["map50"] == pytest.approx(1.0)
     assert result["metrics"]["recall_micro"] == pytest.approx(0.0)
     assert result["prediction_sources"]["map_ar_per_class_and_curves"]["num_detections"] == 1
     assert result["prediction_sources"]["operating_point_precision_recall_f1_and_confusion_matrix"]["num_detections"] == 0

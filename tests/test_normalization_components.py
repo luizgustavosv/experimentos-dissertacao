@@ -30,7 +30,7 @@ def test_read_heridal_split_and_annotations(tmp_path: Path) -> None:
     csv_lines = [
         "filename,width,height,class,xmin,ymin,xmax,ymax",
         "img1.jpg,100,100,human,10,10,30,30",
-        "img2.jpg,100,100,human,20,20,40,50",
+        "img2.jpg,100,100,vehicle,20,20,40,50",
         "img3.jpg,100,100,human,5,5,60,60",
     ]
     (train_dir / "_annotations.csv").write_text("\n".join(csv_lines), encoding="utf-8")
@@ -38,9 +38,9 @@ def test_read_heridal_split_and_annotations(tmp_path: Path) -> None:
     dataset, discarded, warnings, is_labelled = read_heridal(root, seed=1)
 
     assert is_labelled is True
-    assert discarded["non_human_class"] == 0
+    assert discarded == {}
     assert warnings == []
-    assert dataset.classes == ["human"]
+    assert dataset.classes == ["human", "vehicle"]
     assert dataset.num_images_per_split()["train"] == 2
     assert dataset.num_images_per_split()["test"] == 1
     assert dataset.num_annotations_per_split()["train"] + dataset.num_annotations_per_split()["test"] == 3
@@ -79,6 +79,49 @@ def test_read_visdrone_filters_and_categories(tmp_path: Path) -> None:
     assert dataset.classes[0] == "pedestrian"
     assert dataset.classes[3] == "car"
     assert warnings == ["000101.jpg ficou sem anotações após filtros em val"]
+
+def test_read_visdrone_preserves_all_detection_categories(tmp_path: Path) -> None:
+    root = tmp_path / "visdrone"
+    images_dir = root / "train" / "images"
+    annotations_dir = root / "train" / "annotations"
+    val_images_dir = root / "val" / "images"
+    val_annotations_dir = root / "val" / "annotations"
+    _make_image(images_dir / "000001.jpg", size=(200, 200))
+    _make_image(val_images_dir / "000101.jpg", size=(200, 200))
+    annotations_dir.mkdir(parents=True, exist_ok=True)
+    val_annotations_dir.mkdir(parents=True, exist_ok=True)
+
+    train_lines = [
+        f"{10 + idx},{10 + idx},8,9,1,{category_id},0,0"
+        for idx, category_id in enumerate(range(1, 11))
+    ]
+    val_lines = [
+        f"{20 + idx},{20 + idx},8,9,1,{category_id},0,0"
+        for idx, category_id in enumerate(range(1, 11))
+    ]
+    (annotations_dir / "000001.txt").write_text("\n".join(train_lines), encoding="utf-8")
+    (val_annotations_dir / "000101.txt").write_text("\n".join(val_lines), encoding="utf-8")
+
+    dataset, discarded, warnings, is_labelled = read_visdrone(root)
+
+    assert is_labelled is True
+    assert warnings == []
+    assert dataset.classes == [
+        "pedestrian",
+        "people",
+        "bicycle",
+        "car",
+        "van",
+        "truck",
+        "tricycle",
+        "awning-tricycle",
+        "bus",
+        "motor",
+    ]
+    assert {ann.class_id for ann in dataset.annotations} == set(range(10))
+    assert dataset.num_annotations_per_split()["train"] == 10
+    assert dataset.num_annotations_per_split()["val"] == 10
+    assert discarded["unknown_category"] == 0
 
 
 def _build_dataset_ir(tmp_path: Path, split: str = "train") -> DatasetIR:

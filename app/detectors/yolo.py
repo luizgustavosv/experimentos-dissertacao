@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv as _csv_mod
 import json
@@ -89,7 +89,7 @@ def train_yolo(
     # Garantir que o campo 'path' no dataset.yaml aponta para o diretório do
     # próprio arquivo YAML.  O exporter sempre escreve o yaml na raiz do dataset,
     # mas se o diretório foi movido o campo 'path' pode ter ficado desatualizado
-    # (ex.: exportado em D:\ e movido para C:\).  Ultralytics usa esse campo para
+    # (ex.: exportado em uma unidade e movido para outra).  Ultralytics usa esse campo para
     # resolver 'images/train' e 'images/val', portanto precisa estar correto.
     _yaml_correct_path = dataset_yaml.parent.as_posix()
     try:
@@ -115,7 +115,8 @@ def train_yolo(
     if logger and config.max_epochs is not None:
         logger(f"[YOLO][TRAIN] max_epochs ativo={config.max_epochs} -> epochs_to_run={epochs_to_run}")
 
-    run_dir = output_dir / "yolo_visdrone" / "weights"
+    yolo_run_dir = Path(config.yolo_save_dir).expanduser().resolve() if config.yolo_save_dir else output_dir / "yolo_visdrone"
+    run_dir = yolo_run_dir / "weights"
     checkpoint_manager = CheckpointManager(
         run_dir=run_dir,
         prefix="yolo",
@@ -166,9 +167,17 @@ def train_yolo(
     train_kwargs: Dict[str, object] = {
         "data": str(dataset_yaml),
         "epochs": remaining_epochs,
-        "project": str(output_dir),
-        "name": "yolo_visdrone",
-        "verbose": True,
+        "project": str(yolo_run_dir.parent),
+        "name": yolo_run_dir.name,
+        "batch": config.batch_size,
+        "imgsz": config.imgsz,
+        "device": resolve_device(config.device),
+        "workers": config.num_workers,
+        "lr0": config.lr,
+        "momentum": config.momentum,
+        "weight_decay": config.weight_decay,
+        "seed": config.seed,
+        "verbose": config.verbose,
         "patience": patience,
         "save": True,
         "save_period": 1,
@@ -414,7 +423,6 @@ class YoloDetector(DetectionAlgorithm):
         images_dir: Path,
         weights_path: Optional[Path],
         report_out: Path,
-        pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
         benchmark_mode: bool = False,
     ):
@@ -459,8 +467,6 @@ class YoloDetector(DetectionAlgorithm):
                     "exist_ok": True,
                 }
             )
-        if pedestrian_only:
-            predict_kwargs["classes"] = [0]
         results = model.predict(**predict_kwargs)
         self._cuda_sync(resolved_device)
         elapsed = time.perf_counter() - start
@@ -560,7 +566,6 @@ class YoloDetector(DetectionAlgorithm):
         weights_path: Optional[Path],
         report_out: Path,
         plots_dir: Path,
-        pedestrian_only: bool = False,
         logger: Optional[Logger] = None,
     ):
         dataset_yaml_path = Path(dataset_yaml_path)
@@ -575,8 +580,6 @@ class YoloDetector(DetectionAlgorithm):
         device_str = resolve_device(self.config.device)
         if logger:
             logger(f"[VAL] {self.context.name} validando {yaml_path_abs} em {device_str} usando {weights_resolved}")
-            if pedestrian_only:
-                logger("[VAL] Filtrando apenas classe pedestrian (0) durante a validação")
 
         cfg = yaml.safe_load(yaml_path_abs.read_text(encoding="utf-8"))
         root = Path(cfg["path"]).expanduser()
@@ -733,3 +736,4 @@ class YoloDetector(DetectionAlgorithm):
             map_computed=True,
             extra=extra,
         )
+
